@@ -1,0 +1,10 @@
+﻿<div class="card front">
+  <div class="focus">{{Focus}}</div>
+  {{#IPA}}<div class="ipa">{{IPA}}</div>{{/IPA}}
+  {{#Audio}}<div class="audio-controls">{{Audio}}</div>{{/Audio}}
+  {{#Sentence}}<div class="sentence">{{Sentence}}</div>{{/Sentence}}
+  <script>
+    const audio = document.querySelector('audio');
+    if (audio) audio.play().catch(e => console.log("Auto-play blocked"));
+  </script>
+</div>

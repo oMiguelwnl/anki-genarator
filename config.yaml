@@ -1,0 +1,90 @@
+﻿# Default configuration for Anki Deck Generator
+languages:
+  en:
+    display_name: English
+    code: en
+    wordfreq_code: en
+    target_translation_code: en
+  es:
+    display_name: Spanish
+    code: es
+    wordfreq_code: es
+    target_translation_code: en
+  fr:
+    display_name: French
+    code: fr
+    wordfreq_code: fr
+    target_translation_code: en
+  it:
+    display_name: Italian
+    code: it
+    wordfreq_code: it
+    target_translation_code: en
+  de:
+    display_name: German
+    code: de
+    wordfreq_code: de
+    target_translation_code: en
+  ru:
+    display_name: Russian
+    code: ru
+    wordfreq_code: ru
+    target_translation_code: en
+
+providers:
+  deepl:
+    api_key: ""
+    endpoint: "https://api-free.deepl.com/v2/translate"
+  libretranslate:
+    api_key: ""
+    endpoint: "https://libretranslate.com/translate"
+  responsivevoice:
+    api_key: ""
+    endpoint: "https://api.responsivevoice.org/v1/text:speech"
+  ai:
+    providers:
+      - "openrouter"
+      - "groq"
+    api_key: ""
+    api_key_env: "ANKI_AI_KEY"
+    temperature: 0.4
+    openrouter:
+      endpoint: "https://openrouter.ai/api/v1/chat/completions"
+      models:
+        - "meta-llama/llama-3.1-8b-instruct"
+        - "qwen/qwen-turbo"
+        - "meta-llama/llama-3.1-70b-instruct"
+    groq:
+      api_keys: []
+      api_key_envs:
+        - "GROQ_API_KEY_1"
+        - "GROQ_API_KEY_2"
+      endpoint: "https://api.groq.com/openai/v1/chat/completions"
+      models:
+        - "llama-3.1-8b-instant"
+        - "llama-3.3-70b-versatile"
+
+  tatoeba:
+    endpoint: "https://tatoeba.org/eng/api_v0/search"
+  wordincontext:
+    endpoint: "https://api.wordincontext.com"
+
+cache:
+  path: "ankideck_generator/data/cache"
+  autosave_every: 10
+
+deck:
+  name: "Anki Deck Generator"
+  model_id: 1607392319
+  deck_id: 2059400110
+  css_path: "ankideck_generator/templates/styles.css"
+  front_template: "ankideck_generator/templates/card_front.html"
+  back_template: "ankideck_generator/templates/card_back.html"
+
+runtime:
+  timeout_sec: 10
+  retries: 2
+  concurrency: 1
+  seed: 42
+  ai_max_calls_per_word: 6
+  ai_max_calls_per_field: 2
