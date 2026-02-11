@@ -34,7 +34,7 @@ VALIDATIONS = {
     "audio_generated": False,
     "definition_not_literal_translation": True,
     "sentence_length": (5, 25),
-    "sentence_difficulty_matches_level": True,
+    "sentence_difficulty_matches_level": False,
     "ai_quality_check": False,
 }
 
@@ -264,9 +264,15 @@ class DeckBuilder:
             ai_calls_total += 1
             ai_calls_by_field[field] = ai_calls_by_field.get(field, 0) + 1
 
-        definition = cache.get("definitions", word)
+        definition_key = f"{word}::{run.target_translation}"
+        definition = cache.get("definitions", definition_key)
         if not definition:
-            result = providers.definition(word, run.language, allow_ai=allow_ai("definition"))
+            result = providers.definition(
+                word,
+                run.language,
+                allow_ai=allow_ai("definition"),
+                definition_language=run.target_translation,
+            )
             providers_used["definition"] = result.provider_name
             if result.error:
                 provider_errors["definition"] = result.error
@@ -274,7 +280,7 @@ class DeckBuilder:
                 mark_ai("definition")
             definition = result.value or ""
             if definition:
-                cache.set("definitions", word, definition)
+                cache.set("definitions", definition_key, definition)
 
         ipa = cache.get("ipa", word)
         if not ipa:

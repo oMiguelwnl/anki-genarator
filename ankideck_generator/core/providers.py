@@ -65,7 +65,16 @@ class ProviderManager:
         elapsed = int((time.time() - start) * 1000)
         return ProviderResult(value=None, provider_name=provider_name, elapsed_ms=elapsed, error=str(last_exc))
 
-    def definition(self, word: str, language: str, allow_ai: bool = True) -> ProviderResult:
+    def definition(
+        self, word: str, language: str, allow_ai: bool = True, definition_language: str | None = None
+    ) -> ProviderResult:
+        target_lang = definition_language or language
+        if target_lang != language:
+            providers: list[tuple[str, Callable[[], str | None]]] = []
+            if allow_ai:
+                providers.append(("ai", lambda: self._definition_ai(word, target_lang)))
+            return self._fallback(providers)
+
         providers = [
             ("wordnet", lambda: self._definition_wordnet(word, language)),
             ("wiktionary", lambda: self._definition_wiktionary(word, language)),
