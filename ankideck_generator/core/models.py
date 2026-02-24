@@ -16,19 +16,22 @@ class CardData(BaseModel):
     translation_language: str = ""
     image: str = ""
     audio: str = ""
+    word_audio: str = ""
+    sentence_audio: str = ""
     level: int = 1
     language: str = ""
 
     def genanki_fields(self) -> list[str]:
         return [
-            self.focus,
             str(self.index),
-            self.ipa,
+            self.focus,
+            self.focus,
             self.definition,
             self.sentence,
             self.translation,
+            self.word_audio,
+            self.sentence_audio,
             self.image,
-            self.audio,
         ]
 
 

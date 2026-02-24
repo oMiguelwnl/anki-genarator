@@ -158,14 +158,15 @@ class DeckBuilder:
             deck_cfg.get("model_id", 1607392319),
             deck_cfg.get("name", "Anki Deck Generator"),
             fields=[
-                {"name": "Focus"},
-                {"name": "Index"},
-                {"name": "IPA"},
-                {"name": "Definition"},
-                {"name": "Sentence"},
+                {"name": "SortIndex"},
+                {"name": "word"},
+                {"name": "Front of Card"},
+                {"name": "Definitions"},
+                {"name": "Exemple Sentence"},
                 {"name": "Translation"},
-                {"name": "Image"},
-                {"name": "Audio"},
+                {"name": "word_audio"},
+                {"name": "sentence_audio"},
+                {"name": "image"},
             ],
             templates=[
                 {
@@ -348,6 +349,8 @@ class DeckBuilder:
             translation_language=run.target_translation,
             image="",
             audio=audio_value,
+            word_audio="",
+            sentence_audio="",
             level=level,
             language=run.language,
         )
