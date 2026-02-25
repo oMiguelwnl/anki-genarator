@@ -74,9 +74,9 @@ cache:
   autosave_every: 10
 
 deck:
-  name: "Anki Deck Generator"
-  model_id: 1607392319
-  deck_id: 2059400110
+  name: "Anki Deck Generator ES Blue v2"
+  model_id: 1607392327
+  deck_id: 2059400117
   css_path: "ankideck_generator/templates/styles.css"
   front_template: "ankideck_generator/templates/card_front.html"
   back_template: "ankideck_generator/templates/card_back.html"
@@ -86,5 +86,5 @@ runtime:
   retries: 2
   concurrency: 1
   seed: 42
-  ai_max_calls_per_word: 6
-  ai_max_calls_per_field: 2
+  ai_max_calls_per_word: 4
+  ai_max_calls_per_field: 1

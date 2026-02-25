@@ -10,10 +10,11 @@ from tqdm import tqdm
 
 from ..utils.config import load_config
 from ..utils.file_utils import atomic_write_json, ensure_dir, read_json
+from ..utils.definition_tools import normalize_definition
 from ..utils.language_tools import filter_frequent_words, sentence_is_acceptable, unique_keep_order
 from ..utils.logger import JsonLogger
 from .cache_manager import CacheManager
-from .models import CardData, LogRecord, ProgressState, RunConfig
+from .models import ANKI_FIELD_ORDER, CardData, LogRecord, ProgressState, RunConfig
 from .providers import ProviderManager
 from .validators import ValidationContext, validate_card
 
@@ -89,7 +90,11 @@ class DeckBuilder:
         processed = 0
 
         for level, words in level_sets.items():
+            accepted_in_level = 0
+            level_target = level_size
             for index, word in enumerate(tqdm(words, desc=f"Level {level}", unit="word")):
+                if accepted_in_level >= level_target:
+                    break
                 if word in processed_focus:
                     continue
                 try:
@@ -120,6 +125,7 @@ class DeckBuilder:
                     cards.append(card)
                     processed_focus.add(card.focus)
                     processed_sentences.add(card.sentence)
+                    accepted_in_level += 1
                 processed += 1
 
                 if processed % run.autosave_every == 0:
@@ -157,17 +163,7 @@ class DeckBuilder:
         model = genanki.Model(
             deck_cfg.get("model_id", 1607392319),
             deck_cfg.get("name", "Anki Deck Generator"),
-            fields=[
-                {"name": "SortIndex"},
-                {"name": "word"},
-                {"name": "Front of Card"},
-                {"name": "Definitions"},
-                {"name": "Exemple Sentence"},
-                {"name": "Translation"},
-                {"name": "word_audio"},
-                {"name": "sentence_audio"},
-                {"name": "image"},
-            ],
+            fields=[{"name": field_name} for field_name in ANKI_FIELD_ORDER],
             templates=[
                 {
                     "name": "Card 1",
@@ -209,19 +205,22 @@ class DeckBuilder:
         if len(filtered_top) < level_size:
             raw_top = top_n_list(language, target_total * 2)
             filtered_top = filter_frequent_words(raw_top, language, min_length=3)
-        level1 = filtered_top[:level_size]
+        level1_pool_size = min(len(filtered_top), max(level_size * 4, level_size))
+        level1 = filtered_top[:level1_pool_size]
 
         pool_raw = top_n_list(language, max(50000, target_total * 3))
         pool_filtered = filter_frequent_words(pool_raw, language, min_length=3)
         pool_filtered = [w for w in pool_filtered if w not in level1]
 
-        level2_candidates = pool_filtered[:15000]
+        level2_candidates = pool_filtered[:25000]
         random.shuffle(level2_candidates)
-        level2 = level2_candidates[:level_size]
+        level2_pool_size = min(len(level2_candidates), max(level_size * 4, level_size))
+        level2 = level2_candidates[:level2_pool_size]
 
-        level3_candidates = pool_filtered[15000:40000] if len(pool_filtered) > 40000 else pool_filtered
+        level3_candidates = pool_filtered[25000:50000] if len(pool_filtered) > 50000 else pool_filtered
         random.shuffle(level3_candidates)
-        level3 = level3_candidates[:level_size]
+        level3_pool_size = min(len(level3_candidates), max(level_size * 4, level_size))
+        level3 = level3_candidates[:level3_pool_size]
 
         return {
             1: unique_keep_order(level1),
@@ -265,14 +264,15 @@ class DeckBuilder:
             ai_calls_total += 1
             ai_calls_by_field[field] = ai_calls_by_field.get(field, 0) + 1
 
-        definition_key = f"{word}::{run.target_translation}"
+        definition_lang = run.target_translation if level in {1, 2} else run.language
+        definition_key = f"{word}::{definition_lang}"
         definition = cache.get("definitions", definition_key)
         if not definition:
             result = providers.definition(
                 word,
                 run.language,
                 allow_ai=allow_ai("definition"),
-                definition_language=run.target_translation,
+                definition_language=definition_lang,
             )
             providers_used["definition"] = result.provider_name
             if result.error:
@@ -280,6 +280,13 @@ class DeckBuilder:
             if result.provider_name == "ai":
                 mark_ai("definition")
             definition = result.value or ""
+            definition = normalize_definition(
+                definition,
+                definition_lang,
+                pos_mode="auto",
+                min_words=6,
+                max_words=10,
+            )
             if definition:
                 cache.set("definitions", definition_key, definition)
 
@@ -292,8 +299,10 @@ class DeckBuilder:
             if result.provider_name == "ai":
                 mark_ai("ipa")
             ipa = result.value or ""
-            if ipa:
-                cache.set("ipa", word, ipa)
+            # Fast fallback to prevent card loss and extra retries.
+            if not ipa:
+                ipa = f"/{word}/"
+            cache.set("ipa", word, ipa)
 
         sentence = cache.get("sentences", word)
         if not sentence:

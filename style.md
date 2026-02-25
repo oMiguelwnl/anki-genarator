@@ -1,60 +1,3 @@
-Front Template
-
-<div class="customCard cardBack">
-  <div class="horizontalPadding targetWordContainer">
-    <div class="wordBlock">
-      <span class="targetWord">{{Front of Card}}</span>
-      {{#IPA}}<span class="ipa">{{IPA}}</span>{{/IPA}}
-    </div>
-    <span class="wordAudioButtonBack">{{word_audio}}</span>
-  </div>
-
-  <div class="dividerLine"></div>
-
-  <div class="horizontalPadding">
-    <div class="header">definitions:</div>
-    <div class="indent">
-      <ul class="definitionsList">
-        <li>{{Definitions}}</li>
-      </ul>
-    </div>
-  </div>
-
-{{#image}}
-
-  <div class="image">{{image}}</div>
-  {{/image}} {{^image}}
-  <div class="dividerLine"></div>
-  {{/image}}
-
-  <div class="horizontalPadding">
-    <div class="header centerVertically">example:</div>
-    <div class="indent">
-      <div class="centerVertically" style="position: relative; gap: 5px">
-        <span>"{{Exemple Sentence}}"</span>
-        <span class="sentenceAudioButton">{{sentence_audio}}</span>
-      </div>
-      <div class="sentenceTranslation" id="translation" style="display: none">
-        {{Translation}}
-      </div>
-    </div>
-  </div>
-
-  <div class="dividerLine"></div>
-
-  <div class="horizontalPadding"></div>
-</div>
-
-Back Template
-
-{{FrontSide}}
-
-<script>
-  document.getElementById("translation").style.display = "block";
-</script>
-
-Styling (CSS)
-
 /_
 DE1K Variables — Blue Palette
 _/
@@ -97,9 +40,7 @@ margin-inline-start: 0px;
 margin-inline-end: 0px;
 }
 
-div {
-display: block;
-}
+div { display: block; }
 
 body {
 display: block;
@@ -110,83 +51,19 @@ html {
 display: block;
 }
 
-span,
-applet,
-object,
-iframe,
-h1,
-h2,
-h3,
-h4,
-h5,
-h6,
-blockquote,
-pre,
-a,
-abbr,
-acronym,
-address,
-big,
-cite,
-code,
-del,
-dfn,
-em,
-img,
-ins,
-kbd,
-q,
-s,
-samp,
-small,
-strike,
-strong,
-sub,
-sup,
-tt,
-var,
-b,
-u,
-i,
-center,
-dl,
-dt,
-dd,
-ol,
-ul,
-li,
-fieldset,
-form,
-label,
-legend,
-table,
-caption,
-tbody,
-tfoot,
-thead,
-tr,
-th,
-td,
-article,
-aside,
-canvas,
-details,
-embed,
-figure,
-figcaption,
-footer,
-header,
-hgroup,
-menu,
-nav,
-output,
-ruby,
-section,
-summary,
-time,
-mark,
-audio,
-video {
+span, applet, object, iframe,
+h1, h2, h3, h4, h5, h6, blockquote, pre,
+a, abbr, acronym, address, big, cite, code,
+del, dfn, em, img, ins, kbd, q, s, samp,
+small, strike, strong, sub, sup, tt, var,
+b, u, i, center,
+dl, dt, dd, ol, ul, li,
+fieldset, form, label, legend,
+table, caption, tbody, tfoot, thead, tr, th, td,
+article, aside, canvas, details, embed,
+figure, figcaption, footer, header, hgroup,
+menu, nav, output, ruby, section, summary,
+time, mark, audio, video {
 margin: 0;
 padding: 0;
 border: 0;
@@ -195,63 +72,25 @@ font: inherit;
 vertical-align: baseline;
 }
 
-article,
-aside,
-details,
-figcaption,
-figure,
-footer,
-header,
-hgroup,
-menu,
-nav,
-section {
+article, aside, details, figcaption, figure,
+footer, header, hgroup, menu, nav, section {
 display: block;
 }
 
-ol,
-ul {
-list-style: none;
-}
-blockquote,
-q {
-quotes: none;
-}
-blockquote:before,
-blockquote:after,
-q:before,
-q:after {
-content: "";
-content: none;
-}
-table {
-border-collapse: collapse;
-border-spacing: 0;
-}
+ol, ul { list-style: none; }
+blockquote, q { quotes: none; }
+blockquote:before, blockquote:after,
+q:before, q:after { content: ''; content: none; }
+table { border-collapse: collapse; border-spacing: 0; }
 
-- {
-  box-sizing: border-box;
-  }
+- { box-sizing: border-box; }
 
-body.nightMode::-webkit-scrollbar {
-background: #0a1628;
-}
-body.nightMode::-webkit-scrollbar:horizontal {
-height: 12px;
-}
-body.nightMode::-webkit-scrollbar:vertical {
-width: 12px;
-}
-body.nightMode::-webkit-scrollbar-thumb {
-background: #2563eb;
-border-radius: 8px;
-}
-body.nightMode::-webkit-scrollbar-thumb:horizontal {
-min-width: 50px;
-}
-body.nightMode::-webkit-scrollbar-thumb:vertical {
-min-height: 50px;
-}
+body.nightMode::-webkit-scrollbar { background: #0a1628; }
+body.nightMode::-webkit-scrollbar:horizontal { height: 12px; }
+body.nightMode::-webkit-scrollbar:vertical { width: 12px; }
+body.nightMode::-webkit-scrollbar-thumb { background: #2563eb; border-radius: 8px; }
+body.nightMode::-webkit-scrollbar-thumb:horizontal { min-width: 50px; }
+body.nightMode::-webkit-scrollbar-thumb:vertical { min-height: 50px; }
 
 body {
 overscroll-behavior: none;
@@ -280,28 +119,13 @@ display: none;
 -webkit-text-stroke-color: black;
 }
 
-#typeans {
-width: 100%;
-box-sizing: border-box;
-}
-.typeGood {
-background: #0f0;
-}
-.typeBad {
-background: #f00;
-}
-.typeMissed {
-background: #ccc;
-}
-.nightMode .latex {
-filter: invert(100%);
-}
-.drawing {
-zoom: 50%;
-}
-.nightMode img.drawing {
-filter: invert(1) hue-rotate(180deg);
-}
+#typeans { width: 100%; box-sizing: border-box; }
+.typeGood { background: #0f0; }
+.typeBad { background: #f00; }
+.typeMissed { background: #ccc; }
+.nightMode .latex { filter: invert(100%); }
+.drawing { zoom: 50%; }
+.nightMode img.drawing { filter: invert(1) hue-rotate(180deg); }
 
 /_ ========== CARD STYLES ========== _/
 
@@ -317,9 +141,7 @@ justify-content: center;
 align-items: center;
 
 background-color: var(--color-card-background);
-box-shadow:
-0 4px 24px var(--color-box-shadow),
-0 1px 4px rgba(37, 99, 235, 0.08);
+box-shadow: 0 4px 24px var(--color-box-shadow), 0 1px 4px rgba(37, 99, 235, 0.08);
 border-radius: 16px;
 border-top: 4px solid #2563eb;
 min-height: 200px;
@@ -347,9 +169,6 @@ padding-bottom: 8px;
 .targetWordContainer {
 margin-top: 8px;
 margin-bottom: 24px;
-display: flex;
-justify-content: space-between;
-align-items: flex-start;
 }
 
 .targetWord {
@@ -357,18 +176,6 @@ font-size: var(--font-size-targetWord);
 font-weight: 700;
 color: #1e3a8a;
 letter-spacing: -0.5px;
-}
-
-.wordBlock {
-display: flex;
-flex-direction: column;
-gap: 4px;
-}
-
-.ipa {
-font-size: 14px;
-color: var(--color-header);
-font-weight: 500;
 }
 
 .nightMode .targetWord {
@@ -404,17 +211,9 @@ right: 22px;
 .wordAudioButtonBack {
 margin-left: 8px;
 }
-.replay-button svg {
-width: 20px;
-height: 20px;
-}
-.replay-button svg path {
-fill: var(--color-audio-button);
-}
-.replay-button svg circle {
-fill: none;
-stroke: none;
-}
+.replay-button svg { width: 20px; height: 20px; }
+.replay-button svg path { fill: var(--color-audio-button); }
+.replay-button svg circle { fill: none; stroke: none; }
 
 .irregularFormsContainer {
 display: flex;
@@ -511,9 +310,7 @@ padding-left: 16px;
 padding-right: 16px;
 }
 
-.indent {
-padding-left: 12px;
-}
+.indent { padding-left: 12px; }
 
 .centerVertically {
 display: flex;
@@ -535,5 +332,3 @@ font-family: Inter;
 src: url("\_Inter-SemiBold.ttf");
 font-weight: 600;
 }
-
-Nota de manutencao: este arquivo e a fonte de verdade dos templates; qualquer alteracao aqui deve ser refletida em ankideck_generator/templates/card_front.html, ankideck_generator/templates/card_back.html e ankideck_generator/templates/styles.css.

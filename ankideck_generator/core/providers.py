@@ -207,7 +207,10 @@ class ProviderManager:
     def _translate_libre(self, text: str, src: str, dest: str) -> str | None:
         config = self.config.get("providers", {}).get("libretranslate", {})
         endpoint = config.get("endpoint")
-        if not endpoint:
+        api_key = config.get("api_key")
+        enabled = config.get("enabled", False)
+        # Avoid slow unauthenticated public endpoints unless explicitly enabled.
+        if not endpoint or (not enabled and not api_key):
             return None
         payload = {
             "q": text,
@@ -215,7 +218,6 @@ class ProviderManager:
             "target": dest,
             "format": "text",
         }
-        api_key = config.get("api_key")
         if api_key:
             payload["api_key"] = api_key
         resp = requests.post(endpoint, data=payload, timeout=self.timeout_sec)
@@ -379,7 +381,7 @@ class ProviderManager:
         )
         user = (
             f"Language: {language}. "
-            f"Create three natural everyday sentences (one per line) with 5 to 25 words that include the word '{word}'. "
+            f"Create one natural everyday sentence with 5 to 25 words that includes the word '{word}'. "
             "Avoid proper nouns, avoid idioms, and keep it clear and simple."
         )
         text = self._ai_request(system, user)
@@ -389,8 +391,14 @@ class ProviderManager:
         return _best_sentence(lines, word, language)
 
     def _definition_ai(self, word: str, language: str) -> str | None:
-        system = "You provide concise dictionary-style definitions. Return only the definition."
-        user = f"Language: {language}. Define the word '{word}' in the same language."
+        system = (
+            "You provide concise dictionary-style definitions. "
+            "Return exactly one definition, no examples."
+        )
+        user = (
+            f"Language: {language}. Define the word '{word}' in the same language. "
+            "Return 6-10 words. If you know POS, prefix noun/verb/adjective/adverb."
+        )
         return self._ai_request(system, user)
 
     def _translate_ai(self, text: str, src: str, dest: str) -> str | None:

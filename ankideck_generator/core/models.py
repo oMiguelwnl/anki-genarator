@@ -5,6 +5,19 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+ANKI_FIELD_ORDER = [
+    "SortIndex",
+    "word",
+    "Front of Card",
+    "IPA",
+    "Definitions",
+    "Exemple Sentence",
+    "Translation",
+    "word_audio",
+    "sentence_audio",
+    "image",
+]
+
 
 class CardData(BaseModel):
     focus: str = ""
@@ -22,10 +35,12 @@ class CardData(BaseModel):
     language: str = ""
 
     def genanki_fields(self) -> list[str]:
+        # Keep this order strictly aligned with ANKI_FIELD_ORDER.
         return [
             str(self.index),
             self.focus,
             self.focus,
+            self.ipa,
             self.definition,
             self.sentence,
             self.translation,

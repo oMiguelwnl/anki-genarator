@@ -1,7 +1,10 @@
-﻿<div class="customCard cardBack">
+<div class="customCard cardBack">
   <div class="horizontalPadding centerVertically targetWordContainer">
-    <span class="targetWord"> {{Front of Card}} </span>
-    <span class="wordAudioButtonBack"> {{word_audio}} </span>
+    <div class="wordBlock">
+      <span class="targetWord">{{Front of Card}}</span>
+      {{#IPA}}<span class="ipa">{{IPA}}</span>{{/IPA}}
+    </div>
+    <span class="wordAudioButtonBack">{{word_audio}}</span>
   </div>
 
   <div class="dividerLine"></div>
@@ -17,7 +20,8 @@
 
   {{#image}}
   <div class="image">{{image}}</div>
-  {{/image}} {{^image}}
+  {{/image}}
+  {{^image}}
   <div class="dividerLine"></div>
   {{/image}}
 

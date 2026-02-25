@@ -1,4 +1,4 @@
-﻿/* 
+/* 
 DE1K Variables — Blue Palette
 */
 
@@ -270,7 +270,7 @@ body {
 
   font-weight: 500;
   font-size: var(--font-size-card);
-  font-family: "Inter", sans-serif;
+  font-family: "Segoe UI", "Noto Sans", Arial, sans-serif;
   color: var(--color-text-primary);
 }
 
@@ -290,6 +290,9 @@ body {
 .targetWordContainer {
   margin-top: 8px;
   margin-bottom: 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
 }
 
 .targetWord {
@@ -297,6 +300,19 @@ body {
   font-weight: 700;
   color: #1e3a8a;
   letter-spacing: -0.5px;
+}
+
+.wordBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ipa {
+  font-size: 14px;
+  color: var(--color-divader);
+  margin-left: 2px;
+  font-weight: 500;
 }
 
 .nightMode .targetWord {
@@ -320,6 +336,7 @@ body {
   color: var(--color-list-bullets);
   display: inline-block;
   width: 8px;
+  margin-right: 5px;
   margin-left: -16px;
   font-size: 22px;
 }
@@ -446,20 +463,4 @@ body {
 .centerVertically {
   display: flex;
   align-items: center;
-}
-
-@font-face {
-  font-family: Inter;
-  src: url("_Inter-Regular.ttf");
-  font-weight: 400;
-}
-@font-face {
-  font-family: Inter;
-  src: url("_Inter-Medium.ttf");
-  font-weight: 500;
-}
-@font-face {
-  font-family: Inter;
-  src: url("_Inter-SemiBold.ttf");
-  font-weight: 600;
 }
