@@ -82,6 +82,7 @@ class DeckBuilder:
             state = progress_store.load(run.language, run.mode)
         processed_focus = set(state.processed_focus) if state else set()
         processed_sentences = set(state.processed_sentences) if state else set()
+        next_sort_index = (state.created_cards + 1) if state and state.created_cards else 1
         ctx.seen_focus.update(processed_focus)
         ctx.seen_sentence.update(processed_sentences)
 
@@ -122,6 +123,8 @@ class DeckBuilder:
 
                 logger.log(log_record.model_dump())
                 if card:
+                    card.index = next_sort_index
+                    next_sort_index += 1
                     cards.append(card)
                     processed_focus.add(card.focus)
                     processed_sentences.add(card.sentence)
@@ -139,7 +142,7 @@ class DeckBuilder:
                             rng_state=random.getstate(),
                             processed_focus=sorted(processed_focus),
                             processed_sentences=sorted(processed_sentences),
-                            created_cards=len(cards),
+                            created_cards=next_sort_index - 1,
                         )
                     )
 
@@ -153,7 +156,7 @@ class DeckBuilder:
                 rng_state=random.getstate(),
                 processed_focus=sorted(processed_focus),
                 processed_sentences=sorted(processed_sentences),
-                created_cards=len(cards),
+                created_cards=next_sort_index - 1,
             )
         )
         return cards, media_files
@@ -264,7 +267,7 @@ class DeckBuilder:
             ai_calls_total += 1
             ai_calls_by_field[field] = ai_calls_by_field.get(field, 0) + 1
 
-        definition_lang = run.target_translation if level in {1, 2} else run.language
+        definition_lang = run.language
         definition_key = f"{word}::{definition_lang}"
         definition = cache.get("definitions", definition_key)
         if not definition:

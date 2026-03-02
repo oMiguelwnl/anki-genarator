@@ -1,4 +1,4 @@
-<div class="customCard cardBack">
+﻿<div class="customCard cardBack">
   <div class="horizontalPadding centerVertically targetWordContainer">
     <div class="wordBlock">
       <span class="targetWord">{{Front of Card}}</span>
@@ -20,8 +20,7 @@
 
   {{#image}}
   <div class="image">{{image}}</div>
-  {{/image}}
-  {{^image}}
+  {{/image}} {{^image}}
   <div class="dividerLine"></div>
   {{/image}}
 
@@ -29,7 +28,7 @@
     <div class="header centerVertically">example:</div>
     <div class="indent">
       <div class="centerVertically" style="position: relative; gap: 5px">
-        <span>"{{Exemple Sentence}}"</span>
+        <span>{{Exemple Sentence}}</span>
         <span class="sentenceAudioButton">{{sentence_audio}}</span>
       </div>
       <div class="sentenceTranslation" id="translation" style="display: none">

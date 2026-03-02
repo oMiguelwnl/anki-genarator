@@ -43,7 +43,10 @@ def main() -> int:
         return 1
 
     mode = args.mode
-    level_size = 20 if mode == "test" else 1000
+    runtime_cfg = config.get("runtime", {})
+    test_level_size = runtime_cfg.get("test_level_size", 100)
+    full_level_size = runtime_cfg.get("full_level_size", 1000)
+    level_size = test_level_size if mode == "test" else full_level_size
 
     lang_cfg = languages[args.language]
     run = RunConfig(
@@ -55,13 +58,13 @@ def main() -> int:
         level_size=level_size,
         target_translation=lang_cfg.get("target_translation_code", "en"),
         wordfreq_language=lang_cfg.get("wordfreq_code", args.language),
-        timeout_sec=config.get("runtime", {}).get("timeout_sec", 10),
-        retries=config.get("runtime", {}).get("retries", 2),
-        seed=config.get("runtime", {}).get("seed", 42),
+        timeout_sec=runtime_cfg.get("timeout_sec", 10),
+        retries=runtime_cfg.get("retries", 2),
+        seed=runtime_cfg.get("seed", 42),
         cache_path=config.get("cache", {}).get("path", "ankideck_generator/data/cache"),
         autosave_every=config.get("cache", {}).get("autosave_every", 10),
-        ai_max_calls_per_word=config.get("runtime", {}).get("ai_max_calls_per_word", 6),
-        ai_max_calls_per_field=config.get("runtime", {}).get("ai_max_calls_per_field", 2),
+        ai_max_calls_per_word=runtime_cfg.get("ai_max_calls_per_word", 6),
+        ai_max_calls_per_field=runtime_cfg.get("ai_max_calls_per_field", 2),
     )
 
     builder = DeckBuilder(args.config)
