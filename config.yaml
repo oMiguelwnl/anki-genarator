@@ -84,6 +84,7 @@ deck:
     name: "Anki Deck Generator RU Phonetic"
     model_id: 1607392337
     deck_id: 2059400127
+    css_path: "ankideck_generator/templates/styles_ru.css"
     front_template: "ankideck_generator/templates/card_front_ru.html"
     back_template: "ankideck_generator/templates/card_back_ru.html"
 

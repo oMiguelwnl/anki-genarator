@@ -92,5 +92,6 @@
   "word::яркий": "ankideck_generator\\data\\audio\\ru_word_33.mp3",
   "sentence::яркий": "ankideck_generator\\data\\audio\\ru_sentence_33.mp3",
   "sentence::хата": "ankideck_generator\\data\\audio\\ru_sentence_23.mp3",
-  "sentence::юность": "ankideck_generator\\data\\audio\\ru_sentence_32.mp3"
+  "sentence::юность": "ankideck_generator\\data\\audio\\ru_sentence_32.mp3",
+  "sentence::зима": "ankideck_generator\\data\\audio\\ru_sentence_9.mp3"
 }
