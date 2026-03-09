@@ -19,6 +19,22 @@ class ValidationContext:
 def validate_card(card: CardData, ctx: ValidationContext, validations: dict[str, object]) -> list[str]:
     errors: list[str] = []
 
+    if validations.get("spellings_required"):
+        if not card.spellings:
+            errors.append("spellings_missing")
+
+    if validations.get("example_word_required"):
+        if not card.example_word:
+            errors.append("example_word_missing")
+
+    if validations.get("word_translation_required"):
+        if not card.word_translation:
+            errors.append("word_translation_missing")
+
+    if validations.get("letter_audio_required"):
+        if not card.letter_audio:
+            errors.append("letter_audio_missing")
+
     if validations.get("definition_required"):
         if not card.definition:
             errors.append("definition_missing")
@@ -28,7 +44,7 @@ def validate_card(card: CardData, ctx: ValidationContext, validations: dict[str,
             errors.append("ipa_missing")
 
     if validations.get("translation_required"):
-        if card.level in {1, 2} and not card.translation:
+        if not card.translation:
             errors.append("translation_missing")
 
     if validations.get("no_duplicate_focus"):
@@ -42,6 +58,10 @@ def validate_card(card: CardData, ctx: ValidationContext, validations: dict[str,
     if validations.get("focus_in_sentence"):
         if card.focus.lower() not in card.sentence.lower():
             errors.append("focus_not_in_sentence")
+
+    if validations.get("example_word_in_sentence"):
+        if card.example_word and card.example_word.lower() not in card.sentence.lower():
+            errors.append("example_word_not_in_sentence")
 
     if validations.get("valid_characters"):
         if not valid_focus_characters(card.focus):

@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-ANKI_FIELD_ORDER = [
+ANKI_FIELD_ORDER_DEFAULT = [
     "SortIndex",
     "word",
     "Front of Card",
@@ -17,6 +17,23 @@ ANKI_FIELD_ORDER = [
     "sentence_audio",
     "image",
 ]
+
+ANKI_FIELD_ORDER_RU = [
+    "SortIndex",
+    "Spellings",
+    "IPA",
+    "Example Word",
+    "Word Translation",
+    "Exemple Sentence",
+    "Translation",
+    "letter_audio",
+    "word_audio",
+    "sentence_audio",
+    "image",
+]
+
+# Backward-compatible alias used by existing tests/importers.
+ANKI_FIELD_ORDER = ANKI_FIELD_ORDER_DEFAULT
 
 
 class CardData(BaseModel):
@@ -31,23 +48,35 @@ class CardData(BaseModel):
     audio: str = ""
     word_audio: str = ""
     sentence_audio: str = ""
+    spellings: str = ""
+    example_word: str = ""
+    word_translation: str = ""
+    letter_audio: str = ""
     level: int = 1
     language: str = ""
 
-    def genanki_fields(self) -> list[str]:
-        # Keep this order strictly aligned with ANKI_FIELD_ORDER.
-        return [
-            str(self.index),
-            self.focus,
-            self.focus,
-            self.ipa,
-            self.definition,
-            self.sentence,
-            self.translation,
-            self.word_audio,
-            self.sentence_audio,
-            self.image,
-        ]
+    def _field_values(self) -> dict[str, str]:
+        return {
+            "SortIndex": str(self.index),
+            "word": self.focus,
+            "Front of Card": self.focus,
+            "IPA": self.ipa,
+            "Definitions": self.definition,
+            "Exemple Sentence": self.sentence,
+            "Translation": self.translation,
+            "word_audio": self.word_audio,
+            "sentence_audio": self.sentence_audio,
+            "image": self.image,
+            "Spellings": self.spellings,
+            "Example Word": self.example_word,
+            "Word Translation": self.word_translation,
+            "letter_audio": self.letter_audio,
+        }
+
+    def genanki_fields(self, field_order: list[str] | None = None) -> list[str]:
+        values = self._field_values()
+        order = field_order or ANKI_FIELD_ORDER_DEFAULT
+        return [values.get(name, "") for name in order]
 
 
 class ProviderResult(BaseModel):
@@ -73,6 +102,8 @@ class RunConfig(BaseModel):
     autosave_every: int
     ai_max_calls_per_word: int = 6
     ai_max_calls_per_field: int = 2
+    level_pool_multiplier: int = 8
+    strict_quality: bool = True
 
 
 class ProgressState(BaseModel):
@@ -94,5 +125,6 @@ class LogRecord(BaseModel):
     provider_errors: dict[str, str] = Field(default_factory=dict)
     validations: list[str] = Field(default_factory=list)
     status: str
+    discard_reason: str | None = None
     error: str | None = None
     timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())

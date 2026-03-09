@@ -1,0 +1,169 @@
+{
+  "entries": [
+    {
+      "spellings": "а",
+      "ipa": "/a/",
+      "example_word": "мама"
+    },
+    {
+      "spellings": "б",
+      "ipa": "/b/",
+      "example_word": "баба"
+    },
+    {
+      "spellings": "в",
+      "ipa": "/v/",
+      "example_word": "вода"
+    },
+    {
+      "spellings": "г",
+      "ipa": "/ɡ/",
+      "example_word": "гора"
+    },
+    {
+      "spellings": "д",
+      "ipa": "/d/",
+      "example_word": "дед"
+    },
+    {
+      "spellings": "е",
+      "ipa": "/je/",
+      "example_word": "пее"
+    },
+    {
+      "spellings": "ё",
+      "ipa": "/jo/",
+      "example_word": "ёж"
+    },
+    {
+      "spellings": "ж",
+      "ipa": "/ʐ/",
+      "example_word": "жена"
+    },
+    {
+      "spellings": "з",
+      "ipa": "/z/",
+      "example_word": "зима"
+    },
+    {
+      "spellings": "и",
+      "ipa": "/i/",
+      "example_word": "лиса"
+    },
+    {
+      "spellings": "й",
+      "ipa": "/j/",
+      "example_word": "май"
+    },
+    {
+      "spellings": "к",
+      "ipa": "/k/",
+      "example_word": "коза"
+    },
+    {
+      "spellings": "л",
+      "ipa": "/l/",
+      "example_word": "лом"
+    },
+    {
+      "spellings": "м",
+      "ipa": "/m/",
+      "example_word": "мама"
+    },
+    {
+      "spellings": "н",
+      "ipa": "/n/",
+      "example_word": "нос"
+    },
+    {
+      "spellings": "о",
+      "ipa": "/o/",
+      "example_word": "море"
+    },
+    {
+      "spellings": "п",
+      "ipa": "/p/",
+      "example_word": "папа"
+    },
+    {
+      "spellings": "р",
+      "ipa": "/r/",
+      "example_word": "рыба"
+    },
+    {
+      "spellings": "с",
+      "ipa": "/s/",
+      "example_word": "собака"
+    },
+    {
+      "spellings": "т",
+      "ipa": "/t/",
+      "example_word": "тетя"
+    },
+    {
+      "spellings": "у",
+      "ipa": "/u/",
+      "example_word": "улица"
+    },
+    {
+      "spellings": "ф",
+      "ipa": "/f/",
+      "example_word": "футбол"
+    },
+    {
+      "spellings": "х",
+      "ipa": "/x/",
+      "example_word": "хата"
+    },
+    {
+      "spellings": "ц",
+      "ipa": "/ts/",
+      "example_word": "цена"
+    },
+    {
+      "spellings": "ч",
+      "ipa": "/t͡ɕ/",
+      "example_word": "чаепитие"
+    },
+    {
+      "spellings": "ш",
+      "ipa": "/ʂ/",
+      "example_word": "шапка"
+    },
+    {
+      "spellings": "щ",
+      "ipa": "/ɕː/",
+      "example_word": "щека"
+    },
+    {
+      "spellings": "ъ",
+      "ipa": "/ʔ/",
+      "example_word": "съезд"
+    },
+    {
+      "spellings": "ы",
+      "ipa": "/ɨ/",
+      "example_word": "лыса"
+    },
+    {
+      "spellings": "ь",
+      "ipa": "/ʲ/",
+      "example_word": "тьма"
+    },
+    {
+      "spellings": "э",
+      "ipa": "/e/",
+      "example_word": "экран"
+    },
+    {
+      "spellings": "ю",
+      "ipa": "/ju/",
+      "example_word": "юность"
+    },
+    {
+      "spellings": "я",
+      "ipa": "/ja/",
+      "example_word": "яркий"
+    }
+  ]
+}

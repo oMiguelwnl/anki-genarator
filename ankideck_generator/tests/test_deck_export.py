@@ -4,7 +4,7 @@ import zipfile
 from pathlib import Path
 
 from ankideck_generator.core.deck_builder import DeckBuilder
-from ankideck_generator.core.models import ANKI_FIELD_ORDER, CardData, RunConfig
+from ankideck_generator.core.models import ANKI_FIELD_ORDER_DEFAULT, ANKI_FIELD_ORDER_RU, CardData, RunConfig
 
 
 def _read_model_from_apkg(apkg_path: Path, work_dir: Path) -> dict:
@@ -56,7 +56,7 @@ def test_deck_export(tmp_path: Path, monkeypatch) -> None:
 
     model = _read_model_from_apkg(output_path, tmp_path)
     field_names = [field["name"] for field in model["flds"]]
-    assert field_names == ANKI_FIELD_ORDER
+    assert field_names == ANKI_FIELD_ORDER_DEFAULT
 
     qfmt = model["tmpls"][0]["qfmt"]
     afmt = model["tmpls"][0]["afmt"]
@@ -76,3 +76,57 @@ def test_deck_export(tmp_path: Path, monkeypatch) -> None:
     assert "{{Example Sentence}}" not in qfmt
     assert "{{#Image}}" not in qfmt
     assert "{{Image}}" not in qfmt
+
+
+def test_deck_export_russian_uses_russian_model(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = RunConfig(
+        language="ru",
+        mode="test",
+        interactive=False,
+        output_path=str(tmp_path / "deck-ru.apkg"),
+        resume=False,
+        level_size=1,
+        target_translation="en",
+        wordfreq_language="ru",
+        timeout_sec=1,
+        retries=0,
+        seed=1,
+        cache_path=str(tmp_path / "cache"),
+        autosave_every=1,
+    )
+    card = CardData(
+        focus="ц",
+        index=1,
+        ipa="/ts/",
+        sentence="В цирке есть циркониевые цилиндры.",
+        translation="The circus has zirconium cylinders.",
+        word_audio="[sound:ru_word_1.mp3]",
+        sentence_audio="[sound:ru_sentence_1.mp3]",
+        spellings="ц",
+        example_word="цирк",
+        word_translation="circus",
+        letter_audio="[sound:ru_letter_1.mp3]",
+        level=1,
+        language="ru",
+    )
+    builder.export_deck(run, [card], [])
+
+    output_path = Path(run.output_path)
+    assert output_path.exists()
+
+    model = _read_model_from_apkg(output_path, tmp_path)
+    field_names = [field["name"] for field in model["flds"]]
+    assert field_names == ANKI_FIELD_ORDER_RU
+
+    qfmt = model["tmpls"][0]["qfmt"]
+    afmt = model["tmpls"][0]["afmt"]
+
+    assert "{{Spellings}}" in qfmt
+    assert "{{Example Word}}" in qfmt
+    assert "{{Word Translation}}" in qfmt
+    assert "{{letter_audio}}" in qfmt
+    assert "{{Definitions}}" not in qfmt
+    assert "{{FrontSide}}" in afmt
+    assert "document.getElementById(\"translation\").style.display = \"block\";" in afmt

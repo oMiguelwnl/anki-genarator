@@ -1,0 +1,42 @@
+<div class="customCard cardBack russianCard">
+  <div class="horizontalPadding">
+    <div class="ruLetterPanel">
+      <div class="header">the letter(s) is:</div>
+      <div class="ruLetterValue">{{Spellings}}</div>
+    </div>
+
+    <div class="ruSoundRow centerVertically">
+      <span class="ruSoundLabel">sounds like:</span>
+      <span class="ipa">{{IPA}}</span>
+      <span class="ruAudioButton">{{letter_audio}}</span>
+    </div>
+  </div>
+
+  <div class="dividerLine"></div>
+
+  <div class="horizontalPadding">
+    <div class="header">example word:</div>
+    <div class="ruExampleRow centerVertically">
+      <span class="ruExampleWord">{{Example Word}}</span>
+      <span class="wordAudioButtonBack">{{word_audio}}</span>
+      <span class="ruExampleTranslation">{{Word Translation}}</span>
+    </div>
+  </div>
+
+  <div class="dividerLine"></div>
+
+  <div class="horizontalPadding">
+    <div class="header">example sentence:</div>
+    <div class="ruSentenceRow centerVertically">
+      <span>{{Exemple Sentence}}</span>
+      <span class="sentenceAudioButton">{{sentence_audio}}</span>
+    </div>
+    <div class="sentenceTranslation" id="translation" style="display: none">
+      {{Translation}}
+    </div>
+  </div>
+
+  {{#image}}
+  <div class="image">{{image}}</div>
+  {{/image}}
+</div>

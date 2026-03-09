@@ -80,6 +80,12 @@ deck:
   css_path: "ankideck_generator/templates/styles.css"
   front_template: "ankideck_generator/templates/card_front.html"
   back_template: "ankideck_generator/templates/card_back.html"
+  russian:
+    name: "Anki Deck Generator RU Phonetic"
+    model_id: 1607392337
+    deck_id: 2059400127
+    front_template: "ankideck_generator/templates/card_front_ru.html"
+    back_template: "ankideck_generator/templates/card_back_ru.html"
 
 runtime:
   timeout_sec: 10
@@ -88,5 +94,18 @@ runtime:
   seed: 42
   test_level_size: 100
   full_level_size: 1000
-  ai_max_calls_per_word: 4
-  ai_max_calls_per_field: 1
+  ai_max_calls_per_word: 6
+  ai_max_calls_per_field: 2
+  level_pool_multiplier: 8
+  strict_quality: true
+  profiles:
+    test:
+      timeout_sec: 6
+      retries: 1
+      ai_max_calls_per_word: 6
+      ai_max_calls_per_field: 2
+    full:
+      timeout_sec: 10
+      retries: 1
+      ai_max_calls_per_word: 6
+      ai_max_calls_per_field: 2

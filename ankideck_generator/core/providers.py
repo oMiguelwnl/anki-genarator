@@ -1,9 +1,11 @@
 ﻿from __future__ import annotations
 
+import json
+import os
+import re
 import time
 from pathlib import Path
-import os
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import quote
 
 import requests
@@ -40,13 +42,36 @@ class ProviderManager:
         self.config = config
         self.timeout_sec = timeout_sec
         self.retries = retries
+        self._session = requests.Session()
         self._translator = Translator() if Translator else None
         self._ai_config = (config or {}).get("providers", {}).get("ai", {}) if config else {}
+        self._ai_request_count = 0
         providers = self._ai_config.get("providers") or self._ai_config.get("provider") or "openrouter"
         if isinstance(providers, list):
             self._ai_providers = providers
         else:
             self._ai_providers = [str(providers)]
+
+    def validate_ai_ready(self) -> tuple[bool, str]:
+        for provider_name in self._ai_providers:
+            profile = self._ai_config.get(provider_name, {})
+            endpoint = profile.get("endpoint") or self._ai_config.get("endpoint")
+            models = (
+                profile.get("models")
+                or profile.get("model")
+                or self._ai_config.get("models")
+                or self._ai_config.get("model")
+            )
+            keys = self._resolve_api_keys(profile)
+            if endpoint and models and keys:
+                return True, ""
+        return (
+            False,
+            (
+                "AI preflight failed: no AI provider is fully configured. "
+                "Set ANKI_AI_KEY or provider-specific keys in .env and ensure endpoint/models exist in config.yaml."
+            ),
+        )
 
     def _wrap(self, provider_name: str, fn: Callable[[], str | None]) -> ProviderResult:
         start = time.time()
@@ -75,17 +100,16 @@ class ProviderManager:
                 providers.append(("ai", lambda: self._definition_ai(word, target_lang)))
             return self._fallback(providers)
 
-        providers = [
-            ("wordnet", lambda: self._definition_wordnet(word, language)),
-            ("wiktionary", lambda: self._definition_wiktionary(word, language)),
-            ("dictionaryapi", lambda: self._definition_dictionaryapi(word, language)),
-        ]
+        providers: list[tuple[str, Callable[[], str | None]]] = []
         if allow_ai:
             providers.append(("ai", lambda: self._definition_ai(word, language)))
+        providers.append(("wiktionary", lambda: self._definition_wiktionary(word, language)))
+        providers.append(("wordnet", lambda: self._definition_wordnet(word, language)))
+        providers.append(("dictionaryapi", lambda: self._definition_dictionaryapi(word, language)))
         return self._fallback(providers)
 
     def translation(self, text: str, src: str, dest: str, allow_ai: bool = True) -> ProviderResult:
-        providers = [
+        providers: list[tuple[str, Callable[[], str | None]]] = [
             ("googletrans", lambda: self._translate_google(text, src, dest)),
             ("deepl", lambda: self._translate_deepl(text, src, dest)),
             ("libretranslate", lambda: self._translate_libre(text, src, dest)),
@@ -95,16 +119,37 @@ class ProviderManager:
         return self._fallback(providers)
 
     def sentence(self, word: str, language: str, allow_ai: bool = True) -> ProviderResult:
-        providers = [
-            ("tatoeba", lambda: self._sentence_tatoeba(word, language)),
-            ("wordincontext", lambda: self._sentence_wordincontext(word, language)),
-        ]
+        providers: list[tuple[str, Callable[[], str | None]]] = []
         if allow_ai:
             providers.append(("ai", lambda: self._sentence_ai(word, language)))
+        providers.extend(
+            [
+            ("tatoeba", lambda: self._sentence_tatoeba(word, language)),
+            ("wordincontext", lambda: self._sentence_wordincontext(word, language)),
+            ]
+        )
         return self._fallback(providers)
 
     def sentence_ai(self, word: str, language: str) -> ProviderResult:
         return self._wrap("ai", lambda: self._sentence_ai(word, language))
+
+    def sentence_web(self, word: str, language: str) -> ProviderResult:
+        providers = [
+            ("tatoeba", lambda: self._sentence_tatoeba(word, language)),
+            ("wordincontext", lambda: self._sentence_wordincontext(word, language)),
+        ]
+        return self._fallback(providers)
+
+    def translation_ai(self, text: str, src: str, dest: str) -> ProviderResult:
+        return self._wrap("ai", lambda: self._translate_ai(text, src, dest))
+
+    def translation_web(self, text: str, src: str, dest: str) -> ProviderResult:
+        providers = [
+            ("googletrans", lambda: self._translate_google(text, src, dest)),
+            ("deepl", lambda: self._translate_deepl(text, src, dest)),
+            ("libretranslate", lambda: self._translate_libre(text, src, dest)),
+        ]
+        return self._fallback(providers)
 
     def audio(self, text: str, language: str, output_dir: str | Path, filename_hint: str) -> ProviderResult:
         providers = [
@@ -120,6 +165,14 @@ class ProviderManager:
         providers = [
             ("ai", lambda: self._ipa_ai(word, language)),
         ]
+        return self._fallback(providers)
+
+    def russian_phoneme_inventory(self, language: str = "ru", allow_ai: bool = True) -> ProviderResult:
+        if language != "ru":
+            return ProviderResult(value=None, provider_name="ai", elapsed_ms=0, error="unsupported_language")
+        providers: list[tuple[str, Callable[[], str | None]]] = []
+        if allow_ai:
+            providers.append(("ai", lambda: self._russian_inventory_ai(language)))
         return self._fallback(providers)
 
     def _fallback(self, providers: list[tuple[str, Callable[[], str | None]]]) -> ProviderResult:
@@ -150,7 +203,7 @@ class ProviderManager:
     def _definition_wiktionary(self, word: str, language: str) -> str | None:
         lang_name = LANG_CODE_TO_NAME.get(language, "English")
         url = f"https://en.wiktionary.org/api/rest_v1/page/definition/{quote(word)}"
-        resp = requests.get(url, timeout=self.timeout_sec)
+        resp = self._session.get(url, timeout=self.timeout_sec)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -166,7 +219,7 @@ class ProviderManager:
         if language != "en":
             return None
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{quote(word)}"
-        resp = requests.get(url, timeout=self.timeout_sec)
+        resp = self._session.get(url, timeout=self.timeout_sec)
         if resp.status_code != 200:
             return None
         payload = resp.json()
@@ -195,7 +248,7 @@ class ProviderManager:
             "source_lang": src.upper(),
             "target_lang": dest.upper(),
         }
-        resp = requests.post(endpoint, data=payload, timeout=self.timeout_sec)
+        resp = self._session.post(endpoint, data=payload, timeout=self.timeout_sec)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -220,7 +273,7 @@ class ProviderManager:
         }
         if api_key:
             payload["api_key"] = api_key
-        resp = requests.post(endpoint, data=payload, timeout=self.timeout_sec)
+        resp = self._session.post(endpoint, data=payload, timeout=self.timeout_sec)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -236,7 +289,7 @@ class ProviderManager:
             "sort": "relevance",
             "limit": 20,
         }
-        resp = requests.get(endpoint, params=params, timeout=self.timeout_sec)
+        resp = self._session.get(endpoint, params=params, timeout=self.timeout_sec)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -280,7 +333,7 @@ class ProviderManager:
             "src": text,
             "hl": language,
         }
-        resp = requests.get(endpoint, params=params, timeout=self.timeout_sec)
+        resp = self._session.get(endpoint, params=params, timeout=self.timeout_sec)
         if resp.status_code != 200:
             return None
         ensure_dir(output_dir)
@@ -300,8 +353,9 @@ class ProviderManager:
         engine.runAndWait()
         return str(path)
 
-    def _ai_request(self, system_prompt: str, user_prompt: str) -> str | None:
+    def _ai_request(self, system_prompt: str, user_prompt: str, first_line_only: bool = True) -> str | None:
         last_error: str | None = None
+        self._ai_request_count += 1
         for provider_name in self._ai_providers:
             profile = self._ai_config.get(provider_name, {})
             endpoint = profile.get("endpoint") or self._ai_config.get("endpoint")
@@ -315,6 +369,9 @@ class ProviderManager:
             if not endpoint or not models or not api_keys:
                 continue
             model_list = models if isinstance(models, list) else [models]
+            if len(model_list) > 1:
+                offset = self._ai_request_count % len(model_list)
+                model_list = model_list[offset:] + model_list[:offset]
             for api_key in api_keys:
                 headers = {"Content-Type": "application/json"}
                 if api_key:
@@ -331,7 +388,7 @@ class ProviderManager:
                         ],
                         "temperature": self._ai_config.get("temperature", 0.4),
                     }
-                    resp = requests.post(endpoint, json=payload, headers=headers, timeout=self.timeout_sec)
+                    resp = self._session.post(endpoint, json=payload, headers=headers, timeout=self.timeout_sec)
                     if resp.status_code != 200:
                         last_error = f"{provider_name} HTTP {resp.status_code}: {resp.text[:200]}"
                         continue
@@ -342,7 +399,7 @@ class ProviderManager:
                         continue
                     message = choices[0].get("message") or {}
                     content = message.get("content") or ""
-                    text = _first_line(content)
+                    text = _first_line(content) if first_line_only else str(content).strip()
                     if text:
                         return text
         if last_error:
@@ -411,6 +468,45 @@ class ProviderManager:
         user = f"Give IPA for the word '{word}' in language '{language}'."
         return self._ai_request(system, user)
 
+    def _russian_inventory_ai(self, language: str) -> str | None:
+        system = (
+            "You generate concise phoneme-learning inventories. "
+            "Return strictly valid JSON only."
+        )
+        user = (
+            f"Language: {language}. "
+            "Return a JSON array. Each item must be an object with exactly keys: "
+            "spellings, ipa, example_word. "
+            "spellings must be Cyrillic letter(s), ipa must be a phoneme in IPA format, "
+            "example_word must be a common Russian word containing that sound. "
+            "Return 40 to 60 unique entries. No markdown, no comments."
+        )
+        raw = self._ai_request(system, user, first_line_only=False)
+        if not raw:
+            return None
+        payload = _extract_json_payload(raw)
+        if not isinstance(payload, list):
+            return None
+        normalized: list[dict[str, str]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            spellings = str(item.get("spellings", "")).strip()
+            ipa = str(item.get("ipa", "")).strip()
+            example_word = str(item.get("example_word", "")).strip()
+            if not spellings or not ipa or not example_word:
+                continue
+            normalized.append(
+                {
+                    "spellings": spellings,
+                    "ipa": ipa,
+                    "example_word": example_word,
+                }
+            )
+        if not normalized:
+            return None
+        return json.dumps(normalized, ensure_ascii=False)
+
 
 def _safe_filename(value: str) -> str:
     cleaned = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)
@@ -419,6 +515,29 @@ def _safe_filename(value: str) -> str:
 
 def _first_line(text: str) -> str:
     return text.strip().splitlines()[0].strip() if text else ""
+
+
+def _extract_json_payload(text: str) -> Any | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        start_obj = candidate.find("{")
+        start_arr = candidate.find("[")
+        starts = [index for index in (start_obj, start_arr) if index >= 0]
+        if not starts:
+            return None
+        start = min(starts)
+        cropped = candidate[start:].strip()
+        try:
+            return json.loads(cropped)
+        except json.JSONDecodeError:
+            return None
 
 
 def _best_sentence(candidates: list[str], focus: str, language: str) -> str | None:
