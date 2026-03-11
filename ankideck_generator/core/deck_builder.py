@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 from collections import Counter
-import json
 import random
 from datetime import datetime
 import re
@@ -16,7 +15,7 @@ from ..utils.definition_tools import normalize_definition
 from ..utils.language_tools import filter_frequent_words, sentence_is_acceptable, unique_keep_order
 from ..utils.logger import JsonLogger
 from .cache_manager import CacheManager
-from .models import ANKI_FIELD_ORDER_DEFAULT, ANKI_FIELD_ORDER_RU, CardData, LogRecord, ProgressState, RunConfig
+from .models import ANKI_FIELD_ORDER_DEFAULT, CardData, LogRecord, ProgressState, RunConfig
 from .providers import ProviderManager
 from .validators import ValidationContext, validate_card
 
@@ -36,27 +35,6 @@ DEFAULT_VALIDATIONS = {
     "ipa_format": True,
     "audio_generated": False,
     "definition_not_literal_translation": True,
-    "sentence_length": (5, 25),
-    "sentence_difficulty_matches_level": False,
-    "ai_quality_check": False,
-}
-
-RUSSIAN_VALIDATIONS = {
-    "definition_required": False,
-    "ipa_required": True,
-    "translation_required": True,
-    "spellings_required": True,
-    "example_word_required": True,
-    "word_translation_required": True,
-    "letter_audio_required": True,
-    "no_duplicate_focus": True,
-    "no_duplicate_sentences": True,
-    "focus_in_sentence": False,
-    "example_word_in_sentence": True,
-    "valid_characters": False,
-    "ipa_format": True,
-    "audio_generated": False,
-    "definition_not_literal_translation": False,
     "sentence_length": (5, 25),
     "sentence_difficulty_matches_level": False,
     "ai_quality_check": False,
@@ -93,8 +71,6 @@ class DeckBuilder:
         return providers.validate_ai_ready()
 
     def build(self, run: RunConfig) -> tuple[list[CardData], list[str]]:
-        if run.language == "ru":
-            return self._build_russian(run)
         provider_manager = ProviderManager(self.config, run.timeout_sec, run.retries)
         cache_manager = CacheManager(run.cache_path, run.language, run.autosave_every)
         progress_store = ProgressStore("ankideck_generator/data/progress")
@@ -277,18 +253,6 @@ class DeckBuilder:
     def _deck_config_for_language(self, language: str) -> tuple[dict, list[str]]:
         deck_cfg = dict(self.config.get("deck", {}))
         field_order = ANKI_FIELD_ORDER_DEFAULT
-        if language == "ru":
-            ru_cfg = deck_cfg.get("russian", {})
-            merged = dict(deck_cfg)
-            if isinstance(ru_cfg, dict):
-                for key, value in ru_cfg.items():
-                    if value is not None:
-                        merged[key] = value
-            merged.setdefault("front_template", "ankideck_generator/templates/card_front_ru.html")
-            merged.setdefault("back_template", "ankideck_generator/templates/card_back_ru.html")
-            merged.setdefault("css_path", "ankideck_generator/templates/styles.css")
-            deck_cfg = merged
-            field_order = ANKI_FIELD_ORDER_RU
         return deck_cfg, field_order
 
     def _resolve_path(self, value: str | None) -> Path:
@@ -298,283 +262,6 @@ class DeckBuilder:
         if path.is_absolute():
             return path
         return Path(self.config_path).resolve().parent / path
-
-    def _build_russian(self, run: RunConfig) -> tuple[list[CardData], list[str]]:
-        provider_manager = ProviderManager(self.config, run.timeout_sec, run.retries)
-        cache_manager = CacheManager(run.cache_path, run.language, run.autosave_every)
-        log_path = f"ankideck_generator/data/logs/run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.jsonl"
-        logger = JsonLogger(log_path)
-        ctx = ValidationContext()
-
-        inventory = self._load_russian_inventory(cache_manager, provider_manager, run)
-        if run.mode == "test":
-            inventory = inventory[: min(run.level_size, len(inventory))]
-
-        cards: list[CardData] = []
-        media_files: list[str] = []
-        accepted_by_level: Counter[int] = Counter()
-        attempted_by_level: Counter[int] = Counter()
-        validation_counter: Counter[str] = Counter()
-        provider_counter: Counter[str] = Counter()
-
-        for sort_index, entry in enumerate(tqdm(inventory, desc="Russian phonemes", unit="entry"), start=1):
-            attempted_by_level[1] += 1
-            focus = entry.get("spellings") or entry.get("example_word") or ""
-            try:
-                card, log_record = self._process_russian_entry(
-                    entry=entry,
-                    index=sort_index,
-                    run=run,
-                    cache=cache_manager,
-                    providers=provider_manager,
-                    ctx=ctx,
-                    media_files=media_files,
-                )
-            except Exception as exc:  # pragma: no cover - safety net
-                log_record = LogRecord(
-                    focus=focus,
-                    level=1,
-                    providers={},
-                    provider_errors={},
-                    validations=[],
-                    status="error",
-                    error=str(exc),
-                )
-                card = None
-
-            logger.log(log_record.model_dump())
-            for field_name, provider_name in log_record.providers.items():
-                provider_counter[f"{field_name}:{provider_name}"] += 1
-            for validation_error in log_record.validations:
-                validation_counter[validation_error] += 1
-            if card:
-                card.index = len(cards) + 1
-                cards.append(card)
-                accepted_by_level[1] += 1
-
-        cache_manager.save_all()
-        self._print_summary(accepted_by_level, attempted_by_level, validation_counter, provider_counter)
-        return cards, media_files
-
-    def _load_russian_inventory(self, cache: CacheManager, providers: ProviderManager, run: RunConfig) -> list[dict[str, str]]:
-        cached = cache.get("russian_inventory", "entries")
-        normalized_cached = _normalize_russian_inventory(cached)
-        if normalized_cached:
-            return normalized_cached
-
-        result = providers.russian_phoneme_inventory(run.language, allow_ai=True)
-        raw_value = result.value
-        payload: object
-        if isinstance(raw_value, str):
-            try:
-                payload = json.loads(raw_value)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"Invalid Russian inventory JSON from {result.provider_name}") from exc
-        else:
-            payload = raw_value
-        normalized = _normalize_russian_inventory(payload)
-        if not normalized:
-            raise RuntimeError(
-                f"Could not build Russian phoneme inventory. Provider={result.provider_name}, error={result.error}"
-            )
-        cache.set("russian_inventory", "entries", normalized)
-        return normalized
-
-    def _process_russian_entry(
-        self,
-        entry: dict[str, str],
-        index: int,
-        run: RunConfig,
-        cache: CacheManager,
-        providers: ProviderManager,
-        ctx: ValidationContext,
-        media_files: list[str],
-    ) -> tuple[CardData | None, LogRecord]:
-        providers_used: dict[str, str] = {}
-        provider_errors: dict[str, str] = {}
-        ai_calls_total = 0
-        ai_calls_by_field: dict[str, int] = {}
-
-        spellings = str(entry.get("spellings", "")).strip()
-        ipa = _normalize_ipa(str(entry.get("ipa", "")).strip())
-        example_word = str(entry.get("example_word", "")).strip()
-
-        def allow_ai(field: str) -> bool:
-            if ai_calls_total >= run.ai_max_calls_per_word:
-                return False
-            if ai_calls_by_field.get(field, 0) >= run.ai_max_calls_per_field:
-                return False
-            return True
-
-        def mark_ai(field: str) -> None:
-            nonlocal ai_calls_total
-            ai_calls_total += 1
-            ai_calls_by_field[field] = ai_calls_by_field.get(field, 0) + 1
-
-        def trace_result(field: str, result, ai_field: str | None = None) -> None:
-            providers_used[field] = result.provider_name
-            if result.error:
-                provider_errors[field] = result.error
-            if ai_field and result.provider_name == "ai":
-                mark_ai(ai_field)
-
-        word_translation = cache.get("word_translations", example_word) or ""
-        if not word_translation:
-            result = providers.translation_web(example_word, run.language, run.target_translation)
-            trace_result("word_translation", result)
-            word_translation = result.value or ""
-            if not word_translation and allow_ai("word_translation"):
-                result = providers.translation_ai(example_word, run.language, run.target_translation)
-                trace_result("word_translation", result, ai_field="word_translation")
-                word_translation = result.value or ""
-            if word_translation:
-                cache.set("word_translations", example_word, word_translation)
-
-        sentence = cache.get("sentences", example_word) or ""
-        if sentence and not sentence_is_acceptable(sentence, example_word, 5, 25):
-            sentence = ""
-        if not sentence:
-            sentence_attempts = 0
-            while sentence_attempts < 2 and allow_ai("sentence") and not sentence:
-                result = providers.sentence_ai(example_word, run.language)
-                trace_result("sentence", result, ai_field="sentence")
-                candidate = result.value or ""
-                if candidate and sentence_is_acceptable(candidate, example_word, 5, 25):
-                    sentence = candidate
-                    cache.set("sentences", example_word, sentence)
-                    break
-                sentence_attempts += 1
-            if not sentence:
-                result = providers.sentence_web(example_word, run.language)
-                trace_result("sentence", result)
-                candidate = result.value or ""
-                if candidate and sentence_is_acceptable(candidate, example_word, 5, 25):
-                    sentence = candidate
-                    cache.set("sentences", example_word, sentence)
-
-        translation = ""
-        if sentence:
-            translation_key = f"{example_word}::{sentence}"
-            translation = cache.get("translations", translation_key) or ""
-            if not translation:
-                result = providers.translation_web(sentence, run.language, run.target_translation)
-                trace_result("translation", result)
-                translation = result.value or ""
-                if not translation and allow_ai("translation"):
-                    result = providers.translation_ai(sentence, run.language, run.target_translation)
-                    trace_result("translation", result, ai_field="translation")
-                    translation = result.value or ""
-                if translation:
-                    cache.set("translations", translation_key, translation)
-
-        letter_audio = self._load_or_generate_audio_tag(
-            cache=cache,
-            providers=providers,
-            media_files=media_files,
-            run=run,
-            key=f"letter::{spellings}",
-            text=spellings,
-            filename_hint=f"ru_letter_{index}",
-            field="letter_audio",
-            providers_used=providers_used,
-            provider_errors=provider_errors,
-        )
-        word_audio = self._load_or_generate_audio_tag(
-            cache=cache,
-            providers=providers,
-            media_files=media_files,
-            run=run,
-            key=f"word::{example_word}",
-            text=example_word,
-            filename_hint=f"ru_word_{index}",
-            field="word_audio",
-            providers_used=providers_used,
-            provider_errors=provider_errors,
-        )
-        sentence_audio = self._load_or_generate_audio_tag(
-            cache=cache,
-            providers=providers,
-            media_files=media_files,
-            run=run,
-            key=f"sentence::{example_word}",
-            text=sentence,
-            filename_hint=f"ru_sentence_{index}",
-            field="sentence_audio",
-            providers_used=providers_used,
-            provider_errors=provider_errors,
-        )
-
-        card = CardData(
-            focus=spellings,
-            index=index,
-            ipa=ipa,
-            definition="",
-            sentence=sentence,
-            translation=translation,
-            translation_language=run.target_translation,
-            image="",
-            audio="",
-            word_audio=word_audio,
-            sentence_audio=sentence_audio,
-            spellings=spellings,
-            example_word=example_word,
-            word_translation=word_translation,
-            letter_audio=letter_audio,
-            level=1,
-            language=run.language,
-        )
-
-        errors = validate_card(card, ctx, _validations_for_language(run.language))
-        if errors:
-            discard_reason = _infer_discard_reason(errors, provider_errors)
-            return None, LogRecord(
-                focus=spellings,
-                level=1,
-                providers=providers_used,
-                provider_errors=provider_errors,
-                validations=errors,
-                status="discarded",
-                discard_reason=discard_reason,
-            )
-
-        return card, LogRecord(
-            focus=spellings,
-            level=1,
-            providers=providers_used,
-            provider_errors=provider_errors,
-            validations=[],
-            status="accepted",
-        )
-
-    def _load_or_generate_audio_tag(
-        self,
-        cache: CacheManager,
-        providers: ProviderManager,
-        media_files: list[str],
-        run: RunConfig,
-        key: str,
-        text: str,
-        filename_hint: str,
-        field: str,
-        providers_used: dict[str, str],
-        provider_errors: dict[str, str],
-    ) -> str:
-        if not text.strip():
-            return ""
-        cached_path = cache.get("audio_files", key)
-        if cached_path and Path(cached_path).exists():
-            _append_media_file(media_files, str(cached_path))
-            return _to_anki_sound(str(cached_path))
-
-        result = providers.audio(text, run.language, "ankideck_generator/data/audio", filename_hint)
-        providers_used[field] = result.provider_name
-        if result.error:
-            provider_errors[field] = result.error
-        if not result.value:
-            return ""
-        cache.set("audio_files", key, result.value)
-        _append_media_file(media_files, result.value)
-        return _to_anki_sound(result.value)
 
     def _process_word(
         self,
@@ -611,27 +298,78 @@ class DeckBuilder:
             if ai_field and result.provider_name == "ai":
                 mark_ai(ai_field)
 
-        definition_lang = run.language
+        definition_lang = "en"
         definition_key = f"{word}::{definition_lang}"
         definition = cache.get("definitions", definition_key)
         if not definition:
-            result = providers.definition(
-                word,
-                run.language,
-                allow_ai=allow_ai("definition"),
-                definition_language=definition_lang,
-            )
-            trace_result("definition", result, ai_field="definition")
-            definition = result.value or ""
-            definition = normalize_definition(
-                definition,
-                definition_lang,
-                pos_mode="auto",
-                min_words=6,
-                max_words=10,
-            )
-            if definition:
-                cache.set("definitions", definition_key, definition)
+            if run.language == "en":
+                result = providers.definition(
+                    word,
+                    run.language,
+                    allow_ai=allow_ai("definition"),
+                    definition_language="en",
+                )
+                trace_result("definition", result, ai_field="definition")
+                definition = result.value or ""
+                definition = normalize_definition(
+                    definition,
+                    "en",
+                    pos_mode="auto",
+                    min_words=6,
+                    max_words=10,
+                )
+                if definition:
+                    cache.set("definitions", definition_key, definition)
+            else:
+                source_key = f"{word}::{run.language}"
+                source_def = cache.get("definitions", source_key) or ""
+                if not source_def:
+                    result = providers.definition(
+                        word,
+                        run.language,
+                        allow_ai=allow_ai("definition"),
+                        definition_language=run.language,
+                    )
+                    trace_result("definition_source", result, ai_field="definition")
+                    source_def = result.value or ""
+                    source_def = normalize_definition(
+                        source_def,
+                        run.language,
+                        pos_mode="auto",
+                        min_words=6,
+                        max_words=10,
+                    )
+                    if source_def:
+                        cache.set("definitions", source_key, source_def)
+
+                definition_en = ""
+                if source_def:
+                    result = providers.translation_web(source_def, run.language, "en")
+                    trace_result("definition", result)
+                    definition_en = result.value or ""
+                    if not definition_en and allow_ai("definition"):
+                        result = providers.translation_ai(source_def, run.language, "en")
+                        trace_result("definition", result, ai_field="definition")
+                        definition_en = result.value or ""
+                if not definition_en and allow_ai("definition"):
+                    result = providers.definition(
+                        word,
+                        run.language,
+                        allow_ai=True,
+                        definition_language="en",
+                    )
+                    trace_result("definition", result, ai_field="definition")
+                    definition_en = result.value or ""
+
+                definition = normalize_definition(
+                    definition_en,
+                    "en",
+                    pos_mode="auto",
+                    min_words=6,
+                    max_words=10,
+                )
+                if definition:
+                    cache.set("definitions", definition_key, definition)
 
         ipa = cache.get("ipa", word)
         if not ipa:
@@ -647,38 +385,33 @@ class DeckBuilder:
         if sentence and not sentence_is_acceptable(sentence, word, 5, 25):
             sentence = ""
         if not sentence:
-            sentence_attempts = 0
-            while sentence_attempts < 2 and allow_ai("sentence") and not sentence:
-                result = providers.sentence_ai(word, run.language)
-                trace_result("sentence", result, ai_field="sentence")
-                candidate = result.value or ""
-                if candidate and sentence_is_acceptable(candidate, word, 5, 25):
-                    sentence = candidate
-                    cache.set("sentences", word, sentence)
-                    break
-                sentence_attempts += 1
+            result = providers.sentence_web(word, run.language)
+            trace_result("sentence", result)
+            candidate = result.value or ""
+            if candidate and sentence_is_acceptable(candidate, word, 5, 25):
+                sentence = candidate
+                cache.set("sentences", word, sentence)
             if not sentence:
-                result = providers.sentence_web(word, run.language)
-                trace_result("sentence", result)
-                candidate = result.value or ""
-                if candidate and sentence_is_acceptable(candidate, word, 5, 25):
-                    sentence = candidate
-                    cache.set("sentences", word, sentence)
+                sentence_attempts = 0
+                while sentence_attempts < 2 and allow_ai("sentence") and not sentence:
+                    result = providers.sentence_ai(word, run.language)
+                    trace_result("sentence", result, ai_field="sentence")
+                    candidate = result.value or ""
+                    if candidate and sentence_is_acceptable(candidate, word, 5, 25):
+                        sentence = candidate
+                        cache.set("sentences", word, sentence)
+                        break
+                    sentence_attempts += 1
 
         translation = ""
         if sentence:
-            translation_key = f"{word}::{sentence}"
-            translation = cache.get("translations", translation_key)
-            if not translation:
-                result = providers.translation_web(sentence, run.language, run.target_translation)
-                trace_result("translation", result)
+            result = providers.translation_web(sentence, run.language, run.target_translation)
+            trace_result("translation", result)
+            translation = result.value or ""
+            if not translation and allow_ai("translation"):
+                result = providers.translation_ai(sentence, run.language, run.target_translation)
+                trace_result("translation", result, ai_field="translation")
                 translation = result.value or ""
-                if not translation and allow_ai("translation"):
-                    result = providers.translation_ai(sentence, run.language, run.target_translation)
-                    trace_result("translation", result, ai_field="translation")
-                    translation = result.value or ""
-                if translation:
-                    cache.set("translations", translation_key, translation)
 
         audio_value = ""
 
@@ -806,46 +539,7 @@ def _infer_discard_reason(errors: list[str], provider_errors: dict[str, str]) ->
 
 
 def _validations_for_language(language: str) -> dict[str, object]:
-    return RUSSIAN_VALIDATIONS if language == "ru" else DEFAULT_VALIDATIONS
+    _ = language
+    return DEFAULT_VALIDATIONS
 
 
-def _normalize_russian_inventory(raw_value: object) -> list[dict[str, str]]:
-    if not isinstance(raw_value, list):
-        return []
-    entries: list[dict[str, str]] = []
-    seen_keys: set[tuple[str, str]] = set()
-    for raw_item in raw_value:
-        if not isinstance(raw_item, dict):
-            continue
-        spellings = str(raw_item.get("spellings", "")).strip()
-        ipa = _normalize_ipa(str(raw_item.get("ipa", "")).strip())
-        example_word = str(raw_item.get("example_word", "")).strip()
-        if not spellings or not ipa or not example_word:
-            continue
-        if not _contains_cyrillic(spellings) or not _contains_cyrillic(example_word):
-            continue
-        key = (spellings.casefold(), ipa)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        entries.append(
-            {
-                "spellings": spellings,
-                "ipa": ipa,
-                "example_word": example_word,
-            }
-        )
-    return entries
-
-
-def _contains_cyrillic(text: str) -> bool:
-    return bool(re.search(r"[А-Яа-яЁё]", text))
-
-
-def _to_anki_sound(path: str) -> str:
-    return f"[sound:{Path(path).name}]"
-
-
-def _append_media_file(media_files: list[str], path: str) -> None:
-    if path not in media_files:
-        media_files.append(path)

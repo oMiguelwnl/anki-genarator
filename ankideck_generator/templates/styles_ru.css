@@ -1,5 +1,5 @@
 /* 
-DE1K Variables — Blue Palette
+DE1K Variables - Russian Palette
 */
 
 :root {
@@ -11,28 +11,32 @@ DE1K Variables — Blue Palette
   --font-size-header: 16px;
   --font-size-irregular-form: 16px;
 
-  --color-text-primary: #18191f;
-  --color-nightMode-text-primary: #fbfafe;
-  --color-card-background: #ffffff;
-  --color-nightMode-card-background: #0b0716;
-  --color-box-shadow: rgba(18, 62, 119, 0.1);
-  --color-audio-button: #8369ed;
-  --color-list-bullets: #8369ed;
-  --color-irregular-form-background: #f3f4f6;
-  --color-nightMode-irregular-form-background: #1f2937;
-  --color-irregular-form-border: #d1d5db;
-  --color-nightMode-irregular-form-border: #4b5563;
-  --color-nightMode-irregular-form-text: rgba(255, 255, 255, 0.7);
-  --color-hint: #6b7280;
-  --color-nightMode-hint: #9ca3af;
-  --color-sentence-translation: #6b7280;
-  --color-nightMode-sentence-translation: #9ca3af;
-  --color-header: #9ca3af;
-  --color-nightMode-header: rgba(255, 255, 255, 0.5);
-  --color-divider: #e5e7eb;
-  --color-nightMode-divider: #1f2937;
-  --color-box-background: #f3f4f6;
-  --color-nightMode-box-background: #130c22;
+  --color-text-primary: #16213b;
+  --color-nightMode-text-primary: #edf2ff;
+  --color-card-background: #fcfdff;
+  --color-nightMode-card-background: #101a2f;
+  --color-box-shadow: rgba(22, 55, 110, 0.16);
+  --color-audio-button: #2f5fbf;
+  --color-list-bullets: #4a6fb3;
+  --color-irregular-form-background: #ecf2ff;
+  --color-nightMode-irregular-form-background: #1e304f;
+  --color-irregular-form-border: #cbd8f2;
+  --color-nightMode-irregular-form-border: #4c699f;
+  --color-nightMode-irregular-form-text: rgba(233, 241, 255, 0.86);
+  --color-hint: #5d6d8d;
+  --color-nightMode-hint: #a6b9dd;
+  --color-sentence-translation: #4d628b;
+  --color-nightMode-sentence-translation: #b6c7e7;
+  --color-header: #35558f;
+  --color-nightMode-header: rgba(170, 193, 233, 0.78);
+  --color-divider: #d8e2f6;
+  --color-nightMode-divider: #2a3d61;
+  --color-box-background: #f2f6ff;
+  --color-nightMode-box-background: #14233f;
+  --color-ru-accent-blue: #2f5fbf;
+  --color-ru-accent-secondary: #4a6fb3;
+  --color-nightMode-ru-accent-blue: #87adff;
+  --color-nightMode-ru-accent-secondary: #a9c3ff;
 }
 
 /* Chrome Base Styles */
@@ -182,7 +186,7 @@ table {
 }
 
 body.nightMode::-webkit-scrollbar {
-  background: #2f2f31;
+  background: #16213b;
 }
 body.nightMode::-webkit-scrollbar:horizontal {
   height: 12px;
@@ -191,7 +195,7 @@ body.nightMode::-webkit-scrollbar:vertical {
   width: 12px;
 }
 body.nightMode::-webkit-scrollbar-thumb {
-  background: #656565;
+  background: #4c699f;
   border-radius: 8px;
 }
 body.nightMode::-webkit-scrollbar-thumb:horizontal {
@@ -265,8 +269,11 @@ body {
   align-items: center;
 
   background-color: var(--color-card-background);
-  box-shadow: 1px 3px 10px var(--color-box-shadow);
+  box-shadow:
+    0 5px 22px var(--color-box-shadow),
+    0 1px 4px rgba(22, 55, 110, 0.08);
   border-radius: 8px;
+  border-top: 4px solid var(--color-ru-accent-blue);
   min-height: 200px;
   max-width: var(--max-width-card);
 
@@ -534,15 +541,15 @@ body {
 
 .russianCard .ruLetterPanel {
   display: block;
-  border: 1px solid var(--color-divider);
+  border: 1px solid var(--color-ru-accent-blue);
   border-radius: 10px;
   padding: 12px 12px 14px;
-  background-color: transparent;
+  background-color: var(--color-box-background);
 }
 
 .nightMode .russianCard .ruLetterPanel {
-  background-color: transparent;
-  border-color: var(--color-nightMode-text-primary);
+  background-color: var(--color-nightMode-box-background);
+  border-color: var(--color-nightMode-ru-accent-blue);
   margin-top: 10px;
 }
 
@@ -563,13 +570,13 @@ body {
   margin: 0;
   font-size: 52px;
   font-weight: 700;
-  color: var(--color-text-primary);
+  color: var(--color-ru-accent-blue);
   line-height: 1;
   text-align: center;
 }
 
 .nightMode .russianCard .ruLetterValue {
-  color: var(--color-nightMode-text-primary);
+  color: var(--color-nightMode-ru-accent-blue);
 }
 
 .russianCard .ruSoundRow {
@@ -581,12 +588,12 @@ body {
 }
 
 .russianCard .ruSoundLabel {
-  color: var(--color-text-primary);
+  color: var(--color-ru-accent-secondary);
   font-weight: 600;
 }
 
 .nightMode .russianCard .ruSoundLabel {
-  color: var(--color-nightMode-text-primary);
+  color: var(--color-nightMode-ru-accent-secondary);
 }
 
 .russianCard .ruExampleRow {
@@ -599,12 +606,21 @@ body {
 .russianCard .ruExampleWord {
   font-size: 30px;
   font-weight: 700;
+  color: var(--color-ru-accent-blue);
+}
+
+.nightMode .russianCard .ruExampleWord {
+  color: var(--color-nightMode-ru-accent-blue);
 }
 
 .russianCard .ruExampleTranslation {
-  color: var(--color-sentence-translation);
+  color: var(--color-ru-accent-secondary);
   font-style: italic;
   margin-left: 2px;
+}
+
+.nightMode .russianCard .ruExampleTranslation {
+  color: var(--color-nightMode-ru-accent-secondary);
 }
 
 .russianCard .ruSentenceRow {

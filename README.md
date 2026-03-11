@@ -1,5 +1,9 @@
 ﻿# Anki Deck Generator
 
+## Python recomendado
+
+Use Python **3.11**. O `googletrans` nao e estavel no Python 3.13 e pode falhar ao importar dependencias.
+
 ## Execucao recomendada
 
 Para gerar o deck final completo, execute sem retomada:

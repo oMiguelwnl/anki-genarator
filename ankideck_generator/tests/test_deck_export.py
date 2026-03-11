@@ -4,7 +4,7 @@ import zipfile
 from pathlib import Path
 
 from ankideck_generator.core.deck_builder import DeckBuilder
-from ankideck_generator.core.models import ANKI_FIELD_ORDER_DEFAULT, ANKI_FIELD_ORDER_RU, CardData, RunConfig
+from ankideck_generator.core.models import ANKI_FIELD_ORDER_DEFAULT, CardData, RunConfig
 
 
 def _read_model_from_apkg(apkg_path: Path, work_dir: Path) -> dict:
@@ -78,7 +78,7 @@ def test_deck_export(tmp_path: Path, monkeypatch) -> None:
     assert "{{Image}}" not in qfmt
 
 
-def test_deck_export_russian_uses_russian_model(tmp_path: Path, monkeypatch) -> None:
+def test_deck_export_russian_uses_default_model(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     run = RunConfig(
@@ -97,17 +97,14 @@ def test_deck_export_russian_uses_russian_model(tmp_path: Path, monkeypatch) -> 
         autosave_every=1,
     )
     card = CardData(
-        focus="ц",
+        focus="??????",
         index=1,
-        ipa="/ts/",
-        sentence="В цирке есть циркониевые цилиндры.",
-        translation="The circus has zirconium cylinders.",
-        word_audio="[sound:ru_word_1.mp3]",
-        sentence_audio="[sound:ru_sentence_1.mp3]",
-        spellings="ц",
-        example_word="цирк",
-        word_translation="circus",
-        letter_audio="[sound:ru_letter_1.mp3]",
+        ipa="/privet/",
+        definition="greeting",
+        sentence="??????, ??? ????",
+        translation="hello, how are you",
+        image="",
+        audio="",
         level=1,
         language="ru",
     )
@@ -118,15 +115,13 @@ def test_deck_export_russian_uses_russian_model(tmp_path: Path, monkeypatch) -> 
 
     model = _read_model_from_apkg(output_path, tmp_path)
     field_names = [field["name"] for field in model["flds"]]
-    assert field_names == ANKI_FIELD_ORDER_RU
+    assert field_names == ANKI_FIELD_ORDER_DEFAULT
 
     qfmt = model["tmpls"][0]["qfmt"]
     afmt = model["tmpls"][0]["afmt"]
 
-    assert "{{Spellings}}" in qfmt
-    assert "{{Example Word}}" in qfmt
-    assert "{{Word Translation}}" in qfmt
-    assert "{{letter_audio}}" in qfmt
-    assert "{{Definitions}}" not in qfmt
+    assert "{{Definitions}}" in qfmt
+    assert "{{Spellings}}" not in qfmt
+    assert "{{Example Word}}" not in qfmt
     assert "{{FrontSide}}" in afmt
     assert "document.getElementById(\"translation\").style.display = \"block\";" in afmt

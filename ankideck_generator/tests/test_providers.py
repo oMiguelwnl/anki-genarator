@@ -52,7 +52,7 @@ def test_translation_fallback_libre(monkeypatch):
     assert result.value == "hello"
 
 
-def test_sentence_prefers_ai_then_web(monkeypatch):
+def test_sentence_prefers_web_then_ai(monkeypatch):
     provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
     calls: list[str] = []
 
@@ -62,7 +62,7 @@ def test_sentence_prefers_ai_then_web(monkeypatch):
 
     result = provider.sentence("hola", "es", allow_ai=True)
     assert result.value == "ok"
-    assert calls[:2] == ["ai", "tatoeba"]
+    assert calls[:1] == ["tatoeba"]
 
 
 def test_translation_prefers_web_then_ai(monkeypatch):

@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-03-09T19:09:27.412657",
+  "generated_at": "2026-03-11T19:19:41.683854",
   "language": "ru",
   "mode": "test",
-  "cards": 30,
-  "output": "output/deck-ru-test.apkg"
+  "cards": 300,
+  "output": "output/test_ru.apkg"
 }

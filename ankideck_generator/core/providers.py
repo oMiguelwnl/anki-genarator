@@ -120,14 +120,14 @@ class ProviderManager:
 
     def sentence(self, word: str, language: str, allow_ai: bool = True) -> ProviderResult:
         providers: list[tuple[str, Callable[[], str | None]]] = []
-        if allow_ai:
-            providers.append(("ai", lambda: self._sentence_ai(word, language)))
         providers.extend(
             [
-            ("tatoeba", lambda: self._sentence_tatoeba(word, language)),
-            ("wordincontext", lambda: self._sentence_wordincontext(word, language)),
+                ("tatoeba", lambda: self._sentence_tatoeba(word, language)),
+                ("wordincontext", lambda: self._sentence_wordincontext(word, language)),
             ]
         )
+        if allow_ai:
+            providers.append(("ai", lambda: self._sentence_ai(word, language)))
         return self._fallback(providers)
 
     def sentence_ai(self, word: str, language: str) -> ProviderResult:
@@ -165,14 +165,6 @@ class ProviderManager:
         providers = [
             ("ai", lambda: self._ipa_ai(word, language)),
         ]
-        return self._fallback(providers)
-
-    def russian_phoneme_inventory(self, language: str = "ru", allow_ai: bool = True) -> ProviderResult:
-        if language != "ru":
-            return ProviderResult(value=None, provider_name="ai", elapsed_ms=0, error="unsupported_language")
-        providers: list[tuple[str, Callable[[], str | None]]] = []
-        if allow_ai:
-            providers.append(("ai", lambda: self._russian_inventory_ai(language)))
         return self._fallback(providers)
 
     def _fallback(self, providers: list[tuple[str, Callable[[], str | None]]]) -> ProviderResult:
@@ -467,45 +459,6 @@ class ProviderManager:
         system = "You provide IPA transcriptions. Return only the IPA symbols."
         user = f"Give IPA for the word '{word}' in language '{language}'."
         return self._ai_request(system, user)
-
-    def _russian_inventory_ai(self, language: str) -> str | None:
-        system = (
-            "You generate concise phoneme-learning inventories. "
-            "Return strictly valid JSON only."
-        )
-        user = (
-            f"Language: {language}. "
-            "Return a JSON array. Each item must be an object with exactly keys: "
-            "spellings, ipa, example_word. "
-            "spellings must be Cyrillic letter(s), ipa must be a phoneme in IPA format, "
-            "example_word must be a common Russian word containing that sound. "
-            "Return 40 to 60 unique entries. No markdown, no comments."
-        )
-        raw = self._ai_request(system, user, first_line_only=False)
-        if not raw:
-            return None
-        payload = _extract_json_payload(raw)
-        if not isinstance(payload, list):
-            return None
-        normalized: list[dict[str, str]] = []
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            spellings = str(item.get("spellings", "")).strip()
-            ipa = str(item.get("ipa", "")).strip()
-            example_word = str(item.get("example_word", "")).strip()
-            if not spellings or not ipa or not example_word:
-                continue
-            normalized.append(
-                {
-                    "spellings": spellings,
-                    "ipa": ipa,
-                    "example_word": example_word,
-                }
-            )
-        if not normalized:
-            return None
-        return json.dumps(normalized, ensure_ascii=False)
 
 
 def _safe_filename(value: str) -> str:
