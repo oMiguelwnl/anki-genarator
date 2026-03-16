@@ -85,6 +85,10 @@ def test_process_word_uses_source_language_for_definition(tmp_path: Path) -> Non
             _ = (word, language, allow_ai)
             return Result("/bjen/")
 
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("zhee-VYA")
+
         def sentence(self, word, language, allow_ai=True, level=None):
             _ = (word, language, allow_ai, level)
             return Result(f"Hoy me siento {word} en casa.")
@@ -157,6 +161,10 @@ def test_process_word_retries_sentence_web_before_ai(tmp_path: Path) -> None:
         def ipa(self, word, language, allow_ai=True):
             _ = (word, language, allow_ai)
             return Result("/bjen/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("zhee-VYA")
 
         def sentence_ai(self, word, language, level=None):
             _ = (word, language, level)

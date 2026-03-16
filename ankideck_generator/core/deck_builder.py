@@ -379,7 +379,14 @@ class DeckBuilder:
             # Fast fallback to prevent card loss and extra retries.
             if not ipa:
                 ipa = f"/{word}/"
-            cache.set("ipa", word, ipa)
+        ipa = _normalize_ipa(ipa)
+        if ipa and not _ipa_has_pronunciation(ipa) and allow_ai("ipa"):
+            result = providers.phonetic_spelling(ipa, run.language, allow_ai=True)
+            trace_result("ipa_pronunciation", result, ai_field="ipa")
+            phonetic = _sanitize_phonetic(result.value or "")
+            if phonetic:
+                ipa = f"{ipa} ({phonetic})"
+        cache.set("ipa", word, ipa)
 
         sentence = cache.get("sentences", word)
         if sentence and not sentence_is_acceptable(sentence, word, 5, 25):
@@ -515,12 +522,30 @@ def _normalize_ipa(value: str) -> str:
     if not value:
         return ""
     text = value.strip()
-    match = re.search(r"/[^/]+/", text)
+    match = re.search(r"(/[^/]+/)(?:\s*\(([^()]+)\))?", text)
     if match:
-        return match.group(0)
+        ipa = match.group(1)
+        suffix = match.group(2)
+        if suffix:
+            return f"{ipa} ({suffix.strip()})"
+        return ipa
     if text.startswith("/") and text.endswith("/"):
         return text
     return f"/{text}/"
+
+
+def _ipa_has_pronunciation(value: str) -> bool:
+    return bool(re.search(r"/[^/]+/\s*\([^()]+\)", value or ""))
+
+
+def _sanitize_phonetic(value: str) -> str:
+    if not value:
+        return ""
+    text = value.strip().strip('"').strip("'")
+    text = re.sub(r"/[^/]+/", "", text).strip()
+    text = text.replace("(", "").replace(")", "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
 def _infer_discard_reason(errors: list[str], provider_errors: dict[str, str]) -> str | None:

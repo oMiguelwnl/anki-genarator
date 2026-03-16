@@ -7,7 +7,7 @@ from difflib import SequenceMatcher
 from ..utils.language_tools import difficulty, valid_focus_characters, valid_sentence_characters
 from .models import CardData
 
-IPA_RE = re.compile(r"^/[^/]+/$")
+IPA_RE = re.compile(r"^/[^/]+/(?:\s*\([^()]+\))?$")
 
 
 @dataclass

@@ -28,3 +28,29 @@ def test_validate_card_focus_in_sentence() -> None:
     assert "focus_not_in_sentence" in errors
 
 
+def test_validate_card_ipa_with_pronunciation_suffix() -> None:
+    card = CardData(
+        focus="hello",
+        sentence="hello there",
+        level=1,
+        language="en",
+        ipa="/heh-lo/ (huh-LOH)",
+    )
+    ctx = ValidationContext()
+    errors = validate_card(card, ctx, {
+        "definition_required": False,
+        "ipa_required": True,
+        "translation_required": False,
+        "focus_in_sentence": False,
+        "no_duplicate_focus": False,
+        "no_duplicate_sentences": False,
+        "valid_characters": False,
+        "ipa_format": True,
+        "audio_generated": False,
+        "definition_not_literal_translation": False,
+        "sentence_length": (1, 20),
+        "sentence_difficulty_matches_level": False,
+    })
+    assert "invalid_ipa" not in errors
+
+

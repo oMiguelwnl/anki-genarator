@@ -312,7 +312,9 @@ body {
   font-size: 14px;
   color: var(--color-divader);
   margin-left: 2px;
-  font-weight: 500;
+  font-weight: 400;
+  letter-spacing: 0.03em;
+  opacity: 0.7;
 }
 
 .nightMode .targetWord {

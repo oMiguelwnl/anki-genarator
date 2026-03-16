@@ -86,7 +86,7 @@ runtime:
   retries: 2
   concurrency: 1
   seed: 42
-  test_level_size: 100
+  test_level_size: 20
   full_level_size: 1000
   ai_max_calls_per_word: 6
   ai_max_calls_per_field: 2

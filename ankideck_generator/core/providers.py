@@ -167,6 +167,11 @@ class ProviderManager:
         ]
         return self._fallback(providers)
 
+    def phonetic_spelling(self, ipa: str, language: str, allow_ai: bool = True) -> ProviderResult:
+        if not allow_ai:
+            return ProviderResult(value=None, provider_name="ai", elapsed_ms=0, error="ai_budget_exceeded")
+        return self._wrap("ai", lambda: self._phonetic_spelling_ai(ipa, language))
+
     def _fallback(self, providers: list[tuple[str, Callable[[], str | None]]]) -> ProviderResult:
         last_result: ProviderResult | None = None
         for name, fn in providers:
@@ -458,6 +463,14 @@ class ProviderManager:
     def _ipa_ai(self, word: str, language: str) -> str | None:
         system = "You provide IPA transcriptions. Return only the IPA symbols."
         user = f"Give IPA for the word '{word}' in language '{language}'."
+        return self._ai_request(system, user)
+
+    def _phonetic_spelling_ai(self, ipa: str, language: str) -> str | None:
+        system = (
+            "You convert IPA into a simple, readable pronunciation guide for learners. "
+            "Use Latin letters and hyphens if helpful. Return only the pronunciation, no IPA, no quotes."
+        )
+        user = f"Language: {language}. IPA: {ipa}"
         return self._ai_request(system, user)
 
 
