@@ -1,21 +1,32 @@
 ﻿from __future__ import annotations
 
-from collections import Counter
 import random
-from datetime import datetime
 import re
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import genanki
 from tqdm import tqdm
 
 from ..utils.config import load_config
-from ..utils.file_utils import atomic_write_json, ensure_dir, read_json
 from ..utils.definition_tools import normalize_definition
-from ..utils.language_tools import filter_frequent_words, sentence_is_acceptable, unique_keep_order
+from ..utils.file_utils import atomic_write_json, ensure_dir, read_json
+from ..utils.language_tools import (
+    filter_frequent_words,
+    sentence_is_acceptable,
+    unique_keep_order,
+)
 from ..utils.logger import JsonLogger
 from .cache_manager import CacheManager
-from .models import ANKI_FIELD_ORDER_DEFAULT, CardData, LogRecord, ProgressState, RunConfig
+from .models import (
+    ANKI_FIELD_ORDER_DEFAULT,
+    CardData,
+    LogRecord,
+    ProviderResult,
+    ProgressState,
+    RunConfig,
+)
 from .providers import ProviderManager
 from .validators import ValidationContext, validate_card
 
@@ -34,9 +45,15 @@ DEFAULT_VALIDATIONS = {
     "valid_characters": True,
     "ipa_format": True,
     "audio_generated": False,
+    "word_audio_required": False,
+    "sentence_audio_required": False,
     "definition_not_literal_translation": True,
-    "sentence_length": (5, 25),
-    "sentence_difficulty_matches_level": False,
+    "sentence_length": {
+        1: (5, 10),
+        2: (8, 14),
+        3: (8, 16),
+    },
+    "sentence_difficulty_matches_level": True,
     "ai_quality_check": False,
 }
 
@@ -80,14 +97,18 @@ class DeckBuilder:
 
         level_size = run.level_size
         wordfreq_lang = run.wordfreq_language or run.language
-        level_sets = self._prepare_levels(wordfreq_lang, level_size, run.seed, run.level_pool_multiplier)
+        level_sets = self._prepare_levels(
+            wordfreq_lang, level_size, run.seed, run.level_pool_multiplier
+        )
 
         state = None
         if run.resume:
             state = progress_store.load(run.language, run.mode)
         processed_focus = set(state.processed_focus) if state else set()
         processed_sentences = set(state.processed_sentences) if state else set()
-        next_sort_index = (state.created_cards + 1) if state and state.created_cards else 1
+        next_sort_index = (
+            (state.created_cards + 1) if state and state.created_cards else 1
+        )
         ctx.seen_focus.update(processed_focus)
         ctx.seen_sentence.update(processed_sentences)
 
@@ -101,12 +122,22 @@ class DeckBuilder:
 
         for level, words in level_sets.items():
             accepted_in_level = 0
+            attempted_in_level = 0
             level_target = level_size
-            for index, word in enumerate(tqdm(words, desc=f"Level {level}", unit="word")):
+            runtime_cfg = self.config.get("runtime") if isinstance(self.config, dict) else {}
+            runtime_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+            test_attempts_cap = bool(runtime_cfg.get("test_attempts_cap", False)) and run.mode == "test"
+            attempts_cap = level_target if test_attempts_cap else None
+            for index, word in enumerate(
+                tqdm(words, desc=f"Level {level}", unit="word")
+            ):
                 if accepted_in_level >= level_target:
+                    break
+                if attempts_cap is not None and attempted_in_level >= attempts_cap:
                     break
                 if word in processed_focus:
                     continue
+                attempted_in_level += 1
                 attempted_by_level[level] += 1
                 try:
                     card, log_record = self._process_word(
@@ -174,10 +205,18 @@ class DeckBuilder:
                 created_cards=next_sort_index - 1,
             )
         )
-        self._print_summary(accepted_by_level, attempted_by_level, validation_counter, provider_counter)
+        self._print_summary(
+            accepted_by_level, attempted_by_level, validation_counter, provider_counter
+        )
         return cards, media_files
 
-    def export_deck(self, run: RunConfig, cards: list[CardData], media_files: list[str]) -> None:
+    def export_deck(
+        self, run: RunConfig, cards: list[CardData], media_files: list[str]
+    ) -> None:
+        audio_cfg = self.config.get("audio") if isinstance(self.config, dict) else {}
+        audio_cfg = audio_cfg if isinstance(audio_cfg, dict) else {}
+        cleanup_audio = bool(audio_cfg.get("cleanup_after_export", False))
+        cleanup_dir = audio_cfg.get("output_dir", "ankideck_generator/data/audio")
         deck_cfg, field_order = self._deck_config_for_language(run.language)
         default_model_id = 1607392337 if run.language == "ru" else 1607392319
         default_deck_id = 2059400127 if run.language == "ru" else 2059400110
@@ -188,14 +227,23 @@ class DeckBuilder:
             templates=[
                 {
                     "name": "Card 1",
-                    "qfmt": self._resolve_path(deck_cfg.get("front_template")).read_text(encoding="utf-8"),
-                    "afmt": self._resolve_path(deck_cfg.get("back_template")).read_text(encoding="utf-8"),
+                    "qfmt": self._resolve_path(
+                        deck_cfg.get("front_template")
+                    ).read_text(encoding="utf-8"),
+                    "afmt": self._resolve_path(deck_cfg.get("back_template")).read_text(
+                        encoding="utf-8"
+                    ),
                 }
             ],
-            css=self._resolve_path(deck_cfg.get("css_path")).read_text(encoding="utf-8"),
+            css=self._resolve_path(deck_cfg.get("css_path")).read_text(
+                encoding="utf-8"
+            ),
         )
 
-        deck = genanki.Deck(deck_cfg.get("deck_id", default_deck_id), deck_cfg.get("name", "Anki Deck Generator"))
+        deck = genanki.Deck(
+            deck_cfg.get("deck_id", default_deck_id),
+            deck_cfg.get("name", "Anki Deck Generator"),
+        )
         for card in cards:
             note = genanki.Note(
                 model=model,
@@ -209,6 +257,9 @@ class DeckBuilder:
         ensure_dir(Path(run.output_path).parent)
         package.write_to_file(run.output_path)
 
+        if cleanup_audio:
+            self._cleanup_audio_files(media_files, cleanup_dir)
+
         metadata = {
             "generated_at": datetime.utcnow().isoformat(),
             "language": run.language,
@@ -218,7 +269,9 @@ class DeckBuilder:
         }
         atomic_write_json("output/metadata.json", metadata)
 
-    def _prepare_levels(self, language: str, level_size: int, seed: int, pool_multiplier: int = 8) -> dict[int, list[str]]:
+    def _prepare_levels(
+        self, language: str, level_size: int, seed: int, pool_multiplier: int = 8
+    ) -> dict[int, list[str]]:
         random.seed(seed)
         pool_multiplier = max(1, int(pool_multiplier))
         target_total = max(level_size * 60, 6000)
@@ -227,7 +280,9 @@ class DeckBuilder:
         if len(filtered_top) < level_size:
             raw_top = top_n_list(language, target_total * 2)
             filtered_top = filter_frequent_words(raw_top, language, min_length=3)
-        level1_pool_size = min(len(filtered_top), max(level_size * pool_multiplier, level_size))
+        level1_pool_size = min(
+            len(filtered_top), max(level_size * pool_multiplier, level_size)
+        )
         level1 = filtered_top[:level1_pool_size]
 
         pool_raw = top_n_list(language, max(50000, target_total * 3))
@@ -236,12 +291,18 @@ class DeckBuilder:
 
         level2_candidates = pool_filtered[:25000]
         random.shuffle(level2_candidates)
-        level2_pool_size = min(len(level2_candidates), max(level_size * pool_multiplier, level_size))
+        level2_pool_size = min(
+            len(level2_candidates), max(level_size * pool_multiplier, level_size)
+        )
         level2 = level2_candidates[:level2_pool_size]
 
-        level3_candidates = pool_filtered[25000:50000] if len(pool_filtered) > 50000 else pool_filtered
+        level3_candidates = (
+            pool_filtered[25000:50000] if len(pool_filtered) > 50000 else pool_filtered
+        )
         random.shuffle(level3_candidates)
-        level3_pool_size = min(len(level3_candidates), max(level_size * pool_multiplier, level_size))
+        level3_pool_size = min(
+            len(level3_candidates), max(level_size * pool_multiplier, level_size)
+        )
         level3 = level3_candidates[:level3_pool_size]
 
         return {
@@ -295,6 +356,11 @@ class DeckBuilder:
             providers_used[field] = result.provider_name
             if result.error:
                 provider_errors[field] = result.error
+            fallback_errors = getattr(result, "fallback_errors", None)
+            if isinstance(fallback_errors, dict):
+                for name, error in fallback_errors.items():
+                    if error:
+                        provider_errors[f"{field}:{name}"] = str(error)
             if ai_field and result.provider_name == "ai":
                 mark_ai(ai_field)
 
@@ -348,7 +414,9 @@ class DeckBuilder:
                     trace_result("definition", result)
                     definition_en = result.value or ""
                     if not definition_en and allow_ai("definition"):
-                        result = providers.translation_ai(source_def, run.language, "en")
+                        result = providers.translation_ai(
+                            source_def, run.language, "en"
+                        )
                         trace_result("definition", result, ai_field="definition")
                         definition_en = result.value or ""
                 if not definition_en and allow_ai("definition"):
@@ -412,15 +480,134 @@ class DeckBuilder:
 
         translation = ""
         if sentence:
-            result = providers.translation_web(sentence, run.language, run.target_translation)
+            result = providers.translation_web(
+                sentence, run.language, run.target_translation
+            )
             trace_result("translation", result)
             translation = result.value or ""
             if not translation and allow_ai("translation"):
-                result = providers.translation_ai(sentence, run.language, run.target_translation)
+                result = providers.translation_ai(
+                    sentence, run.language, run.target_translation
+                )
                 trace_result("translation", result, ai_field="translation")
                 translation = result.value or ""
 
+        audio_cfg = self.config.get("audio") if isinstance(self.config, dict) else {}
+        audio_cfg = audio_cfg if isinstance(audio_cfg, dict) else {}
+        audio_enabled = bool(audio_cfg.get("enabled", False))
+        audio_required = bool(audio_cfg.get("required", False)) and audio_enabled
+        audio_output_dir = audio_cfg.get("output_dir", "ankideck_generator/data/audio")
+        provider_order = _normalize_provider_order(audio_cfg.get("provider_order"))
+        if not provider_order:
+            provider_order = ["gtts", "responsivevoice", "pyttsx3"]
+        language_overrides = audio_cfg.get("language_overrides") or {}
+        lang_override = (
+            language_overrides.get(run.language, {})
+            if isinstance(language_overrides, dict)
+            else {}
+        )
+        voice_override = None
+        if isinstance(lang_override, dict):
+            override_order = _normalize_provider_order(lang_override.get("provider_order"))
+            if override_order:
+                provider_order = override_order
+            voice_override = lang_override.get("voice")
+        providers_cfg = self.config.get("providers", {}) if isinstance(self.config, dict) else {}
+        azure_cfg = providers_cfg.get("azure_tts", {}) if isinstance(providers_cfg, dict) else {}
+        azure_voice_map = azure_cfg.get("voice_map") or {}
+        azure_voice = voice_override or azure_voice_map.get(run.language) or azure_cfg.get("voice")
+        eleven_cfg = providers_cfg.get("elevenlabs", {}) if isinstance(providers_cfg, dict) else {}
+        voice_gender_preference = eleven_cfg.get("voice_gender_preference") or "male"
+        voice_key = _audio_voice_key(
+            str(
+                azure_voice
+                or eleven_cfg.get("voice_id")
+                or eleven_cfg.get("voice_name")
+                or voice_gender_preference
+                or "default"
+            )
+        )
+        use_legacy_cache = bool(audio_cfg.get("use_legacy_cache", False))
+
+        def _add_media(path: str) -> None:
+            if path and path not in media_files:
+                media_files.append(path)
+
+        def _cached_audio(kind: str, text_value: str) -> ProviderResult | None:
+            cache_kind = "audio_files"
+            for provider_name in provider_order:
+                cache_key = f"{kind}::{text_value}::{provider_name}::{voice_key}"
+                cached = cache.get(cache_kind, cache_key)
+                if cached and Path(cached).exists():
+                    _add_media(cached)
+                    return ProviderResult(
+                        value=cached,
+                        provider_name=provider_name,
+                        elapsed_ms=0,
+                        error=None,
+                    )
+            if use_legacy_cache:
+                legacy_key = f"{kind}::{text_value}"
+                cached = cache.get(cache_kind, legacy_key)
+                if cached and Path(cached).exists():
+                    _add_media(cached)
+                    return ProviderResult(
+                        value=cached,
+                        provider_name="cache",
+                        elapsed_ms=0,
+                        error=None,
+                    )
+            return None
+
+        def _audio_for(kind: str, text_value: str) -> tuple[str, ProviderResult | None]:
+            if not audio_enabled or not text_value:
+                return "", None
+            cached = _cached_audio(kind, text_value)
+            if cached and cached.value:
+                return _sound_tag(cached.value), cached
+            filename_hint = f"{run.language}_{kind}_{text_value}_{voice_key}"
+            result = providers.audio(
+                text_value,
+                run.language,
+                audio_output_dir,
+                filename_hint,
+                provider_order=provider_order,
+                voice=azure_voice,
+                voice_gender_preference=voice_gender_preference,
+            )
+            provider_name = getattr(result, "provider_name", "unknown")
+            value = getattr(result, "value", None)
+            error = getattr(result, "error", None)
+            elapsed_ms = getattr(result, "elapsed_ms", 0)
+            if value and Path(value).exists():
+                cache_key = f"{kind}::{text_value}::{provider_name}::{voice_key}"
+                cache.set("audio_files", cache_key, value)
+                _add_media(value)
+                return _sound_tag(value), result
+            if value and not Path(value).exists():
+                result = ProviderResult(
+                    value=None,
+                    provider_name=provider_name,
+                    elapsed_ms=elapsed_ms,
+                    error=error or "audio_file_missing",
+                )
+            return "", result
+
         audio_value = ""
+        word_audio = ""
+        sentence_audio = ""
+        if audio_enabled:
+            word_audio, result = _audio_for("word", word)
+            if result:
+                trace_result("word_audio", result)
+            if word_audio:
+                audio_value = word_audio
+            if sentence:
+                sentence_audio, result = _audio_for("sentence", sentence)
+                if result:
+                    trace_result("sentence_audio", result)
+                if not audio_value and sentence_audio:
+                    audio_value = sentence_audio
 
         card = CardData(
             focus=word,
@@ -432,14 +619,21 @@ class DeckBuilder:
             translation_language=run.target_translation,
             image="",
             audio=audio_value,
-            word_audio="",
-            sentence_audio="",
+            word_audio=word_audio,
+            sentence_audio=sentence_audio,
             level=level,
             language=run.language,
         )
 
-        errors = validate_card(card, ctx, _validations_for_language(run.language))
-        if errors:
+        errors = validate_card(
+            card,
+            ctx,
+            _validations_for_language(run.language, audio_required=audio_required),
+        )
+        runtime_cfg = self.config.get("runtime") if isinstance(self.config, dict) else {}
+        runtime_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+        test_accept_all = bool(runtime_cfg.get("test_accept_all", False)) and run.mode == "test"
+        if errors and not test_accept_all:
             discard_reason = _infer_discard_reason(errors, provider_errors)
             return None, LogRecord(
                 focus=word,
@@ -449,6 +643,15 @@ class DeckBuilder:
                 validations=errors,
                 status="discarded",
                 discard_reason=discard_reason,
+            )
+        if errors and test_accept_all:
+            return card, LogRecord(
+                focus=word,
+                level=level,
+                providers=providers_used,
+                provider_errors=provider_errors,
+                validations=errors,
+                status="accepted",
             )
 
         if run.interactive:
@@ -517,6 +720,34 @@ class DeckBuilder:
                 else:
                     print("Unknown field")
 
+    def _cleanup_audio_files(self, media_files: list[str], audio_dir: str | Path) -> None:
+        base_dir = Path(audio_dir).resolve()
+        removed = set()
+        for path_str in media_files:
+            path = Path(path_str)
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if base_dir not in resolved.parents and resolved != base_dir:
+                continue
+            if resolved.suffix.lower() not in {".mp3", ".wav", ".ogg", ".opus"}:
+                continue
+            if resolved in removed:
+                continue
+            try:
+                resolved.unlink()
+                removed.add(resolved)
+            except OSError:
+                continue
+        # Remove empty directories under the audio dir
+        for folder in sorted(base_dir.rglob("*"), reverse=True):
+            if folder.is_dir():
+                try:
+                    folder.rmdir()
+                except OSError:
+                    continue
+
 
 def _normalize_ipa(value: str) -> str:
     if not value:
@@ -548,23 +779,58 @@ def _sanitize_phonetic(value: str) -> str:
     return text
 
 
-def _infer_discard_reason(errors: list[str], provider_errors: dict[str, str]) -> str | None:
-    sentence_related = {"focus_not_in_sentence", "example_word_not_in_sentence", "sentence_length_invalid"}
+def _normalize_provider_order(value: object) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _audio_voice_key(value: str) -> str:
+    cleaned = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)
+    return cleaned[:80] if cleaned else "default"
+
+
+def _sound_tag(path: str) -> str:
+    return f"[sound:{Path(path).name}]"
+
+
+def _infer_discard_reason(
+    errors: list[str], provider_errors: dict[str, str]
+) -> str | None:
+    sentence_related = {
+        "focus_not_in_sentence",
+        "example_word_not_in_sentence",
+        "sentence_length_invalid",
+    }
     if "sentence" in provider_errors or sentence_related.intersection(errors):
         return "sentence_generation_failed"
-    if "translation" in provider_errors or "word_translation" in provider_errors or "translation_missing" in errors:
+    if (
+        "translation" in provider_errors
+        or "word_translation" in provider_errors
+        or "translation_missing" in errors
+    ):
         return "translation_generation_failed"
     if "definition" in provider_errors or "definition_missing" in errors:
         return "definition_generation_failed"
     if "ipa" in provider_errors or "ipa_missing" in errors:
         return "ipa_generation_failed"
-    if "letter_audio" in provider_errors or "word_audio" in provider_errors or "sentence_audio" in provider_errors:
+    if (
+        "letter_audio" in provider_errors
+        or "word_audio" in provider_errors
+        or "sentence_audio" in provider_errors
+    ):
         return "audio_generation_failed"
     return None
 
 
-def _validations_for_language(language: str) -> dict[str, object]:
+def _validations_for_language(language: str, audio_required: bool = False) -> dict[str, object]:
     _ = language
-    return DEFAULT_VALIDATIONS
-
-
+    validations = dict(DEFAULT_VALIDATIONS)
+    if audio_required:
+        validations["word_audio_required"] = True
+        validations["sentence_audio_required"] = True
+    return validations

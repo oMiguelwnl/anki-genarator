@@ -56,6 +56,8 @@ def main() -> int:
     ai_max_calls_per_word = mode_profile.get("ai_max_calls_per_word", runtime_cfg.get("ai_max_calls_per_word", 6))
     ai_max_calls_per_field = mode_profile.get("ai_max_calls_per_field", runtime_cfg.get("ai_max_calls_per_field", 2))
     level_pool_multiplier = runtime_cfg.get("level_pool_multiplier", 8)
+    if mode == "test":
+        level_pool_multiplier = runtime_cfg.get("test_level_pool_multiplier", level_pool_multiplier)
     strict_quality = runtime_cfg.get("strict_quality", True)
 
     run = RunConfig(

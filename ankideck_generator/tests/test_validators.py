@@ -54,3 +54,33 @@ def test_validate_card_ipa_with_pronunciation_suffix() -> None:
     assert "invalid_ipa" not in errors
 
 
+def test_validate_card_requires_word_and_sentence_audio() -> None:
+    card = CardData(
+        focus="hello",
+        sentence="hello there",
+        level=1,
+        language="en",
+        word_audio="",
+        sentence_audio="",
+    )
+    ctx = ValidationContext()
+    errors = validate_card(card, ctx, {
+        "definition_required": False,
+        "ipa_required": False,
+        "translation_required": False,
+        "focus_in_sentence": True,
+        "no_duplicate_focus": False,
+        "no_duplicate_sentences": False,
+        "valid_characters": False,
+        "ipa_format": False,
+        "audio_generated": False,
+        "word_audio_required": True,
+        "sentence_audio_required": True,
+        "definition_not_literal_translation": False,
+        "sentence_length": (1, 20),
+        "sentence_difficulty_matches_level": False,
+    })
+    assert "word_audio_missing" in errors
+    assert "sentence_audio_missing" in errors
+
+

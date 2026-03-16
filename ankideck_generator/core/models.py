@@ -84,6 +84,7 @@ class ProviderResult(BaseModel):
     provider_name: str
     elapsed_ms: int
     error: str | None = None
+    fallback_errors: dict[str, str] | None = None
 
 
 class RunConfig(BaseModel):

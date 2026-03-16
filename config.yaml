@@ -41,6 +41,25 @@ providers:
   responsivevoice:
     api_key: ""
     endpoint: "https://api.responsivevoice.org/v1/text:speech"
+  azure_tts:
+    region: ""
+    api_key_env: "AZURE_TTS_KEY"
+    region_env: "AZURE_TTS_REGION"
+    endpoint: ""
+    output_format: "audio-16khz-32kbitrate-mono-mp3"
+    voice_map:
+      en: "en-US-Andrew Dragon HD Latest"
+      es: "es-ES-Tristan Multilingual"
+      fr: "fr-FR-Remy Dragon HD Latest"
+      it: "it-IT-Giuseppe Multilingual"
+      de: "de-DE-Conrad"
+  elevenlabs:
+    api_key_env: "ELEVENLABS_API_KEY"
+    voice_id: ""
+    voice_name: ""
+    voice_gender_preference: "male"
+    model_id: "eleven_multilingual_v2"
+    output_format: "mp3_44100_128"
   ai:
     providers:
       - "openrouter"
@@ -73,8 +92,24 @@ cache:
   path: "ankideck_generator/data/cache"
   autosave_every: 10
 
+audio:
+  enabled: true
+  required: false
+  output_dir: "ankideck_generator/data/audio"
+  cleanup_after_export: true
+  provider_order:
+    - "azure_tts"
+    - "gtts"
+    - "responsivevoice"
+    - "pyttsx3"
+  language_overrides:
+    ru:
+      provider_order:
+        - "elevenlabs"
+  use_legacy_cache: false
+
 deck:
-  name: "Anki Deck Generator ES Blue v2"
+  name: "Anki Deck Generator"
   model_id: 1607392327
   deck_id: 2059400117
   css_path: "ankideck_generator/templates/styles.css"
@@ -86,7 +121,10 @@ runtime:
   retries: 2
   concurrency: 1
   seed: 42
-  test_level_size: 20
+  test_level_size: 10
+  test_level_pool_multiplier: 1
+  test_attempts_cap: true
+  test_accept_all: true
   full_level_size: 1000
   ai_max_calls_per_word: 6
   ai_max_calls_per_field: 2

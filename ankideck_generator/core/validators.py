@@ -4,7 +4,11 @@ import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
-from ..utils.language_tools import difficulty, valid_focus_characters, valid_sentence_characters
+from ..utils.language_tools import (
+    difficulty,
+    valid_focus_characters,
+    valid_sentence_characters,
+)
 from .models import CardData
 
 IPA_RE = re.compile(r"^/[^/]+/(?:\s*\([^()]+\))?$")
@@ -16,7 +20,9 @@ class ValidationContext:
     seen_sentence: set[str] = field(default_factory=set)
 
 
-def validate_card(card: CardData, ctx: ValidationContext, validations: dict[str, object]) -> list[str]:
+def validate_card(
+    card: CardData, ctx: ValidationContext, validations: dict[str, object]
+) -> list[str]:
     errors: list[str] = []
 
     if validations.get("spellings_required"):
@@ -34,6 +40,14 @@ def validate_card(card: CardData, ctx: ValidationContext, validations: dict[str,
     if validations.get("letter_audio_required"):
         if not card.letter_audio:
             errors.append("letter_audio_missing")
+
+    if validations.get("word_audio_required"):
+        if not card.word_audio:
+            errors.append("word_audio_missing")
+
+    if validations.get("sentence_audio_required"):
+        if not card.sentence_audio:
+            errors.append("sentence_audio_missing")
 
     if validations.get("definition_required"):
         if not card.definition:
@@ -84,16 +98,20 @@ def validate_card(card: CardData, ctx: ValidationContext, validations: dict[str,
             and card.translation_language
             and card.translation_language != card.language
         ):
-            ratio = SequenceMatcher(None, card.definition.lower(), card.translation.lower()).ratio()
+            ratio = SequenceMatcher(
+                None, card.definition.lower(), card.translation.lower()
+            ).ratio()
             if ratio > 0.85:
                 errors.append("definition_too_similar_translation")
 
-    length_range = validations.get("sentence_length")
-    if isinstance(length_range, (list, tuple)) and len(length_range) == 2:
-        min_len, max_len = length_range
-        word_count = len(card.sentence.split())
-        if not (min_len <= word_count <= max_len):
-            errors.append("sentence_length_invalid")
+    length_config = validations.get("sentence_length")
+    if isinstance(length_config, dict):
+        length_range = length_config.get(card.level)
+        if isinstance(length_range, (list, tuple)) and len(length_range) == 2:
+            min_len, max_len = length_range
+            word_count = len(card.sentence.split())
+            if not (min_len <= word_count <= max_len):
+                errors.append("sentence_length_invalid")
 
     if validations.get("sentence_difficulty_matches_level"):
         score = difficulty(card.sentence, card.language)

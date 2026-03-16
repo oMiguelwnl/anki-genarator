@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
+from xml.sax.saxutils import escape as xml_escape
 
 import requests
 from gtts import gTTS
@@ -44,6 +45,8 @@ class ProviderManager:
         self.retries = retries
         self._session = requests.Session()
         self._translator = Translator() if Translator else None
+        self._elevenlabs_voice_cache: dict[str, str] = {}
+        self._elevenlabs_voices: list[dict] | None = None
         self._ai_config = (config or {}).get("providers", {}).get("ai", {}) if config else {}
         self._ai_request_count = 0
         providers = self._ai_config.get("providers") or self._ai_config.get("provider") or "openrouter"
@@ -151,12 +154,71 @@ class ProviderManager:
         ]
         return self._fallback(providers)
 
-    def audio(self, text: str, language: str, output_dir: str | Path, filename_hint: str) -> ProviderResult:
-        providers = [
-            ("gtts", lambda: self._audio_gtts(text, language, output_dir, filename_hint)),
-            ("responsivevoice", lambda: self._audio_responsivevoice(text, language, output_dir, filename_hint)),
-            ("pyttsx3", lambda: self._audio_pyttsx3(text, output_dir, filename_hint)),
+    def audio(
+        self,
+        text: str,
+        language: str,
+        output_dir: str | Path,
+        filename_hint: str,
+        provider_order: list[str] | None = None,
+        voice: str | None = None,
+        voice_gender_preference: str | None = None,
+    ) -> ProviderResult:
+        order = _normalize_provider_order(provider_order) or [
+            "gtts",
+            "responsivevoice",
+            "pyttsx3",
         ]
+        providers: list[tuple[str, Callable[[], str | None]]] = []
+        for provider_name in order:
+            provider_hint = f"{filename_hint}__{provider_name}"
+            if provider_name == "azure_tts":
+                providers.append(
+                    (
+                        "azure_tts",
+                        lambda hint=provider_hint, v=voice: self._audio_azure_tts(
+                            text, language, output_dir, hint, voice=v
+                        ),
+                    )
+                )
+            elif provider_name == "elevenlabs":
+                providers.append(
+                    (
+                        "elevenlabs",
+                        lambda hint=provider_hint, pref=voice_gender_preference: self._audio_elevenlabs(
+                            text, language, output_dir, hint, voice_gender_preference=pref
+                        ),
+                    )
+                )
+            elif provider_name == "gtts":
+                providers.append(
+                    (
+                        "gtts",
+                        lambda hint=provider_hint: self._audio_gtts(
+                            text, language, output_dir, hint
+                        ),
+                    )
+                )
+            elif provider_name == "responsivevoice":
+                providers.append(
+                    (
+                        "responsivevoice",
+                        lambda hint=provider_hint: self._audio_responsivevoice(
+                            text, language, output_dir, hint
+                        ),
+                    )
+                )
+            elif provider_name == "pyttsx3":
+                providers.append(
+                    (
+                        "pyttsx3",
+                        lambda hint=provider_hint: self._audio_pyttsx3(
+                            text, output_dir, hint
+                        ),
+                    )
+                )
+        if not providers:
+            return ProviderResult(value=None, provider_name="none", elapsed_ms=0, error="no providers")
         return self._fallback(providers)
 
     def ipa(self, word: str, language: str, allow_ai: bool = True) -> ProviderResult:
@@ -174,12 +236,21 @@ class ProviderManager:
 
     def _fallback(self, providers: list[tuple[str, Callable[[], str | None]]]) -> ProviderResult:
         last_result: ProviderResult | None = None
+        fallback_errors: dict[str, str] = {}
         for name, fn in providers:
             result = self._wrap(name, fn)
             if result.value:
+                if fallback_errors:
+                    result.fallback_errors = fallback_errors
                 return result
+            if result.error:
+                fallback_errors[name] = result.error
             last_result = result
-        return last_result or ProviderResult(value=None, provider_name="none", elapsed_ms=0, error="no providers")
+        if last_result:
+            if fallback_errors:
+                last_result.fallback_errors = fallback_errors
+            return last_result
+        return ProviderResult(value=None, provider_name="none", elapsed_ms=0, error="no providers")
 
     def _definition_wordnet(self, word: str, language: str) -> str | None:
         if language != "en" or wordnet is None:
@@ -350,6 +421,141 @@ class ProviderManager:
         engine.runAndWait()
         return str(path)
 
+    def _audio_azure_tts(
+        self,
+        text: str,
+        language: str,
+        output_dir: str | Path,
+        filename_hint: str,
+        voice: str | None = None,
+    ) -> str | None:
+        config = self.config.get("providers", {}).get("azure_tts", {})
+        api_key_env = config.get("api_key_env") or "AZURE_TTS_KEY"
+        region_env = config.get("region_env") or "AZURE_TTS_REGION"
+        api_key = config.get("api_key") or _resolve_env_value(api_key_env)
+        region = config.get("region") or _resolve_env_value(region_env)
+        endpoint = config.get("endpoint") or (
+            f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1" if region else None
+        )
+        voice_map = config.get("voice_map") or {}
+        voice_name = voice or voice_map.get(language) or config.get("voice")
+        if not api_key:
+            raise ProviderError("azure_tts missing api_key")
+        if not endpoint:
+            raise ProviderError("azure_tts missing endpoint or region")
+        if not voice_name:
+            raise ProviderError("azure_tts missing voice for language")
+        output_format = config.get("output_format") or "audio-16khz-32kbitrate-mono-mp3"
+        locale = _voice_locale(voice_name) or language
+        ssml = (
+            f"<speak version='1.0' xml:lang='{locale}'>"
+            f"<voice name='{voice_name}'>{xml_escape(text)}</voice></speak>"
+        )
+        headers = {
+            "Ocp-Apim-Subscription-Key": api_key,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": output_format,
+            "User-Agent": "ankideck-generator",
+        }
+        resp = self._session.post(endpoint, data=ssml.encode("utf-8"), headers=headers, timeout=self.timeout_sec)
+        if resp.status_code != 200:
+            raise ProviderError(f"azure_tts HTTP {resp.status_code}: {resp.text[:200]}")
+        ensure_dir(output_dir)
+        safe_name = _safe_filename(filename_hint)
+        ext = _audio_extension_from_format(output_format)
+        path = Path(output_dir) / f"{safe_name}.{ext}"
+        path.write_bytes(resp.content)
+        return str(path)
+
+    def _audio_elevenlabs(
+        self,
+        text: str,
+        language: str,
+        output_dir: str | Path,
+        filename_hint: str,
+        voice_gender_preference: str | None = None,
+    ) -> str | None:
+        _ = language
+        config = self.config.get("providers", {}).get("elevenlabs", {})
+        api_key_env = config.get("api_key_env") or "ELEVENLABS_API_KEY"
+        api_key = config.get("api_key") or _resolve_env_value(api_key_env)
+        if not api_key:
+            raise ProviderError("elevenlabs missing api_key")
+        voice_id = config.get("voice_id") or ""
+        voice_name = config.get("voice_name") or ""
+        gender_pref = voice_gender_preference or config.get("voice_gender_preference") or ""
+        if not voice_id:
+            voice_id = self._resolve_elevenlabs_voice_id(api_key, voice_name, gender_pref)
+        if not voice_id:
+            raise ProviderError("elevenlabs voice_id not found")
+        model_id = config.get("model_id") or "eleven_multilingual_v2"
+        endpoint = config.get("endpoint") or "https://api.elevenlabs.io/v1/text-to-speech"
+        output_format = config.get("output_format") or ""
+        url = endpoint.rstrip("/") + f"/{voice_id}"
+        if output_format:
+            url = f"{url}?output_format={quote(str(output_format))}"
+        headers = {
+            "xi-api-key": api_key,
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "text": text,
+            "model_id": model_id,
+        }
+        resp = self._session.post(url, json=payload, headers=headers, timeout=self.timeout_sec)
+        if resp.status_code != 200:
+            raise ProviderError(f"elevenlabs HTTP {resp.status_code}: {resp.text[:200]}")
+        ensure_dir(output_dir)
+        safe_name = _safe_filename(filename_hint)
+        ext = _audio_extension_from_format(output_format) or "mp3"
+        path = Path(output_dir) / f"{safe_name}.{ext}"
+        path.write_bytes(resp.content)
+        return str(path)
+
+    def _resolve_elevenlabs_voice_id(
+        self, api_key: str, voice_name: str, gender_preference: str
+    ) -> str | None:
+        cache_key = (voice_name or "").strip().lower() or f"gender:{gender_preference.lower()}"
+        cached = self._elevenlabs_voice_cache.get(cache_key)
+        if cached:
+            return cached
+        voices = self._elevenlabs_voices or self._fetch_elevenlabs_voices(api_key)
+        self._elevenlabs_voices = voices
+        if not voices:
+            return None
+        if voice_name:
+            for voice in voices:
+                if str(voice.get("name", "")).strip().lower() == voice_name.strip().lower():
+                    voice_id = voice.get("voice_id")
+                    if voice_id:
+                        self._elevenlabs_voice_cache[cache_key] = voice_id
+                        return voice_id
+        gender = gender_preference.strip().lower()
+        if gender:
+            for voice in voices:
+                labels = voice.get("labels") or {}
+                if str(labels.get("gender", "")).strip().lower() == gender:
+                    voice_id = voice.get("voice_id")
+                    if voice_id:
+                        self._elevenlabs_voice_cache[cache_key] = voice_id
+                        return voice_id
+        fallback = voices[0].get("voice_id")
+        if fallback:
+            self._elevenlabs_voice_cache[cache_key] = fallback
+        return fallback
+
+    def _fetch_elevenlabs_voices(self, api_key: str) -> list[dict]:
+        config = self.config.get("providers", {}).get("elevenlabs", {})
+        endpoint = config.get("voices_endpoint") or "https://api.elevenlabs.io/v1/voices"
+        headers = {"xi-api-key": api_key}
+        resp = self._session.get(endpoint, headers=headers, timeout=self.timeout_sec)
+        if resp.status_code != 200:
+            raise ProviderError(f"elevenlabs voices HTTP {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+        voices = data.get("voices")
+        return voices if isinstance(voices, list) else []
+
     def _ai_request(self, system_prompt: str, user_prompt: str, first_line_only: bool = True) -> str | None:
         last_error: str | None = None
         self._ai_request_count += 1
@@ -513,3 +719,40 @@ def _best_sentence(candidates: list[str], focus: str, language: str) -> str | No
     scored.sort(key=lambda item: item[0], reverse=True)
     best_score, best_sentence = scored[0]
     return best_sentence if best_score > 0 else None
+
+
+def _normalize_provider_order(value: list[str] | str | None) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _resolve_env_value(name: str | None) -> str | None:
+    if not name:
+        return None
+    value = os.environ.get(name)
+    return value if value else None
+
+
+def _voice_locale(voice_name: str) -> str | None:
+    parts = voice_name.split("-")
+    if len(parts) >= 2:
+        return f"{parts[0]}-{parts[1]}"
+    return None
+
+
+def _audio_extension_from_format(value: str | None) -> str:
+    if not value:
+        return "mp3"
+    text = str(value).lower()
+    if "wav" in text or "riff" in text or "pcm" in text:
+        return "wav"
+    if "ogg" in text:
+        return "ogg"
+    if "opus" in text:
+        return "opus"
+    if "mp3" in text or "mpeg" in text:
+        return "mp3"
+    return "mp3"
