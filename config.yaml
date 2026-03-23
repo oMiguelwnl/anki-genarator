@@ -48,11 +48,11 @@ providers:
     endpoint: ""
     output_format: "audio-16khz-32kbitrate-mono-mp3"
     voice_map:
-      en: "en-US-Andrew Dragon HD Latest"
-      es: "es-ES-Tristan Multilingual"
-      fr: "fr-FR-Remy Dragon HD Latest"
-      it: "it-IT-Giuseppe Multilingual"
-      de: "de-DE-Conrad"
+      en: "en-US-Andrew:DragonHDLatestNeural"
+      es: "es-ES-Tristan:DragonHDLatestNeural"
+      fr: "fr-FR-Remy:DragonHDLatestNeural"
+      it: "it-IT-GiuseppeMultilingualNeural"
+      de: "de-DE-ConradNeural"
   elevenlabs:
     api_key_env: "ELEVENLABS_API_KEY"
     voice_id: ""
@@ -97,6 +97,8 @@ audio:
   required: false
   output_dir: "ankideck_generator/data/audio"
   cleanup_after_export: true
+  filename_style: "slug_hash"
+  filename_slug_words: 4
   provider_order:
     - "azure_tts"
     - "gtts"
