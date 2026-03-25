@@ -1,10 +1,20 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Iterable
 
 from wordfreq import zipf_frequency
+
+try:
+    from langdetect import DetectorFactory, detect_langs
+except Exception:  # pragma: no cover - optional
+    DetectorFactory = None
+    detect_langs = None
+
+if DetectorFactory is not None:  # pragma: no branch - deterministic language detection
+    DetectorFactory.seed = 0
 
 LANG_CODE_TO_NAME = {
     "en": "English",
@@ -55,6 +65,24 @@ SENTENCE_TEMPLATES = {
 }
 
 WORD_RE = re.compile(r"[\w'-]+", re.UNICODE)
+META_DEFINITION_PATTERNS = [
+    re.compile(
+        r"\b(?:inflection|form|imperative|participle|plural|singular)\s+of\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:simple past|past participle|present participle)\s+of\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:genitive|accusative|dative|prepositional|instrumental|locative|ablative|nominative|vocative)\b.*\bof\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bthe word\b.+\bnot a\b.+\bword\b", re.IGNORECASE),
+    re.compile(r"\bused as a greeting or farewell\b", re.IGNORECASE),
+    re.compile(r"\bdialects?\s+of\b", re.IGNORECASE),
+    re.compile(r"\bdepending on the context\b", re.IGNORECASE),
+]
 
 STOPWORDS = {
     "en": {
@@ -97,6 +125,55 @@ STOPWORDS = {
         "из", "у", "о", "об", "для", "при", "про", "над", "под", "между", "это", "тот", "та", "то",
         "эти", "этот", "эта", "там", "тут", "он", "она", "они", "мы", "вы", "я", "ты", "его", "ее",
         "их", "мой", "твой", "наш", "ваш", "есть", "был", "были", "не",
+    },
+}
+
+
+CLOSED_CLASS_WORDS: dict[str, set[str]] = {
+    "en": {
+        "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "for",
+        "from", "had", "has", "have", "he", "her", "hers", "him", "his", "i", "if", "in",
+        "into", "is", "it", "its", "me", "my", "of", "on", "or", "our", "ours", "she",
+        "that", "the", "their", "theirs", "them", "they", "this", "those", "to", "us",
+        "we", "were", "what", "which", "who", "whom", "with", "you", "your", "yours",
+    },
+    "es": {
+        "a", "al", "con", "de", "del", "el", "ella", "ellas", "ellos", "en", "la", "las",
+        "le", "les", "lo", "los", "me", "mi", "mis", "nos", "nosotros", "o", "para", "por",
+        "que", "se", "si", "sin", "su", "sus", "te", "tu", "tus", "un", "una", "uno", "unos", "y",
+    },
+    "fr": {
+        "a", "au", "aux", "avec", "ce", "ces", "dans", "de", "des", "du", "elle", "elles",
+        "en", "et", "il", "ils", "je", "la", "le", "les", "leur", "leurs", "lui", "ma", "mes",
+        "moi", "mon", "nous", "ou", "par", "pas", "pour", "que", "qui", "sa", "se", "ses",
+        "son", "sur", "ta", "te", "tes", "toi", "tu", "un", "une", "vous", "y",
+    },
+    "it": {
+        "a", "al", "alla", "alle", "allo", "che", "con", "da", "dal", "dalla", "dalle", "dello",
+        "dei", "del", "della", "di", "e", "gli", "ha", "i", "il", "in", "io", "la", "le", "lo",
+        "lui", "ma", "mi", "ne", "noi", "o", "per", "quale", "quali", "se", "si", "su", "sua",
+        "sue", "sul", "sulla", "te", "ti", "tra", "tu", "un", "una", "uno", "voi",
+    },
+    "de": {
+        "aber", "als", "am", "an", "auch", "auf", "aus", "bei", "bis", "da", "das", "dass",
+        "dein", "dem", "den", "der", "des", "die", "du", "ein", "eine", "einem", "einen",
+        "einer", "es", "für", "hat", "ich", "ihr", "im", "in", "ist", "mit", "nach", "nicht",
+        "oder", "sein", "seine", "sich", "sie", "und", "uns", "vom", "von", "war", "wir", "zu",
+    },
+    "ru": {
+        "\u0430", "\u0431\u0435\u0437", "\u0431\u044b", "\u0432", "\u0432\u0430\u0441", "\u0432\u0430\u043c",
+        "\u0432\u0430\u0448", "\u0432\u0430\u0448\u0430", "\u0432\u0430\u0448\u0435", "\u0432\u0430\u0448\u0438",
+        "\u0432\u0430\u0448\u0435\u0433\u043e", "\u0432\u0430\u0448\u0435\u043c\u0443", "\u0432\u0430\u0448\u0438\u0445",
+        "\u0432\u0441\u0435", "\u0432\u0441\u0435\u0445", "\u0432\u0441\u0435\u043c", "\u0432\u044b", "\u0433\u0434\u0435",
+        "\u0434\u0430", "\u0434\u043b\u044f", "\u0435\u0433\u043e", "\u0435\u0435", "\u0435\u0451", "\u0438",
+        "\u0438\u043b\u0438", "\u0438\u043c", "\u0438\u043c\u0438", "\u0438\u0445", "\u043a", "\u043a\u0430\u043a",
+        "\u043a\u0442\u043e", "\u043c\u0435\u043d\u044f", "\u043c\u043d\u0435", "\u043c\u043e\u0439", "\u043c\u044b",
+        "\u043d\u0430", "\u043d\u0430\u0441", "\u043d\u0435", "\u043d\u0435\u0433\u043e", "\u043d\u0435\u0439",
+        "\u043d\u0438\u0445", "\u043d\u043e", "\u043e", "\u043e\u043d", "\u043e\u043d\u0430", "\u043e\u043d\u0438",
+        "\u043e\u0442", "\u043f\u043e", "\u043f\u043e\u0442\u043e\u043c\u0443", "\u043f\u043e\u0447\u0435\u043c\u0443",
+        "\u043f\u0440\u0438", "\u0441", "\u0441\u0435\u0431\u044f", "\u0442\u0430\u043a", "\u0442\u0435\u0431\u0435",
+        "\u0442\u044b", "\u0443", "\u0447\u0435\u0433\u043e", "\u0447\u0442\u043e", "\u044d\u0442\u043e",
+        "\u044d\u0442\u043e\u043c", "\u044f",
     },
 }
 
@@ -164,8 +241,20 @@ def unique_keep_order(items: Iterable[str]) -> list[str]:
     return result
 
 
-def filter_frequent_words(words: Iterable[str], language: str, min_length: int = 3) -> list[str]:
-    stopwords = STOPWORDS.get(language, set())
+def is_closed_class_word(word: str, language: str) -> bool:
+    language_code = normalize_language_code(language)
+    lexicon = CLOSED_CLASS_WORDS.get(language_code, set())
+    return word.lower() in lexicon
+
+
+def filter_frequent_words(
+    words: Iterable[str],
+    language: str,
+    min_length: int = 3,
+    *,
+    exclude_closed_class_words: bool = True,
+) -> list[str]:
+    stopwords = CLOSED_CLASS_WORDS.get(normalize_language_code(language), set())
     result: list[str] = []
     for word in words:
         lower = word.lower()
@@ -173,29 +262,126 @@ def filter_frequent_words(words: Iterable[str], language: str, min_length: int =
             continue
         if not lower.isalpha():
             continue
-        if lower in stopwords:
+        if exclude_closed_class_words and lower in stopwords:
             continue
         result.append(lower)
     return result
 
 
-def score_sentence(sentence: str, focus: str, language: str) -> float:
+def score_sentence(
+    sentence: str,
+    focus: str,
+    language: str,
+    *,
+    min_words: int = 5,
+    max_words: int = 25,
+) -> float:
     if not sentence:
         return 0.0
     tokens = tokenize(sentence)
     word_count = len(tokens)
-    if word_count < 5 or word_count > 25:
+    if word_count < min_words or word_count > max_words:
         return 0.0
     if focus.lower() not in sentence.lower():
         return 0.0
     score = 1.0
-    # Prefer medium length
     score += 1.0 - abs(12 - word_count) / 12
-    # Prefer mid-frequency words
     diff = difficulty(sentence, language)
     if diff.tokens:
         score += max(0.0, min(1.0, (diff.average_zipf - 2.5) / 2.5))
-    # Penalize excessive punctuation
     punctuation = sum(1 for ch in sentence if ch in {",", ";", ":", "(", ")", "\"", "“", "”"})
     score -= min(0.5, punctuation * 0.1)
     return score
+
+
+def normalize_language_code(value: str | None) -> str:
+    if not value:
+        return ""
+    text = str(value).strip().lower()
+    if "-" in text:
+        text = text.split("-", 1)[0]
+    return text
+
+
+def text_language_score(text: str, expected_language: str) -> float:
+    language = normalize_language_code(expected_language)
+    tokens = [token for token in tokenize(text) if any(ch.isalpha() for ch in token)]
+    if not language or not tokens:
+        return 0.0
+
+    stopwords = STOPWORDS.get(language, set()) | CLOSED_CLASS_WORDS.get(language, set())
+    stopword_hits = sum(1 for token in tokens if token in stopwords)
+    stopword_score = stopword_hits / len(tokens)
+
+    detect_score = 0.0
+    if detect_langs is not None and len(" ".join(tokens)) >= 8:
+        try:
+            matches = detect_langs(text)
+        except Exception:  # pragma: no cover - optional
+            matches = []
+        for match in matches:
+            if normalize_language_code(getattr(match, "lang", "")) == language:
+                detect_score = max(detect_score, float(getattr(match, "prob", 0.0)))
+
+    return max(detect_score, min(1.0, stopword_score * 2.5))
+
+
+def text_matches_language(
+    text: str,
+    expected_language: str,
+    *,
+    min_score: float = 0.55,
+    min_tokens: int = 2,
+) -> bool:
+    tokens = [token for token in tokenize(text) if any(ch.isalpha() for ch in token)]
+    if len(tokens) < min_tokens:
+        return False
+    return text_language_score(text, expected_language) >= min_score
+
+
+def semantic_definition_reason(text: str, focus: str = "") -> str | None:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return "definition_missing"
+
+    alpha_tokens = [token for token in tokenize(cleaned) if token.isalpha()]
+    if len(alpha_tokens) < 3:
+        return "definition_too_short"
+
+    for pattern in META_DEFINITION_PATTERNS:
+        if pattern.search(cleaned):
+            return "definition_nonsemantic"
+
+    if focus:
+        lower = cleaned.lower()
+        quoted_focus = f'"{focus.lower()}"'
+        if quoted_focus in lower or f"'{focus.lower()}'" in lower:
+            return "definition_nonsemantic"
+
+    language_names = {name.lower() for name in LANG_CODE_TO_NAME.values()}
+    lower_tokens = {token.lower() for token in alpha_tokens}
+    if lower_tokens.intersection(language_names):
+        return "definition_mentions_other_language"
+
+    return None
+
+
+def is_semantic_definition(text: str, focus: str = "") -> bool:
+    return semantic_definition_reason(text, focus) is None
+
+
+def compact_audio_basename(
+    language: str,
+    kind: str,
+    text: str,
+    *,
+    slug_words: int = 4,
+    extra: str = "",
+) -> str:
+    slug_tokens = tokenize(text)[: max(1, slug_words)]
+    slug = "-".join(slug_tokens).lower()
+    slug = re.sub(r"[^a-z0-9\-]+", "", slug)
+    slug = slug[:24].strip("-") or kind
+    digest_input = f"{language}|{kind}|{text}|{extra}".encode("utf-8")
+    digest = hashlib.sha1(digest_input).hexdigest()[:8]
+    return f"{language}_{kind}_{slug}_{digest}"

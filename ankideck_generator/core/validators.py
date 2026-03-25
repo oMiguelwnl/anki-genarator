@@ -4,14 +4,18 @@ import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
+from ..utils.definition_tools import definition_has_pos
 from ..utils.language_tools import (
     difficulty,
+    is_semantic_definition,
+    text_matches_language,
     valid_focus_characters,
     valid_sentence_characters,
 )
 from .models import CardData
 
 IPA_RE = re.compile(r"^/[^/]+/(?:\s*\([^()]+\))?$")
+CLAUSE_PUNCTUATION = {";", ":"}
 
 
 @dataclass
@@ -21,7 +25,11 @@ class ValidationContext:
 
 
 def validate_card(
-    card: CardData, ctx: ValidationContext, validations: dict[str, object]
+    card: CardData,
+    ctx: ValidationContext,
+    validations: dict[str, object],
+    *,
+    commit: bool = True,
 ) -> list[str]:
     errors: list[str] = []
 
@@ -53,6 +61,14 @@ def validate_card(
         if not card.definition:
             errors.append("definition_missing")
 
+    if validations.get("definition_semantic"):
+        if card.definition and not is_semantic_definition(card.definition, card.focus):
+            errors.append("definition_nonsemantic")
+
+    if validations.get("definition_requires_pos"):
+        if card.definition and not definition_has_pos(card.definition):
+            errors.append("definition_missing_pos")
+
     if validations.get("ipa_required"):
         if not card.ipa:
             errors.append("ipa_missing")
@@ -72,6 +88,25 @@ def validate_card(
     if validations.get("focus_in_sentence"):
         if card.focus.lower() not in card.sentence.lower():
             errors.append("focus_not_in_sentence")
+
+    if validations.get("sentence_matches_language"):
+        if card.sentence and not text_matches_language(
+            card.sentence, card.language, min_score=0.55, min_tokens=3
+        ):
+            errors.append("sentence_wrong_language")
+
+    if validations.get("source_definition_matches_language"):
+        if card.source_definition and not text_matches_language(
+            card.source_definition, card.language, min_score=0.25, min_tokens=3
+        ):
+            errors.append("source_definition_wrong_language")
+
+    if validations.get("definition_matches_translation_language"):
+        expected_language = card.translation_language or "en"
+        if card.definition and not text_matches_language(
+            card.definition, expected_language, min_score=0.25, min_tokens=3
+        ):
+            errors.append("definition_wrong_language")
 
     if validations.get("example_word_in_sentence"):
         if card.example_word and card.example_word.lower() not in card.sentence.lower():
@@ -113,18 +148,55 @@ def validate_card(
             if not (min_len <= word_count <= max_len):
                 errors.append("sentence_length_invalid")
 
+    profile_error = _sentence_profile_error(
+        card.sentence,
+        card.level,
+        validations.get("sentence_profile"),
+    )
+    if profile_error:
+        errors.append(profile_error)
+
     if validations.get("sentence_difficulty_matches_level"):
         score = difficulty(card.sentence, card.language)
         avg = score.average_zipf
-        if card.level == 1 and avg < 3.0:
-            errors.append("sentence_too_hard_for_level1")
-        if card.level == 2 and not (2.5 <= avg <= 5.0):
-            errors.append("sentence_not_level2")
-        if card.level == 3 and avg > 4.5:
-            errors.append("sentence_too_easy_for_level3")
+        level_validation_mode = str(
+            validations.get("level_validation_mode", "zipf_hard")
+        ).strip() or "zipf_hard"
+        if level_validation_mode == "profile_hard_zipf_soft":
+            if card.level == 1 and avg < 3.0:
+                errors.append("sentence_too_hard_for_level1")
+        else:
+            if card.level == 1 and avg < 3.0:
+                errors.append("sentence_too_hard_for_level1")
+            if card.level == 2 and not (2.5 <= avg <= 5.0):
+                errors.append("sentence_not_level2")
+            if card.level == 3 and avg > 4.5:
+                errors.append("sentence_too_easy_for_level3")
 
-    if not errors:
+    if not errors and commit:
         ctx.seen_focus.add(card.focus.lower())
         ctx.seen_sentence.add(card.sentence.lower())
 
     return errors
+
+
+def _sentence_profile_error(
+    sentence: str,
+    level: int,
+    profile_config: object,
+) -> str | None:
+    if not isinstance(profile_config, dict):
+        return None
+    level_profile = profile_config.get(level)
+    if not isinstance(level_profile, dict):
+        return None
+
+    max_commas = level_profile.get("max_commas")
+    if isinstance(max_commas, int) and sentence.count(",") > max_commas:
+        return "sentence_profile_invalid"
+
+    forbid_clause_punctuation = bool(level_profile.get("forbid_clause_punctuation", False))
+    if forbid_clause_punctuation and any(mark in sentence for mark in CLAUSE_PUNCTUATION):
+        return "sentence_profile_invalid"
+
+    return None

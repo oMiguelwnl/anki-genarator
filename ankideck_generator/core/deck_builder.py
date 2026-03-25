@@ -1,7 +1,10 @@
 ﻿from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 import random
 import re
+import threading
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -10,11 +13,14 @@ import genanki
 from tqdm import tqdm
 
 from ..utils.config import load_config
-from ..utils.definition_tools import normalize_definition
+from ..utils.definition_tools import definition_has_pos, normalize_definition
 from ..utils.file_utils import atomic_write_json, ensure_dir, read_json
 from ..utils.language_tools import (
+    compact_audio_basename,
     filter_frequent_words,
-    sentence_is_acceptable,
+    is_closed_class_word,
+    semantic_definition_reason,
+    text_matches_language,
     unique_keep_order,
 )
 from ..utils.logger import JsonLogger
@@ -23,8 +29,8 @@ from .models import (
     ANKI_FIELD_ORDER_DEFAULT,
     CardData,
     LogRecord,
-    ProviderResult,
     ProgressState,
+    ProviderResult,
     RunConfig,
 )
 from .providers import ProviderManager
@@ -37,11 +43,16 @@ except Exception as exc:  # pragma: no cover - optional
 
 DEFAULT_VALIDATIONS = {
     "definition_required": True,
+    "definition_semantic": True,
+    "definition_requires_pos": True,
+    "definition_matches_translation_language": True,
+    "source_definition_matches_language": True,
     "ipa_required": True,
     "translation_required": True,
     "no_duplicate_focus": True,
     "no_duplicate_sentences": True,
     "focus_in_sentence": True,
+    "sentence_matches_language": True,
     "valid_characters": True,
     "ipa_format": True,
     "audio_generated": False,
@@ -49,13 +60,56 @@ DEFAULT_VALIDATIONS = {
     "sentence_audio_required": False,
     "definition_not_literal_translation": True,
     "sentence_length": {
-        1: (5, 10),
-        2: (8, 14),
-        3: (8, 16),
+        1: (2, 7),
+        2: (4, 10),
+        3: (6, 15),
+    },
+    "sentence_profile": {
+        1: {"max_commas": 0, "forbid_clause_punctuation": True},
+        2: {"max_commas": 1, "forbid_clause_punctuation": True},
+        3: {"max_commas": 1, "forbid_clause_punctuation": True},
     },
     "sentence_difficulty_matches_level": True,
+    "level_validation_mode": "profile_hard_zipf_soft",
     "ai_quality_check": False,
 }
+
+TEST_ACCEPT_ALL_SOFT_ERRORS = {
+    "sentence_length_invalid",
+    "sentence_too_hard_for_level1",
+    "sentence_not_level2",
+    "sentence_too_easy_for_level3",
+}
+
+
+@dataclass
+class BuildStats:
+    cards: list[CardData] = field(default_factory=list)
+    media_files: list[str] = field(default_factory=list)
+    processed: int = 0
+    next_sort_index: int = 1
+    accepted_by_level: Counter[int] = field(default_factory=Counter)
+    attempted_by_level: Counter[int] = field(default_factory=Counter)
+    validation_counter: Counter[str] = field(default_factory=Counter)
+    provider_counter: Counter[str] = field(default_factory=Counter)
+    event_counter: Counter[str] = field(default_factory=Counter)
+    stage_counter: Counter[str] = field(default_factory=Counter)
+    stage_samples: Counter[str] = field(default_factory=Counter)
+
+
+@dataclass
+class TextTaskResult:
+    candidate_index: int
+    card: CardData | None
+    log_record: LogRecord
+
+
+@dataclass
+class AudioTaskResult:
+    accepted_index: int
+    card: CardData
+    log_record: LogRecord
+    media_files: list[str] = field(default_factory=list)
 
 
 class ProgressStore:
@@ -82,13 +136,14 @@ class DeckBuilder:
     def __init__(self, config_path: str) -> None:
         self.config_path = config_path
         self.config = load_config(config_path)
+        self._text_provider_local = threading.local()
+        self._audio_provider_local = threading.local()
 
     def preflight(self, run: RunConfig) -> tuple[bool, str]:
         providers = ProviderManager(self.config, run.timeout_sec, run.retries)
         return providers.validate_ai_ready()
 
     def build(self, run: RunConfig) -> tuple[list[CardData], list[str]]:
-        provider_manager = ProviderManager(self.config, run.timeout_sec, run.retries)
         cache_manager = CacheManager(run.cache_path, run.language, run.autosave_every)
         progress_store = ProgressStore("ankideck_generator/data/progress")
         log_path = f"ankideck_generator/data/logs/run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.jsonl"
@@ -97,8 +152,14 @@ class DeckBuilder:
 
         level_size = run.level_size
         wordfreq_lang = run.wordfreq_language or run.language
+        effective_pool_multiplier = max(1, int(run.level_pool_multiplier))
         level_sets = self._prepare_levels(
-            wordfreq_lang, level_size, run.seed, run.level_pool_multiplier
+            wordfreq_lang,
+            level_size,
+            run.seed,
+            effective_pool_multiplier,
+            exclude_closed_class_words=bool(run.exclude_closed_class_words),
+            attempt_budget=int(run.max_attempts_per_level or 0),
         )
 
         state = None
@@ -106,49 +167,109 @@ class DeckBuilder:
             state = progress_store.load(run.language, run.mode)
         processed_focus = set(state.processed_focus) if state else set()
         processed_sentences = set(state.processed_sentences) if state else set()
-        next_sort_index = (
-            (state.created_cards + 1) if state and state.created_cards else 1
+        stats = BuildStats(
+            next_sort_index=(state.created_cards + 1) if state and state.created_cards else 1
         )
-        ctx.seen_focus.update(processed_focus)
-        ctx.seen_sentence.update(processed_sentences)
+        ctx.seen_focus.update(focus.lower() for focus in processed_focus)
+        ctx.seen_sentence.update(sentence.lower() for sentence in processed_sentences)
 
-        cards: list[CardData] = []
-        media_files: list[str] = []
-        processed = 0
-        accepted_by_level: Counter[int] = Counter()
-        attempted_by_level: Counter[int] = Counter()
-        validation_counter: Counter[str] = Counter()
-        provider_counter: Counter[str] = Counter()
+        parallel_enabled = (
+            not run.interactive
+            and max(int(run.concurrency), int(run.audio_concurrency)) > 1
+        )
 
         for level, words in level_sets.items():
-            accepted_in_level = 0
-            attempted_in_level = 0
-            level_target = level_size
-            runtime_cfg = self.config.get("runtime") if isinstance(self.config, dict) else {}
-            runtime_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
-            test_attempts_cap = bool(runtime_cfg.get("test_attempts_cap", False)) and run.mode == "test"
-            attempts_cap = level_target if test_attempts_cap else None
-            for index, word in enumerate(
-                tqdm(words, desc=f"Level {level}", unit="word")
-            ):
+            if parallel_enabled:
+                self._build_level_parallel(
+                    level=level,
+                    words=words,
+                    run=run,
+                    cache=cache_manager,
+                    ctx=ctx,
+                    processed_focus=processed_focus,
+                    processed_sentences=processed_sentences,
+                    stats=stats,
+                    logger=logger,
+                    progress_store=progress_store,
+                )
+            else:
+                self._build_level_serial(
+                    level=level,
+                    words=words,
+                    run=run,
+                    cache=cache_manager,
+                    ctx=ctx,
+                    processed_focus=processed_focus,
+                    processed_sentences=processed_sentences,
+                    stats=stats,
+                    logger=logger,
+                    progress_store=progress_store,
+                )
+
+        cache_manager.save_all()
+        self._save_progress(
+            progress_store,
+            run,
+            level=3,
+            index=level_size,
+            processed_focus=processed_focus,
+            processed_sentences=processed_sentences,
+            next_sort_index=stats.next_sort_index,
+        )
+        self._print_summary(
+            stats.accepted_by_level,
+            stats.attempted_by_level,
+            stats.validation_counter,
+            stats.provider_counter,
+            stats.event_counter,
+            stats.stage_counter,
+            stats.stage_samples,
+        )
+        return stats.cards, stats.media_files
+
+    def _build_level_serial(
+        self,
+        *,
+        level: int,
+        words: list[str],
+        run: RunConfig,
+        cache: CacheManager,
+        ctx: ValidationContext,
+        processed_focus: set[str],
+        processed_sentences: set[str],
+        stats: BuildStats,
+        logger: JsonLogger,
+        progress_store: ProgressStore,
+    ) -> None:
+        provider_manager = self._make_provider_manager(run)
+        accepted_in_level = 0
+        level_target = run.level_size
+        attempt_cap = int(run.max_attempts_per_level or 0)
+        if attempt_cap <= 0:
+            attempt_cap = len(words)
+        progress = tqdm(total=level_target, desc=f"Level {level}", unit="card")
+        try:
+            for index, word in enumerate(words):
                 if accepted_in_level >= level_target:
                     break
-                if attempts_cap is not None and attempted_in_level >= attempts_cap:
+                if stats.attempted_by_level[level] >= attempt_cap:
                     break
                 if word in processed_focus:
                     continue
-                attempted_in_level += 1
-                attempted_by_level[level] += 1
+                blocked_reason = cache.get("invalid_focus", word)
+                if blocked_reason:
+                    continue
+                stats.attempted_by_level[level] += 1
                 try:
                     card, log_record = self._process_word(
                         word=word,
                         level=level,
                         index=index + 1,
                         run=run,
-                        cache=cache_manager,
+                        cache=cache,
                         providers=provider_manager,
                         ctx=ctx,
-                        media_files=media_files,
+                        media_files=stats.media_files,
                     )
                 except Exception as exc:  # pragma: no cover - safety net
                     log_record = LogRecord(
@@ -162,53 +283,321 @@ class DeckBuilder:
                     )
                     card = None
 
-                logger.log(log_record.model_dump())
-                for field_name, provider_name in log_record.providers.items():
-                    provider_counter[f"{field_name}:{provider_name}"] += 1
-                for validation_error in log_record.validations:
-                    validation_counter[validation_error] += 1
+                self._record_log(logger, stats, log_record)
                 if card:
-                    card.index = next_sort_index
-                    next_sort_index += 1
-                    cards.append(card)
+                    card.index = stats.next_sort_index
+                    stats.next_sort_index += 1
+                    stats.cards.append(card)
                     processed_focus.add(card.focus)
                     processed_sentences.add(card.sentence)
                     accepted_in_level += 1
-                    accepted_by_level[level] += 1
-                processed += 1
+                    stats.accepted_by_level[level] += 1
+                    progress.update(1)
 
-                if processed % run.autosave_every == 0:
-                    cache_manager.save_all()
-                    progress_store.save(
-                        ProgressState(
-                            language=run.language,
-                            mode=run.mode,
-                            level=level,
-                            index=index,
-                            rng_state=random.getstate(),
-                            processed_focus=sorted(processed_focus),
-                            processed_sentences=sorted(processed_sentences),
-                            created_cards=next_sort_index - 1,
-                        )
+                if stats.processed % run.autosave_every == 0:
+                    cache.save_all()
+                    self._save_progress(
+                        progress_store,
+                        run,
+                        level=level,
+                        index=index,
+                        processed_focus=processed_focus,
+                        processed_sentences=processed_sentences,
+                        next_sort_index=stats.next_sort_index,
                     )
+        finally:
+            progress.close()
 
-        cache_manager.save_all()
+    def _build_level_parallel(
+        self,
+        *,
+        level: int,
+        words: list[str],
+        run: RunConfig,
+        cache: CacheManager,
+        ctx: ValidationContext,
+        processed_focus: set[str],
+        processed_sentences: set[str],
+        stats: BuildStats,
+        logger: JsonLogger,
+        progress_store: ProgressStore,
+    ) -> None:
+        level_target = run.level_size
+        attempt_cap = int(run.max_attempts_per_level or 0)
+        if attempt_cap <= 0:
+            attempt_cap = len(words)
+        text_workers = max(1, int(run.concurrency))
+        audio_workers = max(1, int(run.audio_concurrency))
+        reserved_focus: set[str] = set()
+        reserved_sentences: set[str] = set()
+        word_cursor = 0
+        submit_index = 0
+        next_consume = 0
+        accepted_index = 0
+        next_audio_commit = 0
+        text_futures: dict[object, int] = {}
+        ready_text: dict[int, TextTaskResult] = {}
+        audio_futures: dict[object, int] = {}
+        ready_audio: dict[int, AudioTaskResult] = {}
+        progress = tqdm(total=level_target, desc=f"Level {level}", unit="card")
+
+        with ThreadPoolExecutor(max_workers=text_workers) as text_executor, ThreadPoolExecutor(max_workers=audio_workers) as audio_executor:
+            try:
+                while True:
+                    pending_text_attempts = len(text_futures) + len(ready_text)
+                    while (
+                        word_cursor < len(words)
+                        and len(text_futures) < text_workers
+                        and stats.accepted_by_level[level] + len(reserved_focus) < level_target
+                        and stats.attempted_by_level[level] + pending_text_attempts
+                        < attempt_cap
+                    ):
+                        word = words[word_cursor]
+                        word_cursor += 1
+                        if word in processed_focus:
+                            continue
+                        blocked_reason = cache.get("invalid_focus", word)
+                        if blocked_reason:
+                            continue
+                        future = text_executor.submit(
+                            self._process_word_textual_task,
+                            word,
+                            level,
+                            submit_index + 1,
+                            run,
+                            cache,
+                        )
+                        text_futures[future] = submit_index
+                        submit_index += 1
+                        pending_text_attempts += 1
+                    cap_reached = stats.attempted_by_level[level] >= attempt_cap
+
+                    if (
+                        stats.accepted_by_level[level] >= level_target
+                        or (
+                            (word_cursor >= len(words) or cap_reached)
+                            and not text_futures
+                            and not ready_text
+                            and not audio_futures
+                            and not ready_audio
+                        )
+                    ):
+                        break
+
+                    if text_futures:
+                        done, _ = wait(
+                            list(text_futures.keys()),
+                            timeout=0.05,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            ready_text[text_futures.pop(future)] = future.result()
+
+                    if audio_futures:
+                        done, _ = wait(
+                            list(audio_futures.keys()),
+                            timeout=0.05,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            ready_audio[audio_futures.pop(future)] = future.result()
+
+                    progressed = False
+
+                    while next_consume in ready_text:
+                        progressed = True
+                        text_result = ready_text.pop(next_consume)
+                        next_consume += 1
+                        stats.attempted_by_level[level] += 1
+
+                        card = text_result.card
+                        log_record = text_result.log_record
+                        if not card:
+                            self._record_log(logger, stats, log_record)
+                            if stats.processed % run.autosave_every == 0:
+                                cache.save_all()
+                                self._save_progress(
+                                    progress_store,
+                                    run,
+                                    level=level,
+                                    index=next_consume,
+                                    processed_focus=processed_focus,
+                                    processed_sentences=processed_sentences,
+                                    next_sort_index=stats.next_sort_index,
+                                )
+                            continue
+
+                        text_errors = unique_keep_order(
+                            log_record.validations
+                            + self._validate_text_candidate(
+                                card,
+                                ctx,
+                                run,
+                                reserved_focus,
+                                reserved_sentences,
+                            )
+                        )
+                        if self._should_reject_errors(text_errors, run):
+                            log_record.validations = text_errors
+                            log_record.status = "discarded"
+                            log_record.discard_reason = _infer_discard_reason(
+                                text_errors, log_record.provider_errors
+                            )
+                            self._record_log(logger, stats, log_record)
+                            if stats.processed % run.autosave_every == 0:
+                                cache.save_all()
+                                self._save_progress(
+                                    progress_store,
+                                    run,
+                                    level=level,
+                                    index=next_consume,
+                                    processed_focus=processed_focus,
+                                    processed_sentences=processed_sentences,
+                                    next_sort_index=stats.next_sort_index,
+                                )
+                            continue
+
+                        log_record.validations = text_errors
+                        reserved_focus.add(card.focus.lower())
+                        reserved_sentences.add(card.sentence.lower())
+                        future = audio_executor.submit(
+                            self._attach_audio_task,
+                            accepted_index,
+                            card,
+                            log_record,
+                            run,
+                            cache,
+                        )
+                        audio_futures[future] = accepted_index
+                        accepted_index += 1
+
+                    while next_audio_commit in ready_audio:
+                        progressed = True
+                        audio_result = ready_audio.pop(next_audio_commit)
+                        next_audio_commit += 1
+                        card = audio_result.card
+                        log_record = audio_result.log_record
+                        reserved_focus.discard(card.focus.lower())
+                        reserved_sentences.discard(card.sentence.lower())
+
+                        final_errors = unique_keep_order(
+                            log_record.validations + self._audio_validation_errors(card, run)
+                        )
+                        if self._should_reject_errors(final_errors, run):
+                            log_record.validations = final_errors
+                            log_record.status = "discarded"
+                            log_record.discard_reason = _infer_discard_reason(
+                                final_errors, log_record.provider_errors
+                            )
+                            self._record_log(logger, stats, log_record)
+                            if stats.processed % run.autosave_every == 0:
+                                cache.save_all()
+                                self._save_progress(
+                                    progress_store,
+                                    run,
+                                    level=level,
+                                    index=next_consume,
+                                    processed_focus=processed_focus,
+                                    processed_sentences=processed_sentences,
+                                    next_sort_index=stats.next_sort_index,
+                                )
+                            continue
+
+                        for path in audio_result.media_files:
+                            if path and path not in stats.media_files:
+                                stats.media_files.append(path)
+
+                        card.index = stats.next_sort_index
+                        stats.next_sort_index += 1
+                        stats.cards.append(card)
+                        processed_focus.add(card.focus)
+                        processed_sentences.add(card.sentence)
+                        ctx.seen_focus.add(card.focus.lower())
+                        ctx.seen_sentence.add(card.sentence.lower())
+                        stats.accepted_by_level[level] += 1
+                        log_record.status = "accepted"
+                        log_record.discard_reason = None
+                        log_record.validations = final_errors if final_errors else []
+                        self._record_log(logger, stats, log_record)
+                        progress.update(1)
+                        if stats.processed % run.autosave_every == 0:
+                            cache.save_all()
+                            self._save_progress(
+                                progress_store,
+                                run,
+                                level=level,
+                                index=next_consume,
+                                processed_focus=processed_focus,
+                                processed_sentences=processed_sentences,
+                                next_sort_index=stats.next_sort_index,
+                            )
+                        if stats.accepted_by_level[level] >= level_target:
+                            break
+
+                    if not progressed and (text_futures or audio_futures):
+                        continue
+            finally:
+                for future in list(text_futures.keys()):
+                    future.cancel()
+                for future in list(audio_futures.keys()):
+                    future.cancel()
+                progress.close()
+
+    def _record_log(self, logger: JsonLogger, stats: BuildStats, log_record: LogRecord) -> None:
+        logger.log(log_record.model_dump())
+        for field_name, provider_name in log_record.providers.items():
+            stats.provider_counter[f"{field_name}:{provider_name}"] += 1
+        for event_name, count in (log_record.event_counts or {}).items():
+            stats.event_counter[event_name] += int(count or 0)
+        for validation_error in log_record.validations:
+            stats.validation_counter[validation_error] += 1
+        for stage_name, elapsed_ms in (log_record.stage_timings or {}).items():
+            stats.stage_counter[stage_name] += int(elapsed_ms or 0)
+            stats.stage_samples[stage_name] += 1
+        stats.processed += 1
+
+    def _save_progress(
+        self,
+        progress_store: ProgressStore,
+        run: RunConfig,
+        *,
+        level: int,
+        index: int,
+        processed_focus: set[str],
+        processed_sentences: set[str],
+        next_sort_index: int,
+    ) -> None:
         progress_store.save(
             ProgressState(
                 language=run.language,
                 mode=run.mode,
-                level=3,
-                index=level_size,
+                level=level,
+                index=index,
                 rng_state=random.getstate(),
                 processed_focus=sorted(processed_focus),
                 processed_sentences=sorted(processed_sentences),
                 created_cards=next_sort_index - 1,
             )
         )
-        self._print_summary(
-            accepted_by_level, attempted_by_level, validation_counter, provider_counter
-        )
-        return cards, media_files
+
+    def _make_provider_manager(self, run: RunConfig) -> ProviderManager:
+        return ProviderManager(self.config, run.timeout_sec, run.retries)
+
+    def _thread_provider_manager(
+        self,
+        run: RunConfig,
+        *,
+        kind: str,
+    ) -> ProviderManager:
+        local = self._text_provider_local if kind == "text" else self._audio_provider_local
+        signature = (int(run.timeout_sec), int(run.retries))
+        provider = getattr(local, "provider", None)
+        cached_signature = getattr(local, "signature", None)
+        if provider is None or cached_signature != signature:
+            provider = self._make_provider_manager(run)
+            local.provider = provider
+            local.signature = signature
+        return provider
 
     def export_deck(
         self, run: RunConfig, cards: list[CardData], media_files: list[str]
@@ -270,40 +659,40 @@ class DeckBuilder:
         atomic_write_json("output/metadata.json", metadata)
 
     def _prepare_levels(
-        self, language: str, level_size: int, seed: int, pool_multiplier: int = 8
+        self,
+        language: str,
+        level_size: int,
+        seed: int,
+        pool_multiplier: int = 8,
+        *,
+        exclude_closed_class_words: bool = True,
+        attempt_budget: int = 0,
     ) -> dict[int, list[str]]:
         random.seed(seed)
         pool_multiplier = max(1, int(pool_multiplier))
-        target_total = max(level_size * 60, 6000)
-        raw_top = top_n_list(language, target_total)
-        filtered_top = filter_frequent_words(raw_top, language, min_length=3)
-        if len(filtered_top) < level_size:
-            raw_top = top_n_list(language, target_total * 2)
-            filtered_top = filter_frequent_words(raw_top, language, min_length=3)
-        level1_pool_size = min(
-            len(filtered_top), max(level_size * pool_multiplier, level_size)
-        )
-        level1 = filtered_top[:level1_pool_size]
+        attempt_budget = max(0, int(attempt_budget))
+        pool_size = max(level_size * pool_multiplier, level_size)
+        if attempt_budget:
+            pool_size = max(pool_size, attempt_budget)
+        required_total = pool_size * 3
+        target_total = max(required_total * 3, 6000)
+        filtered_top: list[str] = []
 
-        pool_raw = top_n_list(language, max(50000, target_total * 3))
-        pool_filtered = filter_frequent_words(pool_raw, language, min_length=3)
-        pool_filtered = [w for w in pool_filtered if w not in level1]
+        while len(filtered_top) < required_total:
+            raw_top = top_n_list(language, target_total)
+            filtered_top = filter_frequent_words(
+                raw_top,
+                language,
+                min_length=3,
+                exclude_closed_class_words=exclude_closed_class_words,
+            )
+            if len(filtered_top) >= required_total or target_total >= 200000:
+                break
+            target_total *= 2
 
-        level2_candidates = pool_filtered[:25000]
-        random.shuffle(level2_candidates)
-        level2_pool_size = min(
-            len(level2_candidates), max(level_size * pool_multiplier, level_size)
-        )
-        level2 = level2_candidates[:level2_pool_size]
-
-        level3_candidates = (
-            pool_filtered[25000:50000] if len(pool_filtered) > 50000 else pool_filtered
-        )
-        random.shuffle(level3_candidates)
-        level3_pool_size = min(
-            len(level3_candidates), max(level_size * pool_multiplier, level_size)
-        )
-        level3 = level3_candidates[:level3_pool_size]
+        level1 = filtered_top[:pool_size]
+        level2 = filtered_top[pool_size : pool_size * 2]
+        level3 = filtered_top[pool_size * 2 : pool_size * 3]
 
         return {
             1: unique_keep_order(level1),
@@ -335,10 +724,164 @@ class DeckBuilder:
         ctx: ValidationContext,
         media_files: list[str],
     ) -> tuple[CardData | None, LogRecord]:
+        card, log_record = self._process_word_textual(
+            word=word,
+            level=level,
+            index=index,
+            run=run,
+            cache=cache,
+            providers=providers,
+        )
+        if not card:
+            return None, log_record
+
+        text_errors = unique_keep_order(
+            log_record.validations + self._validate_text_candidate(card, ctx, run)
+        )
+        if self._should_reject_errors(text_errors, run):
+            log_record.validations = text_errors
+            log_record.status = "discarded"
+            log_record.discard_reason = _infer_discard_reason(
+                text_errors, log_record.provider_errors
+            )
+            return None, log_record
+        log_record.validations = text_errors
+
+        card, log_record, generated_media = self._attach_audio_to_card(
+            card=card,
+            log_record=log_record,
+            run=run,
+            cache=cache,
+            providers=providers,
+        )
+        for path in generated_media:
+            if path and path not in media_files:
+                media_files.append(path)
+
+        final_errors = unique_keep_order(
+            log_record.validations + self._audio_validation_errors(card, run)
+        )
+        if self._should_reject_errors(final_errors, run):
+            log_record.validations = final_errors
+            log_record.status = "discarded"
+            log_record.discard_reason = _infer_discard_reason(
+                final_errors, log_record.provider_errors
+            )
+            return None, log_record
+
+        if run.interactive:
+            try:
+                card = self._interactive_edit(card)
+            except ValueError:
+                return None, LogRecord(
+                    focus=word,
+                    level=level,
+                    providers=log_record.providers,
+                    provider_errors=log_record.provider_errors,
+                    stage_timings=log_record.stage_timings,
+                    event_counts=log_record.event_counts,
+                    validations=["skipped_by_user"],
+                    status="skipped",
+                )
+
+        ctx.seen_focus.add(card.focus.lower())
+        ctx.seen_sentence.add(card.sentence.lower())
+        log_record.status = "accepted"
+        log_record.discard_reason = None
+        log_record.validations = final_errors if final_errors else []
+        return card, log_record
+
+    def _process_word_textual_task(
+        self,
+        word: str,
+        level: int,
+        index: int,
+        run: RunConfig,
+        cache: CacheManager,
+    ) -> TextTaskResult:
+        providers = self._thread_provider_manager(run, kind="text")
+        try:
+            card, log_record = self._process_word_textual(
+                word=word,
+                level=level,
+                index=index,
+                run=run,
+                cache=cache,
+                providers=providers,
+            )
+        except Exception as exc:  # pragma: no cover - safety net
+            card = None
+            log_record = LogRecord(
+                focus=word,
+                level=level,
+                providers={},
+                provider_errors={},
+                validations=[],
+                status="error",
+                error=str(exc),
+            )
+        return TextTaskResult(candidate_index=index - 1, card=card, log_record=log_record)
+
+    def _attach_audio_task(
+        self,
+        accepted_index: int,
+        card: CardData,
+        log_record: LogRecord,
+        run: RunConfig,
+        cache: CacheManager,
+    ) -> AudioTaskResult:
+        providers = self._thread_provider_manager(run, kind="audio")
+        try:
+            card, log_record, media_files = self._attach_audio_to_card(
+                card=card,
+                log_record=log_record,
+                run=run,
+                cache=cache,
+                providers=providers,
+            )
+        except Exception as exc:  # pragma: no cover - safety net
+            log_record.provider_errors["audio"] = str(exc)
+            media_files = []
+        return AudioTaskResult(
+            accepted_index=accepted_index,
+            card=card,
+            log_record=log_record,
+            media_files=media_files,
+        )
+
+    def _process_word_textual(
+        self,
+        *,
+        word: str,
+        level: int,
+        index: int,
+        run: RunConfig,
+        cache: CacheManager,
+        providers: ProviderManager,
+    ) -> tuple[CardData | None, LogRecord]:
         providers_used: dict[str, str] = {}
         provider_errors: dict[str, str] = {}
+        stage_timings: dict[str, int] = {}
+        event_counts: Counter[str] = Counter()
         ai_calls_total = 0
         ai_calls_by_field: dict[str, int] = {}
+        quality_errors: list[str] = []
+        strict_quality = bool(run.strict_quality)
+        validation_rules = _validations_for_language(
+            run.language,
+            audio_required=False,
+            strict_quality=strict_quality,
+            level_validation_mode=run.level_validation_mode,
+        )
+        sentence_min_words, sentence_max_words = _sentence_length_bounds(
+            validation_rules.get("sentence_length"),
+            level,
+        )
+        cache_version = max(1, int(run.cache_validation_version or 1))
+        normalized_word = word.strip().lower()
+        sentence_cache_key = (
+            f"{normalized_word}::lvl{level}::{sentence_min_words}-{sentence_max_words}::v{cache_version}"
+        )
 
         def allow_ai(field: str) -> bool:
             if ai_calls_total >= run.ai_max_calls_per_word:
@@ -352,7 +895,13 @@ class DeckBuilder:
             ai_calls_total += 1
             ai_calls_by_field[field] = ai_calls_by_field.get(field, 0) + 1
 
-        def trace_result(field: str, result, ai_field: str | None = None) -> None:
+        def trace_result(
+            field: str,
+            result: ProviderResult,
+            *,
+            ai_field: str | None = None,
+            stage_key: str | None = None,
+        ) -> None:
             providers_used[field] = result.provider_name
             if result.error:
                 provider_errors[field] = result.error
@@ -363,143 +912,551 @@ class DeckBuilder:
                         provider_errors[f"{field}:{name}"] = str(error)
             if ai_field and result.provider_name == "ai":
                 mark_ai(ai_field)
+            if stage_key:
+                stage_timings[stage_key] = stage_timings.get(stage_key, 0) + int(
+                    getattr(result, "elapsed_ms", 0) or 0
+                )
+
+        def remember_quality_error(name: str | None) -> None:
+            if name and name not in quality_errors:
+                quality_errors.append(name)
+
+        def count_event(name: str) -> None:
+            if name:
+                event_counts[name] += 1
+
+        def normalize_definition_candidate(text: str, language: str) -> str:
+            return normalize_definition(
+                text,
+                language,
+                pos_mode="auto",
+                min_words=2,
+                max_words=12,
+            )
+
+        def definition_issue(text: str, expected_language: str) -> str | None:
+            if not text:
+                return "definition_missing"
+            if not definition_has_pos(text):
+                return "definition_missing_pos"
+            if strict_quality and not text_matches_language(
+                text, expected_language, min_score=0.25, min_tokens=3
+            ):
+                return "definition_wrong_language"
+            semantic_issue = semantic_definition_reason(text, word)
+            if semantic_issue:
+                if semantic_issue == "definition_mentions_other_language":
+                    return "definition_wrong_language"
+                return "definition_nonsemantic"
+            return None
+
+        level_only_sentence_errors = {
+            "sentence_length_invalid",
+            "sentence_profile_invalid",
+            "sentence_too_hard_for_level1",
+            "sentence_not_level2",
+            "sentence_too_easy_for_level3",
+        }
+
+        def analyze_sentence(
+            candidate: str,
+        ) -> tuple[str, list[str], list[str], list[str]]:
+            text = (candidate or "").strip()
+            if not text:
+                return "", ["sentence_missing"], ["sentence_missing"], []
+            sentence_validations = {
+                "focus_in_sentence": True,
+                "sentence_matches_language": strict_quality,
+                "valid_characters": True,
+                "sentence_length": validation_rules.get("sentence_length"),
+                "sentence_profile": validation_rules.get("sentence_profile"),
+                "sentence_difficulty_matches_level": bool(
+                    validation_rules.get("sentence_difficulty_matches_level")
+                ),
+                "level_validation_mode": run.level_validation_mode,
+            }
+            errors = unique_keep_order(
+                validate_card(
+                    CardData(
+                        focus=word,
+                        sentence=text,
+                        level=level,
+                        language=run.language,
+                        translation_language=run.target_translation,
+                    ),
+                    ValidationContext(),
+                    sentence_validations,
+                    commit=False,
+                )
+            )
+            core_errors = [
+                error for error in errors if error not in level_only_sentence_errors
+            ]
+            level_errors = [error for error in errors if error in level_only_sentence_errors]
+            return text, errors, core_errors, level_errors
+
+        def finalize_sentence(candidate: str) -> tuple[str, str | None]:
+            text, errors, _core_errors, _level_errors = analyze_sentence(candidate)
+            return (text, None) if not errors else ("", errors[0])
+
+        def finalize_definition(
+            candidate: str, expected_language: str
+        ) -> tuple[str, str | None]:
+            text = normalize_definition_candidate(candidate, expected_language)
+            issue = definition_issue(text, expected_language)
+            return (text, None) if not issue else ("", issue)
+
+        def translation_issue(text: str, source_sentence: str) -> str | None:
+            value = (text or "").strip()
+            if not value:
+                return "translation_missing"
+            if (
+                run.language != run.target_translation
+                and value.lower() == source_sentence.strip().lower()
+            ):
+                return "translation_same_as_source"
+            if run.enforce_translation_language and strict_quality:
+                alpha_tokens = [
+                    token for token in value.split() if any(char.isalpha() for char in token)
+                ]
+                if len(alpha_tokens) >= 3 and not text_matches_language(
+                    value, run.target_translation, min_score=0.2, min_tokens=2
+                ):
+                    return "translation_wrong_language"
+            return None
+
+        def finalize_translation(
+            candidate: str, source_sentence: str
+        ) -> tuple[str, str | None]:
+            text = (candidate or "").strip()
+            issue = translation_issue(text, source_sentence)
+            return (text, None) if not issue else ("", issue)
+
+        def discard_log(validations: list[str]) -> tuple[CardData | None, LogRecord]:
+            return None, LogRecord(
+                focus=word,
+                level=level,
+                providers=providers_used,
+                provider_errors=provider_errors,
+                stage_timings=stage_timings,
+                event_counts=dict(event_counts),
+                validations=validations,
+                status="discarded",
+                discard_reason=_infer_discard_reason(validations, provider_errors),
+            )
+
+        def request_definition_ai(language: str) -> ProviderResult:
+            definition_ai = getattr(providers, "definition_ai", None)
+            if callable(definition_ai):
+                return definition_ai(word, language, semantic_only=True)
+            return providers.definition(
+                word,
+                run.language,
+                allow_ai=True,
+                definition_language=language,
+            )
+
+        def request_definition_from_context(
+            language: str, sentence_value: str
+        ) -> ProviderResult:
+            definition_from_context = getattr(providers, "definition_from_context", None)
+            if callable(definition_from_context):
+                return definition_from_context(
+                    word,
+                    sentence_value,
+                    run.language,
+                    definition_language=language,
+                )
+            return request_definition_ai(language)
+
+        sentence = ""
+        last_sentence_issue: str | None = None
+
+        def build_sentence() -> str:
+            nonlocal sentence, last_sentence_issue
+            if sentence:
+                return sentence
+            cached_sentence = cache.get("sentences", sentence_cache_key) or ""
+            cached_text, cached_errors, _cached_core, _cached_level = analyze_sentence(
+                cached_sentence
+            )
+            if not cached_errors:
+                sentence = cached_text
+                last_sentence_issue = None
+                return sentence
+            last_sentence_issue = cached_errors[0] if cached_errors else None
+
+            count_event("sentence_tatoeba_attempted")
+            result = providers.sentence_web(
+                word,
+                run.language,
+                min_words=sentence_min_words,
+                max_words=sentence_max_words,
+            )
+            trace_result("sentence", result, stage_key="sentence_ms")
+            web_text, web_errors, web_core_errors, web_level_errors = analyze_sentence(
+                result.value or ""
+            )
+            if not web_errors:
+                sentence = web_text
+                last_sentence_issue = None
+                if result.provider_name == "tatoeba":
+                    count_event("sentence_tatoeba_hit")
+                cache.set("sentences", sentence_cache_key, sentence)
+                return sentence
+            last_sentence_issue = web_errors[0] if web_errors else None
+
+            sentence_rewrite = getattr(providers, "sentence_rewrite", None)
+            should_rewrite = (
+                web_text
+                and web_level_errors
+                and not web_core_errors
+                and run.sentence_rewrite_from_web
+                and callable(sentence_rewrite)
+                and allow_ai("sentence")
+            )
+            if should_rewrite:
+                count_event("sentence_ai_rewrite_attempted")
+                result = sentence_rewrite(
+                    web_text,
+                    word,
+                    run.language,
+                    level=level,
+                    min_words=sentence_min_words,
+                    max_words=sentence_max_words,
+                )
+                trace_result(
+                    "sentence_rewrite",
+                    result,
+                    ai_field="sentence",
+                    stage_key="sentence_ms",
+                )
+                rewritten_text, rewritten_errors, _rewrite_core, _rewrite_level = (
+                    analyze_sentence(result.value or "")
+                )
+                if not rewritten_errors:
+                    sentence = rewritten_text
+                    last_sentence_issue = None
+                    count_event("sentence_ai_rewrite_hit")
+                    cache.set("sentences", sentence_cache_key, sentence)
+                    return sentence
+                last_sentence_issue = (
+                    rewritten_errors[0] if rewritten_errors else last_sentence_issue
+                )
+
+            sentence_attempts = 0
+            while sentence_attempts < 2 and allow_ai("sentence") and not sentence:
+                count_event("sentence_ai_generate_attempted")
+                result = providers.sentence_ai(
+                    word,
+                    run.language,
+                    min_words=sentence_min_words,
+                    max_words=sentence_max_words,
+                )
+                trace_result(
+                    "sentence",
+                    result,
+                    ai_field="sentence",
+                    stage_key="sentence_ms",
+                )
+                generated_text, generated_errors, _gen_core, _gen_level = analyze_sentence(
+                    result.value or ""
+                )
+                if not generated_errors:
+                    sentence = generated_text
+                    last_sentence_issue = None
+                    count_event("sentence_ai_generate_hit")
+                    cache.set("sentences", sentence_cache_key, sentence)
+                    break
+                last_sentence_issue = (
+                    generated_errors[0] if generated_errors else last_sentence_issue
+                )
+                sentence_attempts += 1
+            return sentence
+
+        if run.exclude_closed_class_words and is_closed_class_word(word, run.language):
+            cache.set("invalid_focus", word, "function_word")
+            remember_quality_error("function_word")
+            return discard_log(quality_errors)
+
+        if strict_quality:
+            word_exists = getattr(providers, "word_exists", None)
+            if callable(word_exists):
+                result = word_exists(word, run.language)
+                trace_result("focus_lexicon", result, stage_key="lexicon_ms")
+                lexicon_missing = not result.value and (result.error or "") in {
+                    "",
+                    "empty result",
+                }
+                if lexicon_missing:
+                    cache.set("invalid_focus", word, "focus_not_in_lexicon")
+                    remember_quality_error("focus_not_in_lexicon")
+                    return discard_log(quality_errors)
 
         definition_lang = "en"
-        definition_key = f"{word}::{definition_lang}"
-        definition = cache.get("definitions", definition_key)
-        if not definition:
-            if run.language == "en":
+        definition_key = f"{normalized_word}::{definition_lang}::v{cache_version}"
+        source_key = f"{normalized_word}::{run.language}::v{cache_version}"
+
+        source_definition = ""
+        definition = ""
+        source_definition_issue: str | None = None
+        final_definition_issue: str | None = None
+
+        if run.language == "en":
+            cached_definition = cache.get("definitions", definition_key) or ""
+            definition, final_definition_issue = finalize_definition(
+                cached_definition, "en"
+            )
+            if not definition:
                 result = providers.definition(
                     word,
                     run.language,
                     allow_ai=allow_ai("definition"),
                     definition_language="en",
                 )
-                trace_result("definition", result, ai_field="definition")
-                definition = result.value or ""
-                definition = normalize_definition(
-                    definition,
-                    "en",
-                    pos_mode="auto",
-                    min_words=6,
-                    max_words=10,
+                trace_result(
+                    "definition",
+                    result,
+                    ai_field="definition",
+                    stage_key="definition_ms",
                 )
-                if definition:
-                    cache.set("definitions", definition_key, definition)
-            else:
-                source_key = f"{word}::{run.language}"
-                source_def = cache.get("definitions", source_key) or ""
-                if not source_def:
-                    result = providers.definition(
-                        word,
-                        run.language,
-                        allow_ai=allow_ai("definition"),
-                        definition_language=run.language,
+                definition, final_definition_issue = finalize_definition(
+                    result.value or "", "en"
+                )
+                if not definition and allow_ai("definition") and run.mode == "full":
+                    context_sentence = build_sentence()
+                    if context_sentence:
+                        result = request_definition_from_context("en", context_sentence)
+                    else:
+                        result = request_definition_ai("en")
+                    trace_result(
+                        "definition",
+                        result,
+                        ai_field="definition",
+                        stage_key="definition_ms",
                     )
-                    trace_result("definition_source", result, ai_field="definition")
-                    source_def = result.value or ""
-                    source_def = normalize_definition(
-                        source_def,
-                        run.language,
-                        pos_mode="auto",
-                        min_words=6,
-                        max_words=10,
+                    definition, final_definition_issue = finalize_definition(
+                        result.value or "", "en"
                     )
-                    if source_def:
-                        cache.set("definitions", source_key, source_def)
-
-                definition_en = ""
-                if source_def:
-                    result = providers.translation_web(source_def, run.language, "en")
-                    trace_result("definition", result)
-                    definition_en = result.value or ""
-                    if not definition_en and allow_ai("definition"):
-                        result = providers.translation_ai(
-                            source_def, run.language, "en"
+        else:
+            cached_definition = cache.get("definitions", definition_key) or ""
+            definition, final_definition_issue = finalize_definition(
+                cached_definition, "en"
+            )
+            cached_source = cache.get("definitions", source_key) or ""
+            source_definition, source_definition_issue = finalize_definition(
+                cached_source, run.language
+            )
+            if not source_definition:
+                result = providers.definition(
+                    word,
+                    run.language,
+                    allow_ai=allow_ai("definition"),
+                    definition_language=run.language,
+                )
+                trace_result(
+                    "definition_source",
+                    result,
+                    ai_field="definition",
+                    stage_key="definition_ms",
+                )
+                source_definition, source_definition_issue = finalize_definition(
+                    result.value or "", run.language
+                )
+                if not source_definition and allow_ai("definition") and run.mode == "full":
+                    context_sentence = build_sentence()
+                    if context_sentence:
+                        result = request_definition_from_context(
+                            run.language, context_sentence
                         )
-                        trace_result("definition", result, ai_field="definition")
-                        definition_en = result.value or ""
-                if not definition_en and allow_ai("definition"):
-                    result = providers.definition(
-                        word,
-                        run.language,
-                        allow_ai=True,
-                        definition_language="en",
+                    else:
+                        result = request_definition_ai(run.language)
+                    trace_result(
+                        "definition_source",
+                        result,
+                        ai_field="definition",
+                        stage_key="definition_ms",
                     )
-                    trace_result("definition", result, ai_field="definition")
-                    definition_en = result.value or ""
+                    source_definition, source_definition_issue = finalize_definition(
+                        result.value or "", run.language
+                    )
 
-                definition = normalize_definition(
-                    definition_en,
-                    "en",
-                    pos_mode="auto",
-                    min_words=6,
-                    max_words=10,
+            if source_definition:
+                cache.set("definitions", source_key, source_definition)
+                cached_definition = cache.get("definitions", definition_key) or ""
+                definition, final_definition_issue = finalize_definition(
+                    cached_definition, "en"
                 )
-                if definition:
-                    cache.set("definitions", definition_key, definition)
+                if not definition:
+                    result = providers.translation_web(
+                        source_definition, run.language, "en"
+                    )
+                    trace_result("definition", result, stage_key="definition_ms")
+                    definition, final_definition_issue = finalize_definition(
+                        result.value or "", "en"
+                    )
+                    if not definition and allow_ai("definition"):
+                        result = providers.translation_ai(
+                            source_definition, run.language, "en"
+                        )
+                        trace_result(
+                            "definition",
+                            result,
+                            ai_field="definition",
+                            stage_key="definition_ms",
+                        )
+                        definition, final_definition_issue = finalize_definition(
+                            result.value or "", "en"
+                        )
+                    if not definition and allow_ai("definition") and run.mode == "full":
+                        context_sentence = build_sentence()
+                        if context_sentence:
+                            result = request_definition_from_context(
+                                "en", context_sentence
+                            )
+                        else:
+                            result = request_definition_ai("en")
+                        trace_result(
+                            "definition",
+                            result,
+                            ai_field="definition",
+                            stage_key="definition_ms",
+                        )
+                        definition, final_definition_issue = finalize_definition(
+                            result.value or "", "en"
+                        )
 
-        ipa = cache.get("ipa", word)
+            if not definition and allow_ai("definition"):
+                result = request_definition_ai("en")
+                trace_result(
+                    "definition",
+                    result,
+                    ai_field="definition",
+                    stage_key="definition_ms",
+                )
+                definition, final_definition_issue = finalize_definition(
+                    result.value or "", "en"
+                )
+
+        if definition:
+            cache.set("definitions", definition_key, definition)
+
+        if not definition:
+            remember_quality_error(
+                final_definition_issue or source_definition_issue or "definition_missing"
+            )
+            return discard_log(quality_errors)
+
+        sentence = build_sentence()
+        if not sentence:
+            remember_quality_error(last_sentence_issue or "sentence_missing")
+            return discard_log(quality_errors)
+
+        translation = ""
+        translation_issue_name: str | None = None
+        translation_key = (
+            f"{sentence}::{run.language}->{run.target_translation}::v{cache_version}"
+        )
+        cached_translation = cache.get("translations", translation_key) or ""
+        translation, translation_issue_name = finalize_translation(
+            cached_translation, sentence
+        )
+        if not translation:
+            result = providers.translation_web(
+                sentence, run.language, run.target_translation
+            )
+            trace_result("translation", result, stage_key="translation_ms")
+            translation, translation_issue_name = finalize_translation(
+                result.value or "", sentence
+            )
+            if not translation and allow_ai("translation"):
+                result = providers.translation_ai(
+                    sentence, run.language, run.target_translation
+                )
+                trace_result(
+                    "translation",
+                    result,
+                    ai_field="translation",
+                    stage_key="translation_ms",
+                )
+                translation, translation_issue_name = finalize_translation(
+                    result.value or "", sentence
+                )
+        if translation:
+            cache.set("translations", translation_key, translation)
+        else:
+            remember_quality_error(translation_issue_name or "translation_missing")
+            return discard_log(quality_errors)
+
+        ipa = cache.get("ipa", normalized_word)
         if not ipa:
             result = providers.ipa(word, run.language, allow_ai=allow_ai("ipa"))
-            trace_result("ipa", result, ai_field="ipa")
+            trace_result("ipa", result, ai_field="ipa", stage_key="ipa_ms")
             ipa = result.value or ""
-            # Fast fallback to prevent card loss and extra retries.
             if not ipa:
                 ipa = f"/{word}/"
         ipa = _normalize_ipa(ipa)
         if ipa and not _ipa_has_pronunciation(ipa) and allow_ai("ipa"):
             result = providers.phonetic_spelling(ipa, run.language, allow_ai=True)
-            trace_result("ipa_pronunciation", result, ai_field="ipa")
+            trace_result(
+                "ipa_pronunciation",
+                result,
+                ai_field="ipa",
+                stage_key="ipa_ms",
+            )
             phonetic = _sanitize_phonetic(result.value or "")
             if phonetic:
                 ipa = f"{ipa} ({phonetic})"
-        cache.set("ipa", word, ipa)
+        cache.set("ipa", normalized_word, ipa)
 
-        sentence = cache.get("sentences", word)
-        if sentence and not sentence_is_acceptable(sentence, word, 5, 25):
-            sentence = ""
-        if not sentence:
-            result = providers.sentence_web(word, run.language)
-            trace_result("sentence", result)
-            candidate = result.value or ""
-            if candidate and sentence_is_acceptable(candidate, word, 5, 25):
-                sentence = candidate
-                cache.set("sentences", word, sentence)
-            if not sentence:
-                sentence_attempts = 0
-                while sentence_attempts < 2 and allow_ai("sentence") and not sentence:
-                    result = providers.sentence_ai(word, run.language)
-                    trace_result("sentence", result, ai_field="sentence")
-                    candidate = result.value or ""
-                    if candidate and sentence_is_acceptable(candidate, word, 5, 25):
-                        sentence = candidate
-                        cache.set("sentences", word, sentence)
-                        break
-                    sentence_attempts += 1
+        card = CardData(
+            focus=word,
+            index=index if level == 1 else 0,
+            ipa=_normalize_ipa(ipa),
+            source_definition=source_definition,
+            definition=definition,
+            sentence=sentence,
+            translation=translation,
+            translation_language=run.target_translation,
+            image="",
+            audio="",
+            word_audio="",
+            sentence_audio="",
+            level=level,
+            language=run.language,
+        )
 
-        translation = ""
-        if sentence:
-            result = providers.translation_web(
-                sentence, run.language, run.target_translation
-            )
-            trace_result("translation", result)
-            translation = result.value or ""
-            if not translation and allow_ai("translation"):
-                result = providers.translation_ai(
-                    sentence, run.language, run.target_translation
-                )
-                trace_result("translation", result, ai_field="translation")
-                translation = result.value or ""
+        return card, LogRecord(
+            focus=word,
+            level=level,
+            providers=providers_used,
+            provider_errors=provider_errors,
+            stage_timings=stage_timings,
+            event_counts=dict(event_counts),
+            validations=quality_errors,
+            status="candidate",
+        )
 
+    def _attach_audio_to_card(
+        self,
+        *,
+        card: CardData,
+        log_record: LogRecord,
+        run: RunConfig,
+        cache: CacheManager,
+        providers: ProviderManager,
+    ) -> tuple[CardData, LogRecord, list[str]]:
         audio_cfg = self.config.get("audio") if isinstance(self.config, dict) else {}
         audio_cfg = audio_cfg if isinstance(audio_cfg, dict) else {}
         audio_enabled = bool(audio_cfg.get("enabled", False))
-        audio_required = bool(audio_cfg.get("required", False)) and audio_enabled
         audio_output_dir = audio_cfg.get("output_dir", "ankideck_generator/data/audio")
         provider_order = _normalize_provider_order(audio_cfg.get("provider_order"))
         if not provider_order:
             provider_order = ["gtts", "responsivevoice", "pyttsx3"]
+        filename_style = (
+            str(audio_cfg.get("filename_style", "slug_hash")).strip() or "slug_hash"
+        )
+        filename_slug_words = int(audio_cfg.get("filename_slug_words", 4) or 4)
         language_overrides = audio_cfg.get("language_overrides") or {}
         lang_override = (
             language_overrides.get(run.language, {})
@@ -508,15 +1465,31 @@ class DeckBuilder:
         )
         voice_override = None
         if isinstance(lang_override, dict):
-            override_order = _normalize_provider_order(lang_override.get("provider_order"))
+            override_order = _normalize_provider_order(
+                lang_override.get("provider_order")
+            )
             if override_order:
                 provider_order = override_order
             voice_override = lang_override.get("voice")
-        providers_cfg = self.config.get("providers", {}) if isinstance(self.config, dict) else {}
-        azure_cfg = providers_cfg.get("azure_tts", {}) if isinstance(providers_cfg, dict) else {}
+        providers_cfg = (
+            self.config.get("providers", {}) if isinstance(self.config, dict) else {}
+        )
+        azure_cfg = (
+            providers_cfg.get("azure_tts", {})
+            if isinstance(providers_cfg, dict)
+            else {}
+        )
         azure_voice_map = azure_cfg.get("voice_map") or {}
-        azure_voice = voice_override or azure_voice_map.get(run.language) or azure_cfg.get("voice")
-        eleven_cfg = providers_cfg.get("elevenlabs", {}) if isinstance(providers_cfg, dict) else {}
+        azure_voice = (
+            voice_override
+            or azure_voice_map.get(run.language)
+            or azure_cfg.get("voice")
+        )
+        eleven_cfg = (
+            providers_cfg.get("elevenlabs", {})
+            if isinstance(providers_cfg, dict)
+            else {}
+        )
         voice_gender_preference = eleven_cfg.get("voice_gender_preference") or "male"
         voice_key = _audio_voice_key(
             str(
@@ -528,18 +1501,32 @@ class DeckBuilder:
             )
         )
         use_legacy_cache = bool(audio_cfg.get("use_legacy_cache", False))
+        media_files: list[str] = []
 
-        def _add_media(path: str) -> None:
+        def trace_result(field: str, result: ProviderResult) -> None:
+            log_record.providers[field] = result.provider_name
+            if result.error:
+                log_record.provider_errors[field] = result.error
+            fallback_errors = getattr(result, "fallback_errors", None)
+            if isinstance(fallback_errors, dict):
+                for name, error in fallback_errors.items():
+                    if error:
+                        log_record.provider_errors[f"{field}:{name}"] = str(error)
+            log_record.stage_timings["audio_ms"] = log_record.stage_timings.get(
+                "audio_ms", 0
+            ) + int(getattr(result, "elapsed_ms", 0) or 0)
+
+        def add_media(path: str) -> None:
             if path and path not in media_files:
                 media_files.append(path)
 
-        def _cached_audio(kind: str, text_value: str) -> ProviderResult | None:
+        def cached_audio(kind: str, text_value: str) -> ProviderResult | None:
             cache_kind = "audio_files"
             for provider_name in provider_order:
                 cache_key = f"{kind}::{text_value}::{provider_name}::{voice_key}"
                 cached = cache.get(cache_kind, cache_key)
                 if cached and Path(cached).exists():
-                    _add_media(cached)
+                    add_media(cached)
                     return ProviderResult(
                         value=cached,
                         provider_name=provider_name,
@@ -550,7 +1537,7 @@ class DeckBuilder:
                 legacy_key = f"{kind}::{text_value}"
                 cached = cache.get(cache_kind, legacy_key)
                 if cached and Path(cached).exists():
-                    _add_media(cached)
+                    add_media(cached)
                     return ProviderResult(
                         value=cached,
                         provider_name="cache",
@@ -559,13 +1546,22 @@ class DeckBuilder:
                     )
             return None
 
-        def _audio_for(kind: str, text_value: str) -> tuple[str, ProviderResult | None]:
+        def audio_for(kind: str, text_value: str) -> tuple[str, ProviderResult | None]:
             if not audio_enabled or not text_value:
                 return "", None
-            cached = _cached_audio(kind, text_value)
+            cached = cached_audio(kind, text_value)
             if cached and cached.value:
                 return _sound_tag(cached.value), cached
-            filename_hint = f"{run.language}_{kind}_{text_value}_{voice_key}"
+            if filename_style == "slug_hash":
+                filename_hint = compact_audio_basename(
+                    run.language,
+                    kind,
+                    text_value,
+                    slug_words=filename_slug_words,
+                    extra=voice_key,
+                )
+            else:
+                filename_hint = f"{run.language}_{kind}_{text_value}_{voice_key}"
             result = providers.audio(
                 text_value,
                 run.language,
@@ -582,7 +1578,7 @@ class DeckBuilder:
             if value and Path(value).exists():
                 cache_key = f"{kind}::{text_value}::{provider_name}::{voice_key}"
                 cache.set("audio_files", cache_key, value)
-                _add_media(value)
+                add_media(value)
                 return _sound_tag(value), result
             if value and not Path(value).exists():
                 result = ProviderResult(
@@ -593,88 +1589,68 @@ class DeckBuilder:
                 )
             return "", result
 
-        audio_value = ""
-        word_audio = ""
+        if not audio_enabled:
+            return card, log_record, media_files
+        if not run.generate_audio:
+            return card, log_record, media_files
+
+        word_audio, result = audio_for("word", card.focus)
+        if result:
+            trace_result("word_audio", result)
         sentence_audio = ""
-        if audio_enabled:
-            word_audio, result = _audio_for("word", word)
+        if card.sentence:
+            sentence_audio, result = audio_for("sentence", card.sentence)
             if result:
-                trace_result("word_audio", result)
-            if word_audio:
-                audio_value = word_audio
-            if sentence:
-                sentence_audio, result = _audio_for("sentence", sentence)
-                if result:
-                    trace_result("sentence_audio", result)
-                if not audio_value and sentence_audio:
-                    audio_value = sentence_audio
+                trace_result("sentence_audio", result)
 
-        card = CardData(
-            focus=word,
-            index=index if level == 1 else 0,
-            ipa=_normalize_ipa(ipa),
-            definition=definition,
-            sentence=sentence,
-            translation=translation,
-            translation_language=run.target_translation,
-            image="",
-            audio=audio_value,
-            word_audio=word_audio,
-            sentence_audio=sentence_audio,
-            level=level,
-            language=run.language,
+        card.word_audio = word_audio
+        card.sentence_audio = sentence_audio
+        card.audio = word_audio or sentence_audio
+        return card, log_record, media_files
+
+    def _validate_text_candidate(
+        self,
+        card: CardData,
+        ctx: ValidationContext,
+        run: RunConfig,
+        reserved_focus: set[str] | None = None,
+        reserved_sentences: set[str] | None = None,
+    ) -> list[str]:
+        temp_ctx = ValidationContext(
+            seen_focus=set(ctx.seen_focus),
+            seen_sentence=set(ctx.seen_sentence),
         )
-
-        errors = validate_card(
-            card,
-            ctx,
-            _validations_for_language(run.language, audio_required=audio_required),
+        if reserved_focus:
+            temp_ctx.seen_focus.update(reserved_focus)
+        if reserved_sentences:
+            temp_ctx.seen_sentence.update(reserved_sentences)
+        validations = _validations_for_language(
+            run.language,
+            audio_required=False,
+            strict_quality=bool(run.strict_quality),
+            level_validation_mode=run.level_validation_mode,
         )
-        runtime_cfg = self.config.get("runtime") if isinstance(self.config, dict) else {}
-        runtime_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
-        test_accept_all = bool(runtime_cfg.get("test_accept_all", False)) and run.mode == "test"
-        if errors and not test_accept_all:
-            discard_reason = _infer_discard_reason(errors, provider_errors)
-            return None, LogRecord(
-                focus=word,
-                level=level,
-                providers=providers_used,
-                provider_errors=provider_errors,
-                validations=errors,
-                status="discarded",
-                discard_reason=discard_reason,
-            )
-        if errors and test_accept_all:
-            return card, LogRecord(
-                focus=word,
-                level=level,
-                providers=providers_used,
-                provider_errors=provider_errors,
-                validations=errors,
-                status="accepted",
-            )
+        return validate_card(card, temp_ctx, validations, commit=False)
 
-        if run.interactive:
-            try:
-                card = self._interactive_edit(card)
-            except ValueError:
-                return None, LogRecord(
-                    focus=word,
-                    level=level,
-                    providers=providers_used,
-                    provider_errors=provider_errors,
-                    validations=["skipped_by_user"],
-                    status="skipped",
-                )
+    def _audio_validation_errors(self, card: CardData, run: RunConfig) -> list[str]:
+        if not run.generate_audio:
+            return []
+        audio_cfg = self.config.get("audio") if isinstance(self.config, dict) else {}
+        audio_cfg = audio_cfg if isinstance(audio_cfg, dict) else {}
+        if not bool(audio_cfg.get("enabled", False)):
+            return []
+        if not bool(audio_cfg.get("required", False)):
+            return []
+        errors: list[str] = []
+        if not card.word_audio:
+            errors.append("word_audio_missing")
+        if not card.sentence_audio:
+            errors.append("sentence_audio_missing")
+        return errors
 
-        return card, LogRecord(
-            focus=word,
-            level=level,
-            providers=providers_used,
-            provider_errors=provider_errors,
-            validations=[],
-            status="accepted",
-        )
+    def _should_reject_errors(self, errors: list[str], run: RunConfig) -> bool:
+        _ = run
+        return bool(errors)
 
     def _print_summary(
         self,
@@ -682,6 +1658,9 @@ class DeckBuilder:
         attempted_by_level: Counter[int],
         validation_counter: Counter[str],
         provider_counter: Counter[str],
+        event_counter: Counter[str],
+        stage_counter: Counter[str],
+        stage_samples: Counter[str],
     ) -> None:
         print("\nRun summary:")
         for level in sorted(attempted_by_level.keys() | accepted_by_level.keys()):
@@ -694,11 +1673,43 @@ class DeckBuilder:
             print("- Top validation errors:")
             for name, count in top_validations:
                 print(f"  {name}: {count}")
+        sentence_event_keys = [
+            "sentence_tatoeba_attempted",
+            "sentence_tatoeba_hit",
+            "sentence_ai_rewrite_attempted",
+            "sentence_ai_rewrite_hit",
+            "sentence_ai_generate_attempted",
+            "sentence_ai_generate_hit",
+        ]
+        sentence_events = [
+            (name, event_counter.get(name, 0))
+            for name in sentence_event_keys
+            if event_counter.get(name, 0)
+        ]
+        if sentence_events:
+            print("- Sentence source stats:")
+            for name, count in sentence_events:
+                print(f"  {name}: {count}")
         top_providers = provider_counter.most_common(8)
         if top_providers:
             print("- Provider hit-rate:")
             for name, count in top_providers:
                 print(f"  {name}: {count}")
+        ordered_stage_keys = [
+            "lexicon_ms",
+            "sentence_ms",
+            "definition_ms",
+            "translation_ms",
+            "audio_ms",
+        ]
+        available_stage_keys = [key for key in ordered_stage_keys if stage_samples.get(key)]
+        if available_stage_keys:
+            print("- Stage timings:")
+            for key in available_stage_keys:
+                total_ms = stage_counter.get(key, 0)
+                samples = stage_samples.get(key, 0)
+                avg_ms = (total_ms / samples) if samples else 0.0
+                print(f"  {key}: total {total_ms} ms, avg {avg_ms:.1f} ms")
 
     def _interactive_edit(self, card: CardData) -> CardData:
         print("\n--- Review Card ---")
@@ -720,7 +1731,9 @@ class DeckBuilder:
                 else:
                     print("Unknown field")
 
-    def _cleanup_audio_files(self, media_files: list[str], audio_dir: str | Path) -> None:
+    def _cleanup_audio_files(
+        self, media_files: list[str], audio_dir: str | Path
+    ) -> None:
         base_dir = Path(audio_dir).resolve()
         removed = set()
         for path_str in media_files:
@@ -790,7 +1803,9 @@ def _normalize_provider_order(value: object) -> list[str]:
 
 
 def _audio_voice_key(value: str) -> str:
-    cleaned = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)
+    cleaned = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_" for char in value
+    )
     return cleaned[:80] if cleaned else "default"
 
 
@@ -801,17 +1816,35 @@ def _sound_tag(path: str) -> str:
 def _infer_discard_reason(
     errors: list[str], provider_errors: dict[str, str]
 ) -> str | None:
+    if "focus_not_in_lexicon" in errors:
+        return "focus_not_in_lexicon"
     sentence_related = {
         "focus_not_in_sentence",
         "example_word_not_in_sentence",
         "sentence_length_invalid",
+        "sentence_profile_invalid",
+        "sentence_wrong_language",
+        "sentence_too_hard_for_level1",
+        "sentence_not_level2",
+        "sentence_too_easy_for_level3",
     }
     if "sentence" in provider_errors or sentence_related.intersection(errors):
         return "sentence_generation_failed"
     if (
+        "definition_wrong_language" in errors
+        or "source_definition_wrong_language" in errors
+    ):
+        return "definition_wrong_language"
+    if "definition_missing_pos" in errors:
+        return "definition_missing_pos"
+    if "definition_nonsemantic" in errors:
+        return "definition_nonsemantic"
+    if (
         "translation" in provider_errors
         or "word_translation" in provider_errors
         or "translation_missing" in errors
+        or "translation_wrong_language" in errors
+        or "translation_same_as_source" in errors
     ):
         return "translation_generation_failed"
     if "definition" in provider_errors or "definition_missing" in errors:
@@ -827,9 +1860,33 @@ def _infer_discard_reason(
     return None
 
 
-def _validations_for_language(language: str, audio_required: bool = False) -> dict[str, object]:
+def _sentence_length_bounds(
+    length_config: object, level: int, default: tuple[int, int] = (2, 15)
+) -> tuple[int, int]:
+    if isinstance(length_config, dict):
+        value = length_config.get(level)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            return int(value[0]), int(value[1])
+    if isinstance(length_config, (list, tuple)) and len(length_config) == 2:
+        return int(length_config[0]), int(length_config[1])
+    return default
+
+
+def _validations_for_language(
+    language: str,
+    audio_required: bool = False,
+    strict_quality: bool = True,
+    level_validation_mode: str = "profile_hard_zipf_soft",
+) -> dict[str, object]:
     _ = language
     validations = dict(DEFAULT_VALIDATIONS)
+    validations["level_validation_mode"] = level_validation_mode
+    if not strict_quality:
+        validations["definition_semantic"] = False
+        validations["definition_requires_pos"] = False
+        validations["definition_matches_translation_language"] = False
+        validations["source_definition_matches_language"] = False
+        validations["sentence_matches_language"] = False
     if audio_required:
         validations["word_audio_required"] = True
         validations["sentence_audio_required"] = True

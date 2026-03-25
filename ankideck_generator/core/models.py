@@ -40,6 +40,7 @@ class CardData(BaseModel):
     focus: str = ""
     index: int = 0
     ipa: str = ""
+    source_definition: str = ""
     definition: str = ""
     sentence: str = ""
     translation: str = ""
@@ -104,7 +105,16 @@ class RunConfig(BaseModel):
     ai_max_calls_per_word: int = 6
     ai_max_calls_per_field: int = 2
     level_pool_multiplier: int = 8
+    concurrency: int = 1
+    audio_concurrency: int = 1
     strict_quality: bool = True
+    max_attempts_per_level: int = 0
+    exclude_closed_class_words: bool = True
+    cache_validation_version: int = 3
+    enforce_translation_language: bool = True
+    generate_audio: bool = True
+    sentence_rewrite_from_web: bool = True
+    level_validation_mode: str = "profile_hard_zipf_soft"
 
 
 class ProgressState(BaseModel):
@@ -124,6 +134,8 @@ class LogRecord(BaseModel):
     level: int
     providers: dict[str, str] = Field(default_factory=dict)
     provider_errors: dict[str, str] = Field(default_factory=dict)
+    stage_timings: dict[str, int] = Field(default_factory=dict)
+    event_counts: dict[str, int] = Field(default_factory=dict)
     validations: list[str] = Field(default_factory=list)
     status: str
     discard_reason: str | None = None

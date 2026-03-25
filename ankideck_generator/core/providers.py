@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+from html import unescape
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -13,7 +14,11 @@ import requests
 from gtts import gTTS
 
 from ..utils.file_utils import ensure_dir
-from ..utils.language_tools import LANG_CODE_TO_NAME, score_sentence
+from ..utils.language_tools import (
+    LANG_CODE_TO_NAME,
+    score_sentence,
+    semantic_definition_reason,
+)
 from .models import ProviderResult
 
 try:
@@ -44,9 +49,21 @@ class ProviderManager:
         self.timeout_sec = timeout_sec
         self.retries = retries
         self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "User-Agent": "ankideck-generator/1.0 (+https://example.invalid)",
+                "Accept": "application/json",
+            }
+        )
         self._translator = Translator() if Translator else None
         self._elevenlabs_voice_cache: dict[str, str] = {}
         self._elevenlabs_voices: list[dict] | None = None
+        self._lexicon_cache: dict[tuple[str, str], ProviderResult] = {}
+        self._wiktionary_definition_cache: dict[tuple[str, str], list[str]] = {}
+        self._disabled_providers: set[str] = set()
+        self._provider_failure_streak: dict[str, int] = {}
+        self._provider_timeout_streak: dict[str, int] = {}
+        self._provider_timeout_limit = 3
         self._ai_config = (config or {}).get("providers", {}).get("ai", {}) if config else {}
         self._ai_request_count = 0
         providers = self._ai_config.get("providers") or self._ai_config.get("provider") or "openrouter"
@@ -77,6 +94,13 @@ class ProviderManager:
         )
 
     def _wrap(self, provider_name: str, fn: Callable[[], str | None]) -> ProviderResult:
+        if provider_name in self._disabled_providers:
+            return ProviderResult(
+                value=None,
+                provider_name=provider_name,
+                elapsed_ms=0,
+                error="provider_disabled",
+            )
         start = time.time()
         last_exc: Exception | None = None
         for attempt in range(self.retries + 1):
@@ -84,14 +108,66 @@ class ProviderManager:
                 value = fn()
                 if value is None or value == "":
                     raise ProviderError("empty result")
+                self._register_provider_success(provider_name)
                 elapsed = int((time.time() - start) * 1000)
                 return ProviderResult(value=value, provider_name=provider_name, elapsed_ms=elapsed)
             except Exception as exc:  # pragma: no cover - network errors
                 last_exc = exc
+                message = str(exc)
+                self._register_provider_failure(provider_name, message, exc)
+                if self._is_deterministic_error(message):
+                    break
                 if attempt >= self.retries:
                     break
         elapsed = int((time.time() - start) * 1000)
         return ProviderResult(value=None, provider_name=provider_name, elapsed_ms=elapsed, error=str(last_exc))
+
+    def _register_provider_success(self, provider_name: str) -> None:
+        self._provider_failure_streak[provider_name] = 0
+        self._provider_timeout_streak[provider_name] = 0
+
+    def _register_provider_failure(
+        self, provider_name: str, message: str, exc: Exception | None = None
+    ) -> None:
+        failures = self._provider_failure_streak.get(provider_name, 0) + 1
+        self._provider_failure_streak[provider_name] = failures
+
+        if self._is_timeout_error(message, exc):
+            timeout_streak = self._provider_timeout_streak.get(provider_name, 0) + 1
+            self._provider_timeout_streak[provider_name] = timeout_streak
+            if timeout_streak >= self._provider_timeout_limit:
+                self._disabled_providers.add(provider_name)
+            return
+
+        self._provider_timeout_streak[provider_name] = 0
+        if self._is_auth_or_restricted_error(message):
+            self._disabled_providers.add(provider_name)
+
+    def _is_timeout_error(self, message: str, exc: Exception | None = None) -> bool:
+        text = (message or "").lower()
+        if "timed out" in text or "timeout" in text or "read timed out" in text:
+            return True
+        return isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ReadTimeout))
+
+    def _is_auth_or_restricted_error(self, message: str) -> bool:
+        text = (message or "").lower()
+        if "organization has been restricted" in text:
+            return True
+        if "invalid api key" in text or "missing api_key" in text:
+            return True
+        return any(code in text for code in ("http 401", "http 403"))
+
+    def _is_deterministic_error(self, message: str) -> bool:
+        text = (message or "").strip().lower()
+        if not text:
+            return False
+        if "empty result" in text:
+            return True
+        if "missing api_key" in text or "voice_id not found" in text:
+            return True
+        if "organization has been restricted" in text:
+            return True
+        return any(code in text for code in ("http 400", "http 401", "http 403", "http 404"))
 
     def definition(
         self, word: str, language: str, allow_ai: bool = True, definition_language: str | None = None
@@ -100,16 +176,65 @@ class ProviderManager:
         if target_lang != language:
             providers: list[tuple[str, Callable[[], str | None]]] = []
             if allow_ai:
-                providers.append(("ai", lambda: self._definition_ai(word, target_lang)))
+                providers.append(
+                    ("ai", lambda: self._definition_ai(word, target_lang, semantic_only=True))
+                )
             return self._fallback(providers)
 
         providers: list[tuple[str, Callable[[], str | None]]] = []
-        if allow_ai:
-            providers.append(("ai", lambda: self._definition_ai(word, language)))
         providers.append(("wiktionary", lambda: self._definition_wiktionary(word, language)))
         providers.append(("wordnet", lambda: self._definition_wordnet(word, language)))
         providers.append(("dictionaryapi", lambda: self._definition_dictionaryapi(word, language)))
+        if allow_ai:
+            providers.append(
+                ("ai", lambda: self._definition_ai(word, language, semantic_only=True))
+            )
         return self._fallback(providers)
+
+    def definition_ai(
+        self, word: str, language: str, semantic_only: bool = True
+    ) -> ProviderResult:
+        return self._wrap(
+            "ai", lambda: self._definition_ai(word, language, semantic_only=semantic_only)
+        )
+
+    def definition_from_context(
+        self,
+        word: str,
+        sentence: str,
+        language: str,
+        definition_language: str | None = None,
+    ) -> ProviderResult:
+        target_language = definition_language or language
+        return self._wrap(
+            "ai",
+            lambda: self._definition_from_context_ai(
+                word, sentence, language, target_language
+            ),
+        )
+
+    def word_exists(self, word: str, language: str) -> ProviderResult:
+        cache_key = (word.strip().lower(), language.strip().lower())
+        cached = self._lexicon_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        providers: list[tuple[str, Callable[[], str | None]]] = [
+            ("wiktionary", lambda: word if self._word_exists_wiktionary(word, language) else None),
+        ]
+        if language == "en":
+            providers.extend(
+                [
+                    ("wordnet", lambda: word if self._definition_wordnet(word, language) else None),
+                    (
+                        "dictionaryapi",
+                        lambda: word if self._definition_dictionaryapi(word, language) else None,
+                    ),
+                ]
+            )
+        result = self._fallback(providers)
+        self._lexicon_cache[cache_key] = result
+        return result
 
     def translation(self, text: str, src: str, dest: str, allow_ai: bool = True) -> ProviderResult:
         providers: list[tuple[str, Callable[[], str | None]]] = [
@@ -121,24 +246,93 @@ class ProviderManager:
             providers.append(("ai", lambda: self._translate_ai(text, src, dest)))
         return self._fallback(providers)
 
-    def sentence(self, word: str, language: str, allow_ai: bool = True) -> ProviderResult:
+    def sentence(
+        self,
+        word: str,
+        language: str,
+        allow_ai: bool = True,
+        *,
+        min_words: int | None = None,
+        max_words: int | None = None,
+    ) -> ProviderResult:
         providers: list[tuple[str, Callable[[], str | None]]] = []
         providers.extend(
             [
-                ("tatoeba", lambda: self._sentence_tatoeba(word, language)),
-                ("wordincontext", lambda: self._sentence_wordincontext(word, language)),
+                (
+                    "tatoeba",
+                    lambda: self._sentence_tatoeba(
+                        word, language, min_words=min_words, max_words=max_words
+                    ),
+                ),
+                (
+                    "wordincontext",
+                    lambda: self._sentence_wordincontext(word, language),
+                ),
             ]
         )
         if allow_ai:
-            providers.append(("ai", lambda: self._sentence_ai(word, language)))
+            providers.append(
+                (
+                    "ai",
+                    lambda: self._sentence_ai(
+                        word, language, min_words=min_words, max_words=max_words
+                    ),
+                )
+            )
         return self._fallback(providers)
 
-    def sentence_ai(self, word: str, language: str) -> ProviderResult:
-        return self._wrap("ai", lambda: self._sentence_ai(word, language))
+    def sentence_ai(
+        self,
+        word: str,
+        language: str,
+        *,
+        min_words: int | None = None,
+        max_words: int | None = None,
+    ) -> ProviderResult:
+        return self._wrap(
+            "ai",
+            lambda: self._sentence_ai(
+                word, language, min_words=min_words, max_words=max_words
+            ),
+        )
 
-    def sentence_web(self, word: str, language: str) -> ProviderResult:
+    def sentence_rewrite(
+        self,
+        sentence: str,
+        word: str,
+        language: str,
+        *,
+        level: int | None = None,
+        min_words: int | None = None,
+        max_words: int | None = None,
+    ) -> ProviderResult:
+        return self._wrap(
+            "ai",
+            lambda: self._sentence_rewrite_ai(
+                sentence,
+                word,
+                language,
+                level=level,
+                min_words=min_words,
+                max_words=max_words,
+            ),
+        )
+
+    def sentence_web(
+        self,
+        word: str,
+        language: str,
+        *,
+        min_words: int | None = None,
+        max_words: int | None = None,
+    ) -> ProviderResult:
         providers = [
-            ("tatoeba", lambda: self._sentence_tatoeba(word, language)),
+            (
+                "tatoeba",
+                lambda: self._sentence_tatoeba(
+                    word, language, min_words=min_words, max_words=max_words
+                ),
+            ),
             ("wordincontext", lambda: self._sentence_wordincontext(word, language)),
         ]
         return self._fallback(providers)
@@ -238,6 +432,9 @@ class ProviderManager:
         last_result: ProviderResult | None = None
         fallback_errors: dict[str, str] = {}
         for name, fn in providers:
+            if name in self._disabled_providers:
+                fallback_errors[name] = "provider_disabled"
+                continue
             result = self._wrap(name, fn)
             if result.value:
                 if fallback_errors:
@@ -269,19 +466,8 @@ class ProviderManager:
         return synsets[0].definition()
 
     def _definition_wiktionary(self, word: str, language: str) -> str | None:
-        lang_name = LANG_CODE_TO_NAME.get(language, "English")
-        url = f"https://en.wiktionary.org/api/rest_v1/page/definition/{quote(word)}"
-        resp = self._session.get(url, timeout=self.timeout_sec)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        entries = data.get(lang_name)
-        if not entries:
-            return None
-        definitions = entries[0].get("definitions")
-        if not definitions:
-            return None
-        return definitions[0].get("definition")
+        definitions = self._wiktionary_definitions(word, language)
+        return definitions[0] if definitions else None
 
     def _definition_dictionaryapi(self, word: str, language: str) -> str | None:
         if language != "en":
@@ -347,7 +533,53 @@ class ProviderManager:
         data = resp.json()
         return data.get("translatedText")
 
-    def _sentence_tatoeba(self, word: str, language: str) -> str | None:
+    def _wiktionary_definitions(self, word: str, language: str) -> list[str]:
+        cache_key = (word.strip().lower(), language.strip().lower())
+        cached = self._wiktionary_definition_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        lang_name = LANG_CODE_TO_NAME.get(language, "English")
+        url = f"https://en.wiktionary.org/api/rest_v1/page/definition/{quote(word)}"
+        resp = self._session.get(url, timeout=self.timeout_sec)
+        if resp.status_code != 200:
+            self._wiktionary_definition_cache[cache_key] = []
+            return []
+        data = resp.json()
+        entries = data.get(language) or data.get(language.lower()) or data.get(lang_name)
+        if not entries:
+            self._wiktionary_definition_cache[cache_key] = []
+            return []
+
+        preferred: list[str] = []
+        fallback: list[str] = []
+        for entry in entries:
+            part_of_speech = _wiktionary_pos_label(
+                entry.get("partOfSpeech") or entry.get("part_of_speech") or ""
+            )
+            for definition in entry.get("definitions") or []:
+                text = _clean_wiktionary_text(definition.get("definition") or "")
+                if text:
+                    candidate = f"{part_of_speech}: {text}" if part_of_speech else text
+                    if semantic_definition_reason(candidate, word) is None:
+                        preferred.append(candidate)
+                    else:
+                        fallback.append(candidate)
+        definitions = preferred or fallback
+        self._wiktionary_definition_cache[cache_key] = definitions
+        return definitions
+
+    def _word_exists_wiktionary(self, word: str, language: str) -> bool:
+        return bool(self._wiktionary_definitions(word, language))
+
+    def _sentence_tatoeba(
+        self,
+        word: str,
+        language: str,
+        *,
+        min_words: int | None = None,
+        max_words: int | None = None,
+    ) -> str | None:
         endpoint = self.config.get("providers", {}).get("tatoeba", {}).get("endpoint")
         if not endpoint:
             return None
@@ -375,7 +607,13 @@ class ProviderManager:
             candidates.append(sentence)
         if not candidates:
             return None
-        return _best_sentence(candidates, word, language)
+        return _best_sentence(
+            candidates,
+            word,
+            language,
+            min_words=min_words or 5,
+            max_words=max_words or 25,
+        )
 
     def _sentence_wordincontext(self, word: str, language: str) -> str | None:
         # Placeholder for paid API; return None to trigger fallback.
@@ -634,30 +872,119 @@ class ProviderManager:
 
         return [k.strip() for k in keys if k.strip()]
 
-    def _sentence_ai(self, word: str, language: str) -> str | None:
+    def _sentence_ai(
+        self,
+        word: str,
+        language: str,
+        *,
+        min_words: int | None = None,
+        max_words: int | None = None,
+    ) -> str | None:
+        language_name = LANG_CODE_TO_NAME.get(language, language)
+        min_words = int(min_words or 5)
+        max_words = int(max_words or 25)
         system = (
             "You generate natural, simple example sentences for language learners. "
-            "Return only one sentence, no quotes, no extra text."
+            "Return exactly one sentence, with no quotes, no notes, and no extra text."
         )
         user = (
-            f"Language: {language}. "
-            f"Create one natural everyday sentence with 5 to 25 words that includes the word '{word}'. "
-            "Avoid proper nouns, avoid idioms, and keep it clear and simple."
+            f"Target language: {language_name} ({language}). "
+            f"Create one natural everyday sentence in {language_name} with {min_words} to {max_words} words that includes the exact word '{word}'. "
+            "Do not use English or any other language. Avoid proper nouns, avoid idioms, avoid lists, and keep it clear and simple."
         )
         text = self._ai_request(system, user)
         if not text:
             return None
         lines = [line.strip("- ").strip() for line in text.splitlines() if line.strip()]
-        return _best_sentence(lines, word, language)
+        return _best_sentence(
+            lines,
+            word,
+            language,
+            min_words=min_words,
+            max_words=max_words,
+        )
 
-    def _definition_ai(self, word: str, language: str) -> str | None:
+    def _sentence_rewrite_ai(
+        self,
+        sentence: str,
+        word: str,
+        language: str,
+        *,
+        level: int | None = None,
+        min_words: int | None = None,
+        max_words: int | None = None,
+    ) -> str | None:
+        language_name = LANG_CODE_TO_NAME.get(language, language)
+        min_words = int(min_words or 5)
+        max_words = int(max_words or 25)
         system = (
-            "You provide concise dictionary-style definitions. "
-            "Return exactly one definition, no examples."
+            "You rewrite example sentences for language learners. "
+            "Return exactly one sentence, with no quotes, no notes, and no extra text."
         )
         user = (
-            f"Language: {language}. Define the word '{word}' in the same language. "
-            "Return 6-10 words. If you know POS, prefix noun/verb/adjective/adverb."
+            f"Target language: {language_name} ({language}). "
+            f"Rewrite this sentence to fit learner level {level or 1} using {min_words} to {max_words} words: '{sentence}'. "
+            f"Keep the exact focus word '{word}' in the rewritten sentence. "
+            "Preserve the original meaning as much as possible. "
+            "Do not use English or any other language. Avoid proper nouns, avoid lists, and keep the sentence natural."
+        )
+        text = self._ai_request(system, user)
+        if not text:
+            return None
+        lines = [line.strip("- ").strip() for line in text.splitlines() if line.strip()]
+        return _best_sentence(
+            lines,
+            word,
+            language,
+            min_words=min_words,
+            max_words=max_words,
+        )
+
+    def _definition_ai(
+        self, word: str, language: str, semantic_only: bool = True
+    ) -> str | None:
+        language_name = LANG_CODE_TO_NAME.get(language, language)
+        system = (
+            "You provide concise dictionary-style definitions. "
+            "Return exactly one definition, no examples, no quotes, and no extra commentary."
+        )
+        semantic_rule = (
+            "Explain the meaning of the word itself, not grammar labels, not inflection notes, not etymology, and not whether the word exists."
+            if semantic_only
+            else "Define the word directly."
+        )
+        user = (
+            f"Target language: {language_name} ({language}). Define the word '{word}' only in {language_name}. "
+            f"{semantic_rule} "
+            "Return 4 to 12 words. Always prefix exactly one POS label from this list: "
+            "noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, article, determiner, numeral, auxiliary verb, proper noun, masculine noun, feminine noun, plural noun, expression. "
+            "Use the POS label in English, even if the definition itself is in another language."
+        )
+        return self._ai_request(system, user)
+
+    def _definition_from_context_ai(
+        self,
+        word: str,
+        sentence: str,
+        source_language: str,
+        definition_language: str,
+    ) -> str | None:
+        source_name = LANG_CODE_TO_NAME.get(source_language, source_language)
+        target_name = LANG_CODE_TO_NAME.get(definition_language, definition_language)
+        system = (
+            "You provide context-aware dictionary definitions for language learners. "
+            "Return exactly one definition, no examples, no quotes, and no extra text."
+        )
+        user = (
+            f"Source language: {source_name} ({source_language}). "
+            f"Definition language: {target_name} ({definition_language}). "
+            f"Word: '{word}'. Sentence: '{sentence}'. "
+            f"Define the word as used in this sentence, in {target_name}. "
+            "Do not describe grammar notes like 'third-person singular', 'plural of', or 'imperative of'. "
+            "Always prefix exactly one POS label from this list: "
+            "noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, article, determiner, numeral, auxiliary verb, proper noun, masculine noun, feminine noun, plural noun, expression. "
+            "Use the POS label in English, even if the definition itself is in another language. "
+            "Return 4 to 12 words."
         )
         return self._ai_request(system, user)
 
@@ -712,10 +1039,41 @@ def _extract_json_payload(text: str) -> Any | None:
             return None
 
 
-def _best_sentence(candidates: list[str], focus: str, language: str) -> str | None:
+def _clean_wiktionary_text(value: str) -> str:
+    text = unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _wiktionary_pos_label(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return text.strip(" -:;,./")
+
+
+def _best_sentence(
+    candidates: list[str],
+    focus: str,
+    language: str,
+    *,
+    min_words: int = 5,
+    max_words: int = 25,
+) -> str | None:
     if not candidates:
         return None
-    scored = [(score_sentence(sent, focus, language), sent) for sent in candidates]
+    scored = [
+        (
+            score_sentence(
+                sent,
+                focus,
+                language,
+                min_words=min_words,
+                max_words=max_words,
+            ),
+            sent,
+        )
+        for sent in candidates
+    ]
     scored.sort(key=lambda item: item[0], reverse=True)
     best_score, best_sentence = scored[0]
     return best_sentence if best_score > 0 else None

@@ -56,9 +56,29 @@ def main() -> int:
     ai_max_calls_per_word = mode_profile.get("ai_max_calls_per_word", runtime_cfg.get("ai_max_calls_per_word", 6))
     ai_max_calls_per_field = mode_profile.get("ai_max_calls_per_field", runtime_cfg.get("ai_max_calls_per_field", 2))
     level_pool_multiplier = runtime_cfg.get("level_pool_multiplier", 8)
+    concurrency = runtime_cfg.get("concurrency", 1)
+    audio_concurrency = runtime_cfg.get("audio_concurrency", 1)
+    max_attempts_per_level = runtime_cfg.get("max_attempts_per_level_full", 0)
     if mode == "test":
         level_pool_multiplier = runtime_cfg.get("test_level_pool_multiplier", level_pool_multiplier)
+        concurrency = runtime_cfg.get("test_concurrency", concurrency)
+        audio_concurrency = runtime_cfg.get("test_audio_concurrency", audio_concurrency)
+        max_attempts_per_level = runtime_cfg.get(
+            "max_attempts_per_level_test", max_attempts_per_level
+        )
     strict_quality = runtime_cfg.get("strict_quality", True)
+    exclude_closed_class_words = bool(runtime_cfg.get("exclude_closed_class_words", True))
+    cache_validation_version = int(runtime_cfg.get("cache_validation_version", 3) or 3)
+    enforce_translation_language = bool(
+        runtime_cfg.get("enforce_translation_language", True)
+    )
+    sentence_rewrite_from_web = bool(
+        runtime_cfg.get("sentence_rewrite_from_web", True)
+    )
+    level_validation_mode = str(
+        runtime_cfg.get("level_validation_mode", "profile_hard_zipf_soft")
+    ).strip() or "profile_hard_zipf_soft"
+    generate_audio = not (mode == "test" and bool(runtime_cfg.get("test_disable_audio", False)))
 
     run = RunConfig(
         language=lang_cfg.get("code", args.language),
@@ -77,7 +97,16 @@ def main() -> int:
         ai_max_calls_per_word=ai_max_calls_per_word,
         ai_max_calls_per_field=ai_max_calls_per_field,
         level_pool_multiplier=level_pool_multiplier,
+        concurrency=concurrency,
+        audio_concurrency=audio_concurrency,
         strict_quality=strict_quality,
+        max_attempts_per_level=int(max_attempts_per_level or 0),
+        exclude_closed_class_words=exclude_closed_class_words,
+        cache_validation_version=cache_validation_version,
+        enforce_translation_language=enforce_translation_language,
+        generate_audio=generate_audio,
+        sentence_rewrite_from_web=sentence_rewrite_from_web,
+        level_validation_mode=level_validation_mode,
     )
 
     builder = DeckBuilder(args.config)
