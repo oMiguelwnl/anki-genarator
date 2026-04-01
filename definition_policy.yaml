@@ -1,0 +1,44 @@
+cleanup:
+  collapse_whitespace: true
+  strip_bracket_notes: true
+  strip_css_markup: true
+  strip_html: true
+  strip_quotes: true
+  normalize_punctuation_spacing: true
+
+noise_patterns:
+  - "\\.mw-parser-output(?:\\s+\\.[A-Za-z0-9_-]+(?:\\{[^{}]*\\})?)*"
+  - "\\.[A-Za-z0-9_-]+\\{[^{}]*\\}"
+  - "__TOC__"
+
+spacing_replacements:
+  - ["\\s+,", ","]
+  - ["\\s+\\.", "."]
+  - ["\\s+;", ";"]
+  - ["\\s+:", ":"]
+  - ["\\(\\s+", "("]
+  - ["\\s+\\)", ")"]
+  - [",(?=\\S)", ", "]
+  - [";(?=\\S)", "; "]
+
+pos_aliases:
+  adj: adjective
+  adv: adverb
+  adverbio: adverb
+  adjectif: adjective
+  article defini: article
+  conjonction: conjunction
+  determinante: determiner
+  interjeccion: interjection
+  nom: noun
+  nome: noun
+  nombre: noun
+  numéral: numeral
+  particule: particle
+  particula: particle
+  prep: preposition
+  pronom: pronoun
+  pronombre: pronoun
+  substantif: noun
+  sustantivo: noun
+  verbo: verb

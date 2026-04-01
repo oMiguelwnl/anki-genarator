@@ -4,8 +4,10 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 import random
 import re
+import shutil
 import threading
-from collections import Counter
+import time
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -13,7 +15,12 @@ import genanki
 from tqdm import tqdm
 
 from ..utils.config import load_config
-from ..utils.definition_tools import definition_has_pos, normalize_definition
+from ..utils.definition_tools import (
+    build_definition_policy,
+    definition_has_pos,
+    normalize_definition,
+    set_default_definition_policy,
+)
 from ..utils.file_utils import atomic_write_json, ensure_dir, read_json
 from ..utils.language_tools import (
     compact_audio_basename,
@@ -37,7 +44,7 @@ from .providers import ProviderManager
 from .validators import ValidationContext, validate_card
 
 try:
-    from wordfreq import top_n_list
+    from wordfreq import top_n_list, zipf_frequency
 except Exception as exc:  # pragma: no cover - optional
     raise RuntimeError("wordfreq is required") from exc
 
@@ -76,9 +83,43 @@ DEFAULT_VALIDATIONS = {
 
 TEST_ACCEPT_ALL_SOFT_ERRORS = {
     "sentence_length_invalid",
+    "sentence_profile_invalid",
     "sentence_too_hard_for_level1",
     "sentence_not_level2",
     "sentence_too_easy_for_level3",
+}
+
+DEFAULT_HARD_VALIDATION_ERRORS = {
+    "function_word",
+    "focus_not_in_lexicon",
+    "definition_missing",
+    "definition_missing_pos",
+    "definition_nonsemantic",
+    "definition_wrong_language",
+    "translation_missing",
+    "translation_same_as_source",
+    "translation_wrong_language",
+    "sentence_missing",
+    "focus_not_in_sentence",
+    "sentence_wrong_language",
+    "invalid_focus_characters",
+    "invalid_sentence_characters",
+    "duplicate_focus",
+    "duplicate_sentence",
+    "ipa_missing",
+    "invalid_ipa",
+}
+
+DEFAULT_SOFT_VALIDATION_ERRORS = {
+    "sentence_length_invalid",
+    "sentence_profile_invalid",
+    "sentence_too_hard_for_level1",
+    "sentence_not_level2",
+    "sentence_too_easy_for_level3",
+    "source_definition_wrong_language",
+    "definition_too_similar_translation",
+    "word_audio_missing",
+    "sentence_audio_missing",
 }
 
 
@@ -93,8 +134,21 @@ class BuildStats:
     validation_counter: Counter[str] = field(default_factory=Counter)
     provider_counter: Counter[str] = field(default_factory=Counter)
     event_counter: Counter[str] = field(default_factory=Counter)
+    event_counter_by_level: dict[int, Counter[str]] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
     stage_counter: Counter[str] = field(default_factory=Counter)
     stage_samples: Counter[str] = field(default_factory=Counter)
+    stage_counter_by_level: dict[int, Counter[str]] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
+    stage_samples_by_level: dict[int, Counter[str]] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
+    discard_counter: Counter[str] = field(default_factory=Counter)
+    discard_by_level: dict[int, Counter[str]] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
 
 
 @dataclass
@@ -136,17 +190,30 @@ class DeckBuilder:
     def __init__(self, config_path: str) -> None:
         self.config_path = config_path
         self.config = load_config(config_path)
+        self.definition_policy = self._load_definition_policy()
+        definitions_cfg = self.config.setdefault("definitions", {})
+        if isinstance(definitions_cfg, dict):
+            definitions_cfg["_resolved_policy"] = self.definition_policy
+        set_default_definition_policy(self.definition_policy)
         self._text_provider_local = threading.local()
         self._audio_provider_local = threading.local()
+        self._last_run_log_path: str | None = None
 
     def preflight(self, run: RunConfig) -> tuple[bool, str]:
-        providers = ProviderManager(self.config, run.timeout_sec, run.retries)
+        providers = ProviderManager(
+            self.config,
+            run.timeout_sec,
+            run.retries,
+            timeout_overrides=run.provider_timeout_overrides,
+            retry_overrides=run.provider_retry_overrides,
+        )
         return providers.validate_ai_ready()
 
     def build(self, run: RunConfig) -> tuple[list[CardData], list[str]]:
         cache_manager = CacheManager(run.cache_path, run.language, run.autosave_every)
         progress_store = ProgressStore("ankideck_generator/data/progress")
         log_path = f"ankideck_generator/data/logs/run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.jsonl"
+        self._last_run_log_path = log_path
         logger = JsonLogger(log_path)
         ctx = ValidationContext()
 
@@ -222,8 +289,13 @@ class DeckBuilder:
             stats.validation_counter,
             stats.provider_counter,
             stats.event_counter,
+            stats.event_counter_by_level,
             stats.stage_counter,
             stats.stage_samples,
+            stats.stage_counter_by_level,
+            stats.stage_samples_by_level,
+            stats.discard_counter,
+            stats.discard_by_level,
         )
         return stats.cards, stats.media_files
 
@@ -244,19 +316,36 @@ class DeckBuilder:
         provider_manager = self._make_provider_manager(run)
         accepted_in_level = 0
         level_target = run.level_size
+        level_deadline = (
+            time.time() + float(run.max_minutes_per_level) * 60.0
+            if float(run.max_minutes_per_level or 0.0) > 0.0
+            else 0.0
+        )
         attempt_cap = int(run.max_attempts_per_level or 0)
         if attempt_cap <= 0:
             attempt_cap = len(words)
         progress = tqdm(total=level_target, desc=f"Level {level}", unit="card")
         try:
             for index, word in enumerate(words):
+                if level_deadline and time.time() >= level_deadline:
+                    progress.write(
+                        f"Level {level}: stopping by time budget ({run.max_minutes_per_level:.1f} min)"
+                    )
+                    break
+                if self._is_low_yield_level(level, run, stats):
+                    attempted = stats.attempted_by_level[level]
+                    accepted = stats.accepted_by_level[level]
+                    progress.write(
+                        f"Level {level}: stopping by low yield ({accepted}/{attempted})"
+                    )
+                    break
                 if accepted_in_level >= level_target:
                     break
                 if stats.attempted_by_level[level] >= attempt_cap:
                     break
                 if word in processed_focus:
                     continue
-                blocked_reason = cache.get("invalid_focus", word)
+                blocked_reason = cache.get("invalid_focus", self._invalid_focus_key(word, run))
                 if blocked_reason:
                     continue
                 stats.attempted_by_level[level] += 1
@@ -294,17 +383,16 @@ class DeckBuilder:
                     stats.accepted_by_level[level] += 1
                     progress.update(1)
 
-                if stats.processed % run.autosave_every == 0:
-                    cache.save_all()
-                    self._save_progress(
-                        progress_store,
-                        run,
-                        level=level,
-                        index=index,
-                        processed_focus=processed_focus,
-                        processed_sentences=processed_sentences,
-                        next_sort_index=stats.next_sort_index,
-                    )
+                self._maybe_checkpoint(
+                    stats=stats,
+                    run=run,
+                    cache=cache,
+                    progress_store=progress_store,
+                    level=level,
+                    index=index,
+                    processed_focus=processed_focus,
+                    processed_sentences=processed_sentences,
+                )
         finally:
             progress.close()
 
@@ -323,6 +411,11 @@ class DeckBuilder:
         progress_store: ProgressStore,
     ) -> None:
         level_target = run.level_size
+        level_deadline = (
+            time.time() + float(run.max_minutes_per_level) * 60.0
+            if float(run.max_minutes_per_level or 0.0) > 0.0
+            else 0.0
+        )
         attempt_cap = int(run.max_attempts_per_level or 0)
         if attempt_cap <= 0:
             attempt_cap = len(words)
@@ -344,6 +437,18 @@ class DeckBuilder:
         with ThreadPoolExecutor(max_workers=text_workers) as text_executor, ThreadPoolExecutor(max_workers=audio_workers) as audio_executor:
             try:
                 while True:
+                    if level_deadline and time.time() >= level_deadline:
+                        progress.write(
+                            f"Level {level}: stopping by time budget ({run.max_minutes_per_level:.1f} min)"
+                        )
+                        break
+                    if self._is_low_yield_level(level, run, stats):
+                        attempted = stats.attempted_by_level[level]
+                        accepted = stats.accepted_by_level[level]
+                        progress.write(
+                            f"Level {level}: stopping by low yield ({accepted}/{attempted})"
+                        )
+                        break
                     pending_text_attempts = len(text_futures) + len(ready_text)
                     while (
                         word_cursor < len(words)
@@ -356,7 +461,9 @@ class DeckBuilder:
                         word_cursor += 1
                         if word in processed_focus:
                             continue
-                        blocked_reason = cache.get("invalid_focus", word)
+                        blocked_reason = cache.get(
+                            "invalid_focus", self._invalid_focus_key(word, run)
+                        )
                         if blocked_reason:
                             continue
                         future = text_executor.submit(
@@ -384,22 +491,21 @@ class DeckBuilder:
                     ):
                         break
 
-                    if text_futures:
+                    if not ready_text and not ready_audio and (text_futures or audio_futures):
                         done, _ = wait(
-                            list(text_futures.keys()),
-                            timeout=0.05,
+                            list(text_futures.keys()) + list(audio_futures.keys()),
+                            timeout=0.2,
                             return_when=FIRST_COMPLETED,
                         )
                         for future in done:
+                            if future in text_futures:
+                                ready_text[text_futures.pop(future)] = future.result()
+                            elif future in audio_futures:
+                                ready_audio[audio_futures.pop(future)] = future.result()
+                    else:
+                        for future in [f for f in list(text_futures.keys()) if f.done()]:
                             ready_text[text_futures.pop(future)] = future.result()
-
-                    if audio_futures:
-                        done, _ = wait(
-                            list(audio_futures.keys()),
-                            timeout=0.05,
-                            return_when=FIRST_COMPLETED,
-                        )
-                        for future in done:
+                        for future in [f for f in list(audio_futures.keys()) if f.done()]:
                             ready_audio[audio_futures.pop(future)] = future.result()
 
                     progressed = False
@@ -414,17 +520,16 @@ class DeckBuilder:
                         log_record = text_result.log_record
                         if not card:
                             self._record_log(logger, stats, log_record)
-                            if stats.processed % run.autosave_every == 0:
-                                cache.save_all()
-                                self._save_progress(
-                                    progress_store,
-                                    run,
-                                    level=level,
-                                    index=next_consume,
-                                    processed_focus=processed_focus,
-                                    processed_sentences=processed_sentences,
-                                    next_sort_index=stats.next_sort_index,
-                                )
+                            self._maybe_checkpoint(
+                                stats=stats,
+                                run=run,
+                                cache=cache,
+                                progress_store=progress_store,
+                                level=level,
+                                index=next_consume,
+                                processed_focus=processed_focus,
+                                processed_sentences=processed_sentences,
+                            )
                             continue
 
                         text_errors = unique_keep_order(
@@ -444,17 +549,16 @@ class DeckBuilder:
                                 text_errors, log_record.provider_errors
                             )
                             self._record_log(logger, stats, log_record)
-                            if stats.processed % run.autosave_every == 0:
-                                cache.save_all()
-                                self._save_progress(
-                                    progress_store,
-                                    run,
-                                    level=level,
-                                    index=next_consume,
-                                    processed_focus=processed_focus,
-                                    processed_sentences=processed_sentences,
-                                    next_sort_index=stats.next_sort_index,
-                                )
+                            self._maybe_checkpoint(
+                                stats=stats,
+                                run=run,
+                                cache=cache,
+                                progress_store=progress_store,
+                                level=level,
+                                index=next_consume,
+                                processed_focus=processed_focus,
+                                processed_sentences=processed_sentences,
+                            )
                             continue
 
                         log_record.validations = text_errors
@@ -490,17 +594,16 @@ class DeckBuilder:
                                 final_errors, log_record.provider_errors
                             )
                             self._record_log(logger, stats, log_record)
-                            if stats.processed % run.autosave_every == 0:
-                                cache.save_all()
-                                self._save_progress(
-                                    progress_store,
-                                    run,
-                                    level=level,
-                                    index=next_consume,
-                                    processed_focus=processed_focus,
-                                    processed_sentences=processed_sentences,
-                                    next_sort_index=stats.next_sort_index,
-                                )
+                            self._maybe_checkpoint(
+                                stats=stats,
+                                run=run,
+                                cache=cache,
+                                progress_store=progress_store,
+                                level=level,
+                                index=next_consume,
+                                processed_focus=processed_focus,
+                                processed_sentences=processed_sentences,
+                            )
                             continue
 
                         for path in audio_result.media_files:
@@ -520,17 +623,16 @@ class DeckBuilder:
                         log_record.validations = final_errors if final_errors else []
                         self._record_log(logger, stats, log_record)
                         progress.update(1)
-                        if stats.processed % run.autosave_every == 0:
-                            cache.save_all()
-                            self._save_progress(
-                                progress_store,
-                                run,
-                                level=level,
-                                index=next_consume,
-                                processed_focus=processed_focus,
-                                processed_sentences=processed_sentences,
-                                next_sort_index=stats.next_sort_index,
-                            )
+                        self._maybe_checkpoint(
+                            stats=stats,
+                            run=run,
+                            cache=cache,
+                            progress_store=progress_store,
+                            level=level,
+                            index=next_consume,
+                            processed_focus=processed_focus,
+                            processed_sentences=processed_sentences,
+                        )
                         if stats.accepted_by_level[level] >= level_target:
                             break
 
@@ -545,16 +647,52 @@ class DeckBuilder:
 
     def _record_log(self, logger: JsonLogger, stats: BuildStats, log_record: LogRecord) -> None:
         logger.log(log_record.model_dump())
+        level = int(log_record.level or 0)
         for field_name, provider_name in log_record.providers.items():
             stats.provider_counter[f"{field_name}:{provider_name}"] += 1
         for event_name, count in (log_record.event_counts or {}).items():
             stats.event_counter[event_name] += int(count or 0)
+            stats.event_counter_by_level[level][event_name] += int(count or 0)
         for validation_error in log_record.validations:
             stats.validation_counter[validation_error] += 1
+        if log_record.discard_reason:
+            stats.discard_counter[log_record.discard_reason] += 1
+            stats.discard_by_level[level][log_record.discard_reason] += 1
         for stage_name, elapsed_ms in (log_record.stage_timings or {}).items():
             stats.stage_counter[stage_name] += int(elapsed_ms or 0)
             stats.stage_samples[stage_name] += 1
+            stats.stage_counter_by_level[level][stage_name] += int(elapsed_ms or 0)
+            stats.stage_samples_by_level[level][stage_name] += 1
         stats.processed += 1
+
+    def _maybe_checkpoint(
+        self,
+        *,
+        stats: BuildStats,
+        run: RunConfig,
+        cache: CacheManager,
+        progress_store: ProgressStore,
+        level: int,
+        index: int,
+        processed_focus: set[str],
+        processed_sentences: set[str],
+    ) -> None:
+        if run.autosave_every <= 0:
+            return
+        if stats.processed <= 0:
+            return
+        if stats.processed % run.autosave_every != 0:
+            return
+        cache.save_all()
+        self._save_progress(
+            progress_store,
+            run,
+            level=level,
+            index=index,
+            processed_focus=processed_focus,
+            processed_sentences=processed_sentences,
+            next_sort_index=stats.next_sort_index,
+        )
 
     def _save_progress(
         self,
@@ -581,7 +719,13 @@ class DeckBuilder:
         )
 
     def _make_provider_manager(self, run: RunConfig) -> ProviderManager:
-        return ProviderManager(self.config, run.timeout_sec, run.retries)
+        return ProviderManager(
+            self.config,
+            run.timeout_sec,
+            run.retries,
+            timeout_overrides=run.provider_timeout_overrides,
+            retry_overrides=run.provider_retry_overrides,
+        )
 
     def _thread_provider_manager(
         self,
@@ -590,7 +734,12 @@ class DeckBuilder:
         kind: str,
     ) -> ProviderManager:
         local = self._text_provider_local if kind == "text" else self._audio_provider_local
-        signature = (int(run.timeout_sec), int(run.retries))
+        signature = (
+            int(run.timeout_sec),
+            int(run.retries),
+            tuple(sorted((run.provider_timeout_overrides or {}).items())),
+            tuple(sorted((run.provider_retry_overrides or {}).items())),
+        )
         provider = getattr(local, "provider", None)
         cached_signature = getattr(local, "signature", None)
         if provider is None or cached_signature != signature:
@@ -646,9 +795,6 @@ class DeckBuilder:
         ensure_dir(Path(run.output_path).parent)
         package.write_to_file(run.output_path)
 
-        if cleanup_audio:
-            self._cleanup_audio_files(media_files, cleanup_dir)
-
         metadata = {
             "generated_at": datetime.utcnow().isoformat(),
             "language": run.language,
@@ -657,6 +803,12 @@ class DeckBuilder:
             "output": run.output_path,
         }
         atomic_write_json("output/metadata.json", metadata)
+        self._cleanup_run_artifacts(
+            run,
+            cleanup_audio=cleanup_audio,
+            audio_dir=cleanup_dir,
+            media_files=media_files,
+        )
 
     def _prepare_levels(
         self,
@@ -705,6 +857,35 @@ class DeckBuilder:
         field_order = ANKI_FIELD_ORDER_DEFAULT
         return deck_cfg, field_order
 
+    def _lexicon_zipf_fallback_ok(self, word: str, run: RunConfig) -> bool:
+        threshold = max(0.0, float(run.lexicon_zipf_fallback_min or 0.0))
+        if threshold <= 0.0:
+            return False
+        try:
+            score = float(zipf_frequency(word, run.wordfreq_language or run.language))
+        except Exception:
+            return False
+        return score >= threshold
+
+    def _invalid_focus_key(self, word: str, run: RunConfig) -> str:
+        return f"{word.lower()}::v{int(run.cache_validation_version or 0)}"
+
+    def _is_low_yield_level(self, level: int, run: RunConfig, stats: BuildStats) -> bool:
+        if int(run.low_yield_start_level or 1) > level:
+            return False
+        min_attempts = max(0, int(run.low_yield_min_attempts or 0))
+        min_rate = max(0.0, float(run.low_yield_min_acceptance_rate or 0.0))
+        if min_attempts <= 0 or min_rate <= 0.0:
+            return False
+        attempted = int(stats.attempted_by_level.get(level, 0))
+        if attempted < min_attempts:
+            return False
+        accepted = int(stats.accepted_by_level.get(level, 0))
+        max_accepted = max(0, int(run.low_yield_max_accepted or 0))
+        if max_accepted > 0 and accepted > max_accepted:
+            return False
+        return (accepted / attempted) < min_rate
+
     def _resolve_path(self, value: str | None) -> Path:
         if not value:
             raise ValueError("Missing template path in config")
@@ -712,6 +893,20 @@ class DeckBuilder:
         if path.is_absolute():
             return path
         return Path(self.config_path).resolve().parent / path
+
+    def _load_definition_policy(self) -> dict[str, object]:
+        definitions_cfg = (
+            self.config.get("definitions", {}) if isinstance(self.config, dict) else {}
+        )
+        definitions_cfg = definitions_cfg if isinstance(definitions_cfg, dict) else {}
+        policy_path = definitions_cfg.get("policy_path")
+        if not policy_path:
+            return build_definition_policy()
+        try:
+            raw_policy = load_config(self._resolve_path(str(policy_path)))
+        except FileNotFoundError:
+            raw_policy = {}
+        return build_definition_policy(raw_policy if isinstance(raw_policy, dict) else {})
 
     def _process_word(
         self,
@@ -932,12 +1127,13 @@ class DeckBuilder:
                 pos_mode="auto",
                 min_words=2,
                 max_words=12,
+                policy=self.definition_policy,
             )
 
         def definition_issue(text: str, expected_language: str) -> str | None:
             if not text:
                 return "definition_missing"
-            if not definition_has_pos(text):
+            if not definition_has_pos(text, policy=self.definition_policy):
                 return "definition_missing_pos"
             if strict_quality and not text_matches_language(
                 text, expected_language, min_score=0.25, min_tokens=3
@@ -1093,7 +1289,7 @@ class DeckBuilder:
                 min_words=sentence_min_words,
                 max_words=sentence_max_words,
             )
-            trace_result("sentence", result, stage_key="sentence_ms")
+            trace_result("sentence", result, stage_key="sentence_web_ms")
             web_text, web_errors, web_core_errors, web_level_errors = analyze_sentence(
                 result.value or ""
             )
@@ -1129,7 +1325,7 @@ class DeckBuilder:
                     "sentence_rewrite",
                     result,
                     ai_field="sentence",
-                    stage_key="sentence_ms",
+                    stage_key="sentence_rewrite_ms",
                 )
                 rewritten_text, rewritten_errors, _rewrite_core, _rewrite_level = (
                     analyze_sentence(result.value or "")
@@ -1145,7 +1341,12 @@ class DeckBuilder:
                 )
 
             sentence_attempts = 0
-            while sentence_attempts < 2 and allow_ai("sentence") and not sentence:
+            max_sentence_ai_attempts = max(0, int(run.sentence_ai_attempts or 0))
+            while (
+                sentence_attempts < max_sentence_ai_attempts
+                and allow_ai("sentence")
+                and not sentence
+            ):
                 count_event("sentence_ai_generate_attempted")
                 result = providers.sentence_ai(
                     word,
@@ -1157,7 +1358,7 @@ class DeckBuilder:
                     "sentence",
                     result,
                     ai_field="sentence",
-                    stage_key="sentence_ms",
+                    stage_key="sentence_ai_ms",
                 )
                 generated_text, generated_errors, _gen_core, _gen_level = analyze_sentence(
                     result.value or ""
@@ -1171,27 +1372,64 @@ class DeckBuilder:
                 last_sentence_issue = (
                     generated_errors[0] if generated_errors else last_sentence_issue
                 )
+                error_text = (result.error or "").lower()
+                if error_text and any(
+                    token in error_text
+                    for token in (
+                        "provider_disabled",
+                        "http 401",
+                        "http 403",
+                        "http 429",
+                        "missing api_key",
+                    )
+                ):
+                    break
                 sentence_attempts += 1
+            if not sentence and run.sentence_template_fallback:
+                templated = _sentence_template_fallback(word, run.language, level)
+                if templated:
+                    templated_text, templated_errors, _templ_core, _templ_level = (
+                        analyze_sentence(templated)
+                    )
+                    if not templated_errors:
+                        sentence = templated_text
+                        last_sentence_issue = None
+                        count_event("sentence_template_fallback_hit")
+                        cache.set("sentences", sentence_cache_key, sentence)
             return sentence
 
         if run.exclude_closed_class_words and is_closed_class_word(word, run.language):
-            cache.set("invalid_focus", word, "function_word")
+            cache.set(
+                "invalid_focus",
+                self._invalid_focus_key(word, run),
+                "function_word",
+            )
             remember_quality_error("function_word")
             return discard_log(quality_errors)
 
         if strict_quality:
-            word_exists = getattr(providers, "word_exists", None)
-            if callable(word_exists):
-                result = word_exists(word, run.language)
-                trace_result("focus_lexicon", result, stage_key="lexicon_ms")
-                lexicon_missing = not result.value and (result.error or "") in {
-                    "",
-                    "empty result",
-                }
-                if lexicon_missing:
-                    cache.set("invalid_focus", word, "focus_not_in_lexicon")
-                    remember_quality_error("focus_not_in_lexicon")
-                    return discard_log(quality_errors)
+            if self._lexicon_zipf_fallback_ok(word, run):
+                count_event("focus_lexicon_zipf_precheck_hit")
+            else:
+                word_exists = getattr(providers, "word_exists", None)
+                if callable(word_exists):
+                    result = word_exists(word, run.language)
+                    trace_result("focus_lexicon", result, stage_key="lexicon_ms")
+                    lexicon_missing = not result.value and (result.error or "") in {
+                        "",
+                        "empty result",
+                    }
+                    if lexicon_missing:
+                        if self._lexicon_zipf_fallback_ok(word, run):
+                            count_event("focus_lexicon_zipf_fallback_hit")
+                        else:
+                            cache.set(
+                                "invalid_focus",
+                                self._invalid_focus_key(word, run),
+                                "focus_not_in_lexicon",
+                            )
+                            remember_quality_error("focus_not_in_lexicon")
+                            return discard_log(quality_errors)
 
         definition_lang = "en"
         definition_key = f"{normalized_word}::{definition_lang}::v{cache_version}"
@@ -1201,6 +1439,17 @@ class DeckBuilder:
         definition = ""
         source_definition_issue: str | None = None
         final_definition_issue: str | None = None
+
+        def classify_definition_candidate(
+            candidate: str,
+        ) -> tuple[str | None, str, str | None]:
+            source_value, source_issue = finalize_definition(candidate, run.language)
+            if source_value:
+                return "source", source_value, None
+            direct_definition, direct_issue = finalize_definition(candidate, "en")
+            if direct_definition:
+                return "definition", direct_definition, None
+            return None, "", source_issue or direct_issue
 
         if run.language == "en":
             cached_definition = cache.get("definitions", definition_key) or ""
@@ -1218,12 +1467,17 @@ class DeckBuilder:
                     "definition",
                     result,
                     ai_field="definition",
-                    stage_key="definition_ms",
+                    stage_key="definition_source_ms",
                 )
                 definition, final_definition_issue = finalize_definition(
                     result.value or "", "en"
                 )
-                if not definition and allow_ai("definition") and run.mode == "full":
+                if (
+                    not definition
+                    and allow_ai("definition")
+                    and run.mode == "full"
+                    and run.definition_context_fallback
+                ):
                     context_sentence = build_sentence()
                     if context_sentence:
                         result = request_definition_from_context("en", context_sentence)
@@ -1233,7 +1487,7 @@ class DeckBuilder:
                         "definition",
                         result,
                         ai_field="definition",
-                        stage_key="definition_ms",
+                        stage_key="definition_context_ms",
                     )
                     definition, final_definition_issue = finalize_definition(
                         result.value or "", "en"
@@ -1243,11 +1497,21 @@ class DeckBuilder:
             definition, final_definition_issue = finalize_definition(
                 cached_definition, "en"
             )
-            cached_source = cache.get("definitions", source_key) or ""
-            source_definition, source_definition_issue = finalize_definition(
-                cached_source, run.language
-            )
-            if not source_definition:
+            if not definition:
+                cached_source = cache.get("definitions", source_key) or ""
+                source_kind, source_value, source_issue = classify_definition_candidate(
+                    cached_source
+                )
+                if source_kind == "source":
+                    source_definition = source_value
+                    source_definition_issue = None
+                elif source_kind == "definition":
+                    definition = source_value
+                    final_definition_issue = None
+                else:
+                    source_definition_issue = source_issue
+
+            if not definition and not source_definition:
                 result = providers.definition(
                     word,
                     run.language,
@@ -1258,12 +1522,26 @@ class DeckBuilder:
                     "definition_source",
                     result,
                     ai_field="definition",
-                    stage_key="definition_ms",
+                    stage_key="definition_source_ms",
                 )
-                source_definition, source_definition_issue = finalize_definition(
-                    result.value or "", run.language
+                source_kind, source_value, source_issue = classify_definition_candidate(
+                    result.value or ""
                 )
-                if not source_definition and allow_ai("definition") and run.mode == "full":
+                if source_kind == "source":
+                    source_definition = source_value
+                    source_definition_issue = None
+                elif source_kind == "definition":
+                    definition = source_value
+                    final_definition_issue = None
+                else:
+                    source_definition_issue = source_issue
+                if (
+                    not definition
+                    and not source_definition
+                    and allow_ai("definition")
+                    and run.mode == "full"
+                    and run.definition_context_fallback
+                ):
                     context_sentence = build_sentence()
                     if context_sentence:
                         result = request_definition_from_context(
@@ -1275,56 +1553,59 @@ class DeckBuilder:
                         "definition_source",
                         result,
                         ai_field="definition",
-                        stage_key="definition_ms",
+                        stage_key="definition_context_ms",
                     )
-                    source_definition, source_definition_issue = finalize_definition(
-                        result.value or "", run.language
+                    source_kind, source_value, source_issue = classify_definition_candidate(
+                        result.value or ""
                     )
+                    if source_kind == "source":
+                        source_definition = source_value
+                        source_definition_issue = None
+                    elif source_kind == "definition":
+                        definition = source_value
+                        final_definition_issue = None
+                    else:
+                        source_definition_issue = source_issue
 
             if source_definition:
                 cache.set("definitions", source_key, source_definition)
-                cached_definition = cache.get("definitions", definition_key) or ""
+            if not definition and source_definition:
+                result = providers.translation_web(source_definition, run.language, "en")
+                trace_result("definition", result, stage_key="definition_translate_ms")
                 definition, final_definition_issue = finalize_definition(
-                    cached_definition, "en"
+                    result.value or "", "en"
                 )
-                if not definition:
-                    result = providers.translation_web(
-                        source_definition, run.language, "en"
+                if not definition and allow_ai("definition"):
+                    result = providers.translation_ai(source_definition, run.language, "en")
+                    trace_result(
+                        "definition",
+                        result,
+                        ai_field="definition",
+                        stage_key="definition_translate_ms",
                     )
-                    trace_result("definition", result, stage_key="definition_ms")
                     definition, final_definition_issue = finalize_definition(
                         result.value or "", "en"
                     )
-                    if not definition and allow_ai("definition"):
-                        result = providers.translation_ai(
-                            source_definition, run.language, "en"
-                        )
-                        trace_result(
-                            "definition",
-                            result,
-                            ai_field="definition",
-                            stage_key="definition_ms",
-                        )
-                        definition, final_definition_issue = finalize_definition(
-                            result.value or "", "en"
-                        )
-                    if not definition and allow_ai("definition") and run.mode == "full":
-                        context_sentence = build_sentence()
-                        if context_sentence:
-                            result = request_definition_from_context(
-                                "en", context_sentence
-                            )
-                        else:
-                            result = request_definition_ai("en")
-                        trace_result(
-                            "definition",
-                            result,
-                            ai_field="definition",
-                            stage_key="definition_ms",
-                        )
-                        definition, final_definition_issue = finalize_definition(
-                            result.value or "", "en"
-                        )
+                if (
+                    not definition
+                    and allow_ai("definition")
+                    and run.mode == "full"
+                    and run.definition_context_fallback
+                ):
+                    context_sentence = build_sentence()
+                    if context_sentence:
+                        result = request_definition_from_context("en", context_sentence)
+                    else:
+                        result = request_definition_ai("en")
+                    trace_result(
+                        "definition",
+                        result,
+                        ai_field="definition",
+                        stage_key="definition_context_ms",
+                    )
+                    definition, final_definition_issue = finalize_definition(
+                        result.value or "", "en"
+                    )
 
             if not definition and allow_ai("definition"):
                 result = request_definition_ai("en")
@@ -1332,11 +1613,32 @@ class DeckBuilder:
                     "definition",
                     result,
                     ai_field="definition",
-                    stage_key="definition_ms",
+                    stage_key="definition_context_ms",
                 )
                 definition, final_definition_issue = finalize_definition(
                     result.value or "", "en"
                 )
+
+        if not definition and run.definition_word_fallback:
+            fallback_translation_key = f"{normalized_word}::{run.language}->en::v{cache_version}"
+            fallback_translation = (
+                cache.get("word_translations", fallback_translation_key) or ""
+            ).strip()
+            if not fallback_translation:
+                result = providers.translation_web(word, run.language, "en")
+                trace_result("word_translation", result, stage_key="word_translation_ms")
+                fallback_translation = (result.value or "").strip()
+                if fallback_translation:
+                    cache.set(
+                        "word_translations", fallback_translation_key, fallback_translation
+                    )
+            fallback_definition = _definition_from_word_translation(fallback_translation)
+            if fallback_definition:
+                definition, final_definition_issue = finalize_definition(
+                    fallback_definition, "en"
+                )
+                if definition:
+                    count_event("definition_word_fallback_hit")
 
         if definition:
             cache.set("definitions", definition_key, definition)
@@ -1382,6 +1684,43 @@ class DeckBuilder:
                 translation, translation_issue_name = finalize_translation(
                     result.value or "", sentence
                 )
+            if not translation and run.definition_word_fallback:
+                fallback_translation = _translation_from_definition(definition)
+                if fallback_translation:
+                    translation, translation_issue_name = finalize_translation(
+                        fallback_translation,
+                        sentence,
+                    )
+                    if translation:
+                        count_event("translation_definition_fallback_hit")
+                fallback_translation_key = (
+                    f"{normalized_word}::{run.language}->en::v{cache_version}"
+                )
+                fallback_word_translation = (
+                    cache.get("word_translations", fallback_translation_key) or ""
+                ).strip()
+                if not fallback_word_translation:
+                    result = providers.translation_web(word, run.language, "en")
+                    trace_result(
+                        "word_translation",
+                        result,
+                        stage_key="word_translation_ms",
+                    )
+                    fallback_word_translation = (result.value or "").strip()
+                    if fallback_word_translation:
+                        cache.set(
+                            "word_translations",
+                            fallback_translation_key,
+                            fallback_word_translation,
+                        )
+                fallback_translation = _translation_from_word(fallback_word_translation)
+                if fallback_translation:
+                    translation, translation_issue_name = finalize_translation(
+                        fallback_translation,
+                        sentence,
+                    )
+                    if translation:
+                        count_event("translation_template_fallback_hit")
         if translation:
             cache.set("translations", translation_key, translation)
         else:
@@ -1512,8 +1851,9 @@ class DeckBuilder:
                 for name, error in fallback_errors.items():
                     if error:
                         log_record.provider_errors[f"{field}:{name}"] = str(error)
-            log_record.stage_timings["audio_ms"] = log_record.stage_timings.get(
-                "audio_ms", 0
+            stage_key = "audio_sentence_ms" if field == "sentence_audio" else "audio_word_ms"
+            log_record.stage_timings[stage_key] = log_record.stage_timings.get(
+                stage_key, 0
             ) + int(getattr(result, "elapsed_ms", 0) or 0)
 
         def add_media(path: str) -> None:
@@ -1648,9 +1988,43 @@ class DeckBuilder:
             errors.append("sentence_audio_missing")
         return errors
 
+    def _error_policy(self, run: RunConfig) -> tuple[set[str], set[str], int]:
+        runtime_cfg = self.config.get("runtime", {}) if isinstance(self.config, dict) else {}
+        policy_cfg = runtime_cfg.get("error_policy", {}) if isinstance(runtime_cfg, dict) else {}
+        mode_policy = policy_cfg.get(run.mode, {}) if isinstance(policy_cfg, dict) else {}
+
+        hard = set(DEFAULT_HARD_VALIDATION_ERRORS)
+        soft = set(DEFAULT_SOFT_VALIDATION_ERRORS)
+        max_soft_errors = 999 if run.mode == "test" else 1
+
+        if run.mode == "test" and bool(runtime_cfg.get("test_accept_all", False)):
+            soft.update(TEST_ACCEPT_ALL_SOFT_ERRORS)
+            max_soft_errors = 999
+
+        if isinstance(mode_policy, dict):
+            configured_hard = mode_policy.get("hard")
+            if isinstance(configured_hard, list) and configured_hard:
+                hard = {str(item).strip() for item in configured_hard if str(item).strip()}
+            configured_soft = mode_policy.get("soft")
+            if isinstance(configured_soft, list) and configured_soft:
+                soft = {str(item).strip() for item in configured_soft if str(item).strip()}
+            configured_max_soft = mode_policy.get("max_soft_errors")
+            if configured_max_soft is not None:
+                max_soft_errors = max(0, int(configured_max_soft))
+
+        return hard, soft, max_soft_errors
+
     def _should_reject_errors(self, errors: list[str], run: RunConfig) -> bool:
-        _ = run
-        return bool(errors)
+        if not errors:
+            return False
+        hard_errors, soft_errors, max_soft_errors = self._error_policy(run)
+        unknown_errors = [error for error in errors if error not in hard_errors and error not in soft_errors]
+        if unknown_errors:
+            return True
+        if any(error in hard_errors for error in errors):
+            return True
+        soft_count = sum(1 for error in errors if error in soft_errors)
+        return soft_count > max_soft_errors
 
     def _print_summary(
         self,
@@ -1659,8 +2033,13 @@ class DeckBuilder:
         validation_counter: Counter[str],
         provider_counter: Counter[str],
         event_counter: Counter[str],
+        event_counter_by_level: dict[int, Counter[str]],
         stage_counter: Counter[str],
         stage_samples: Counter[str],
+        stage_counter_by_level: dict[int, Counter[str]],
+        stage_samples_by_level: dict[int, Counter[str]],
+        discard_counter: Counter[str],
+        discard_by_level: dict[int, Counter[str]],
     ) -> None:
         print("\nRun summary:")
         for level in sorted(attempted_by_level.keys() | accepted_by_level.keys()):
@@ -1673,6 +2052,19 @@ class DeckBuilder:
             print("- Top validation errors:")
             for name, count in top_validations:
                 print(f"  {name}: {count}")
+        top_discards = discard_counter.most_common(6)
+        if top_discards:
+            print("- Top discard reasons:")
+            for name, count in top_discards:
+                print(f"  {name}: {count}")
+            for level in sorted(discard_by_level.keys()):
+                level_discards = discard_by_level.get(level, Counter())
+                if not level_discards:
+                    continue
+                summary = ", ".join(
+                    f"{name}={count}" for name, count in level_discards.most_common(4)
+                )
+                print(f"  level{level}: {summary}")
         sentence_event_keys = [
             "sentence_tatoeba_attempted",
             "sentence_tatoeba_hit",
@@ -1680,6 +2072,7 @@ class DeckBuilder:
             "sentence_ai_rewrite_hit",
             "sentence_ai_generate_attempted",
             "sentence_ai_generate_hit",
+            "sentence_template_fallback_hit",
         ]
         sentence_events = [
             (name, event_counter.get(name, 0))
@@ -1690,6 +2083,39 @@ class DeckBuilder:
             print("- Sentence source stats:")
             for name, count in sentence_events:
                 print(f"  {name}: {count}")
+            attempts = event_counter.get("sentence_tatoeba_attempted", 0)
+            tatoeba_hits = event_counter.get("sentence_tatoeba_hit", 0)
+            rewrite_hits = event_counter.get("sentence_ai_rewrite_hit", 0)
+            ai_hits = event_counter.get("sentence_ai_generate_hit", 0)
+            template_hits = event_counter.get("sentence_template_fallback_hit", 0)
+            total_hits = tatoeba_hits + rewrite_hits + ai_hits + template_hits
+            if attempts:
+                print(f"  tatoeba_hit_rate: {tatoeba_hits / attempts * 100.0:.1f}%")
+            if total_hits:
+                print(
+                    "  source_mix: "
+                    f"tatoeba={tatoeba_hits / total_hits * 100.0:.1f}%, "
+                    f"rewrite={rewrite_hits / total_hits * 100.0:.1f}%, "
+                    f"ai={ai_hits / total_hits * 100.0:.1f}%, "
+                    f"template={template_hits / total_hits * 100.0:.1f}%"
+                )
+            for level in sorted(event_counter_by_level.keys()):
+                level_events = event_counter_by_level.get(level, Counter())
+                level_total_hits = (
+                    level_events.get("sentence_tatoeba_hit", 0)
+                    + level_events.get("sentence_ai_rewrite_hit", 0)
+                    + level_events.get("sentence_ai_generate_hit", 0)
+                    + level_events.get("sentence_template_fallback_hit", 0)
+                )
+                if not level_total_hits:
+                    continue
+                print(
+                    f"  level{level}_source_mix: "
+                    f"tatoeba={level_events.get('sentence_tatoeba_hit', 0) / level_total_hits * 100.0:.1f}%, "
+                    f"rewrite={level_events.get('sentence_ai_rewrite_hit', 0) / level_total_hits * 100.0:.1f}%, "
+                    f"ai={level_events.get('sentence_ai_generate_hit', 0) / level_total_hits * 100.0:.1f}%, "
+                    f"template={level_events.get('sentence_template_fallback_hit', 0) / level_total_hits * 100.0:.1f}%"
+                )
         top_providers = provider_counter.most_common(8)
         if top_providers:
             print("- Provider hit-rate:")
@@ -1697,10 +2123,17 @@ class DeckBuilder:
                 print(f"  {name}: {count}")
         ordered_stage_keys = [
             "lexicon_ms",
-            "sentence_ms",
-            "definition_ms",
+            "sentence_web_ms",
+            "sentence_rewrite_ms",
+            "sentence_ai_ms",
+            "definition_source_ms",
+            "definition_translate_ms",
+            "definition_context_ms",
+            "word_translation_ms",
             "translation_ms",
-            "audio_ms",
+            "ipa_ms",
+            "audio_word_ms",
+            "audio_sentence_ms",
         ]
         available_stage_keys = [key for key in ordered_stage_keys if stage_samples.get(key)]
         if available_stage_keys:
@@ -1710,6 +2143,20 @@ class DeckBuilder:
                 samples = stage_samples.get(key, 0)
                 avg_ms = (total_ms / samples) if samples else 0.0
                 print(f"  {key}: total {total_ms} ms, avg {avg_ms:.1f} ms")
+            for level in sorted(stage_samples_by_level.keys()):
+                level_samples = stage_samples_by_level.get(level, Counter())
+                level_totals = stage_counter_by_level.get(level, Counter())
+                if not level_samples:
+                    continue
+                for key in available_stage_keys:
+                    samples = level_samples.get(key, 0)
+                    if not samples:
+                        continue
+                    total_ms = level_totals.get(key, 0)
+                    avg_ms = total_ms / samples
+                    print(
+                        f"  level{level}_{key}: total {total_ms} ms, avg {avg_ms:.1f} ms"
+                    )
 
     def _interactive_edit(self, card: CardData) -> CardData:
         print("\n--- Review Card ---")
@@ -1731,35 +2178,61 @@ class DeckBuilder:
                 else:
                     print("Unknown field")
 
+    def _cleanup_run_artifacts(
+        self,
+        run: RunConfig,
+        *,
+        cleanup_audio: bool,
+        audio_dir: str | Path,
+        media_files: list[str],
+    ) -> None:
+        runtime_cfg = self.config.get("runtime", {}) if isinstance(self.config, dict) else {}
+        if not bool(runtime_cfg.get("cleanup_generated_artifacts", False)):
+            return
+        if cleanup_audio:
+            self._cleanup_audio_files(media_files, audio_dir)
+        self._cleanup_generated_directory(run.cache_path)
+        self._cleanup_generated_directory("ankideck_generator/data/progress")
+        if self._last_run_log_path:
+            self._cleanup_generated_directory(Path(self._last_run_log_path).parent)
+            self._last_run_log_path = None
+
+    def _cleanup_generated_directory(self, target: str | Path) -> None:
+        path = Path(target)
+        if not path.exists():
+            return
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return
+        if not self._is_safe_cleanup_target(resolved):
+            return
+        shutil.rmtree(resolved, ignore_errors=True)
+
+    def _is_safe_cleanup_target(self, path: Path) -> bool:
+        allowed_roots: list[Path] = []
+        for candidate in (Path.cwd(), Path(self.config_path).resolve().parent):
+            try:
+                resolved_root = candidate.resolve()
+            except OSError:
+                continue
+            if resolved_root not in allowed_roots:
+                allowed_roots.append(resolved_root)
+        for root in allowed_roots:
+            if path == root:
+                return False
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            return True
+        return False
+
     def _cleanup_audio_files(
         self, media_files: list[str], audio_dir: str | Path
     ) -> None:
-        base_dir = Path(audio_dir).resolve()
-        removed = set()
-        for path_str in media_files:
-            path = Path(path_str)
-            try:
-                resolved = path.resolve()
-            except OSError:
-                continue
-            if base_dir not in resolved.parents and resolved != base_dir:
-                continue
-            if resolved.suffix.lower() not in {".mp3", ".wav", ".ogg", ".opus"}:
-                continue
-            if resolved in removed:
-                continue
-            try:
-                resolved.unlink()
-                removed.add(resolved)
-            except OSError:
-                continue
-        # Remove empty directories under the audio dir
-        for folder in sorted(base_dir.rglob("*"), reverse=True):
-            if folder.is_dir():
-                try:
-                    folder.rmdir()
-                except OSError:
-                    continue
+        _ = media_files
+        self._cleanup_generated_directory(audio_dir)
 
 
 def _normalize_ipa(value: str) -> str:
@@ -1792,6 +2265,58 @@ def _sanitize_phonetic(value: str) -> str:
     return text
 
 
+def _sentence_template_fallback(word: str, language: str, level: int) -> str | None:
+    normalized_language = (language or "").strip().lower()
+    if normalized_language != "ru":
+        return None
+    templates = {
+        1: "\u042d\u0442\u043e \u0441\u043b\u043e\u0432\u043e {focus}.",
+        2: "\u042f \u0447\u0430\u0441\u0442\u043e \u0432\u0438\u0436\u0443 \u0441\u043b\u043e\u0432\u043e {focus} \u0434\u043e\u043c\u0430.",
+        3: "\u0412 \u044d\u0442\u043e\u043c \u043f\u0440\u0438\u043c\u0435\u0440\u0435 \u044f \u0435\u0441\u0442\u0435\u0441\u0442\u0432\u0435\u043d\u043d\u043e \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e \u0441\u043b\u043e\u0432\u043e {focus} \u0432 \u043a\u043e\u043d\u0442\u0435\u043a\u0441\u0442\u0435.",
+    }
+    template = templates.get(int(level or 1), templates[1])
+    return template.format(focus=word)
+
+
+def _definition_from_word_translation(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (value or "").strip())
+    cleaned = re.sub(r"[^A-Za-z0-9\s'\-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    tokens = cleaned.split()
+    phrase = " ".join(tokens[:8]).strip()
+    if not phrase:
+        return ""
+    return f"noun: common concept related to {phrase}"
+
+
+def _translation_from_word(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (value or "").strip())
+    cleaned = re.sub(r"[^A-Za-z0-9\s'\-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    tokens = cleaned.split()
+    phrase = " ".join(tokens[:8]).strip()
+    if not phrase:
+        return ""
+    return f"This sentence uses the word {phrase}."
+
+
+def _translation_from_definition(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    cleaned = re.sub(r"^[A-Za-z\s]+:\s*", "", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"[^A-Za-z0-9\s'\-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    return f"This sentence uses a word that means {cleaned}."
+
+
 def _normalize_provider_order(value: object) -> list[str]:
     if not value:
         return []
@@ -1816,9 +2341,21 @@ def _sound_tag(path: str) -> str:
 def _infer_discard_reason(
     errors: list[str], provider_errors: dict[str, str]
 ) -> str | None:
-    if "focus_not_in_lexicon" in errors:
+    error_set = set(errors)
+    if "focus_not_in_lexicon" in error_set:
         return "focus_not_in_lexicon"
-    sentence_related = {
+    if "function_word" in error_set:
+        return "function_word"
+    if "definition_missing" in error_set:
+        return "definition_generation_failed"
+    if "definition_missing_pos" in error_set:
+        return "definition_missing_pos"
+    if "definition_nonsemantic" in error_set:
+        return "definition_nonsemantic"
+    if "definition_wrong_language" in error_set or "source_definition_wrong_language" in error_set:
+        return "definition_wrong_language"
+    if {
+        "sentence_missing",
         "focus_not_in_sentence",
         "example_word_not_in_sentence",
         "sentence_length_invalid",
@@ -1827,35 +2364,29 @@ def _infer_discard_reason(
         "sentence_too_hard_for_level1",
         "sentence_not_level2",
         "sentence_too_easy_for_level3",
-    }
-    if "sentence" in provider_errors or sentence_related.intersection(errors):
+    }.intersection(error_set):
         return "sentence_generation_failed"
-    if (
-        "definition_wrong_language" in errors
-        or "source_definition_wrong_language" in errors
-    ):
-        return "definition_wrong_language"
-    if "definition_missing_pos" in errors:
-        return "definition_missing_pos"
-    if "definition_nonsemantic" in errors:
-        return "definition_nonsemantic"
-    if (
-        "translation" in provider_errors
-        or "word_translation" in provider_errors
-        or "translation_missing" in errors
-        or "translation_wrong_language" in errors
-        or "translation_same_as_source" in errors
-    ):
+    if {
+        "translation_missing",
+        "translation_wrong_language",
+        "translation_same_as_source",
+    }.intersection(error_set):
         return "translation_generation_failed"
-    if "definition" in provider_errors or "definition_missing" in errors:
-        return "definition_generation_failed"
-    if "ipa" in provider_errors or "ipa_missing" in errors:
+    if {"ipa_missing", "invalid_ipa"}.intersection(error_set):
         return "ipa_generation_failed"
-    if (
-        "letter_audio" in provider_errors
-        or "word_audio" in provider_errors
-        or "sentence_audio" in provider_errors
+    if {"letter_audio_missing", "word_audio_missing", "sentence_audio_missing"}.intersection(
+        error_set
     ):
+        return "audio_generation_failed"
+    if "definition" in provider_errors or "definition_source" in provider_errors:
+        return "definition_generation_failed"
+    if "sentence" in provider_errors or "sentence_rewrite" in provider_errors:
+        return "sentence_generation_failed"
+    if "translation" in provider_errors or "word_translation" in provider_errors:
+        return "translation_generation_failed"
+    if "ipa" in provider_errors:
+        return "ipa_generation_failed"
+    if "letter_audio" in provider_errors or "word_audio" in provider_errors or "sentence_audio" in provider_errors:
         return "audio_generation_failed"
     return None
 

@@ -188,6 +188,24 @@ def tokenize(text: str) -> list[str]:
     return WORD_RE.findall(text.lower())
 
 
+def _normalize_focus_token(value: str) -> str:
+    return str(value or "").strip().lower().replace("’", "'")
+
+
+def text_contains_focus(text: str, focus: str) -> bool:
+    focus_tokens = [_normalize_focus_token(token) for token in tokenize(focus)]
+    sentence_tokens = [_normalize_focus_token(token) for token in tokenize(text)]
+    if not focus_tokens or not sentence_tokens:
+        return False
+    if len(focus_tokens) == 1:
+        return focus_tokens[0] in sentence_tokens
+    window = len(focus_tokens)
+    for index in range(0, len(sentence_tokens) - window + 1):
+        if sentence_tokens[index : index + window] == focus_tokens:
+            return True
+    return False
+
+
 def valid_focus_characters(text: str) -> bool:
     for char in text:
         if char.isalpha() or char in {"-", "'", "’"}:
@@ -216,7 +234,7 @@ def sentence_is_acceptable(sentence: str, focus: str, min_len: int, max_len: int
     word_count = len(sentence.split())
     if not (min_len <= word_count <= max_len):
         return False
-    if focus.lower() not in sentence.lower():
+    if not text_contains_focus(sentence, focus):
         return False
     return True
 
@@ -282,7 +300,7 @@ def score_sentence(
     word_count = len(tokens)
     if word_count < min_words or word_count > max_words:
         return 0.0
-    if focus.lower() not in sentence.lower():
+    if not text_contains_focus(sentence, focus):
         return 0.0
     score = 1.0
     score += 1.0 - abs(12 - word_count) / 12

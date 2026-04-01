@@ -53,6 +53,7 @@ providers:
       fr: "fr-FR-Remy:DragonHDLatestNeural"
       it: "it-IT-GiuseppeMultilingualNeural"
       de: "de-DE-ConradNeural"
+      ru: "ru-RU-DmitryNeural"
   elevenlabs:
     api_key_env: "ELEVENLABS_API_KEY"
     voice_id: ""
@@ -85,12 +86,21 @@ providers:
 
   tatoeba:
     endpoint: "https://tatoeba.org/eng/api_v0/search"
+    exact_match: true
+    native_only: true
+    exclude_orphans: true
+    exclude_unapproved: true
+    max_pages: 3
+    page_size: 20
   wordincontext:
     endpoint: "https://api.wordincontext.com"
 
+definitions:
+  policy_path: "definition_policy.yaml"
+
 cache:
   path: "ankideck_generator/data/cache"
-  autosave_every: 10
+  autosave_every: 100
 
 audio:
   enabled: true
@@ -107,7 +117,10 @@ audio:
   language_overrides:
     ru:
       provider_order:
+        - "azure_tts"
         - "elevenlabs"
+        - "gtts"
+        - "pyttsx3"
   use_legacy_cache: false
 
 deck:
@@ -121,22 +134,122 @@ deck:
 runtime:
   timeout_sec: 10
   retries: 2
+  lexicon_zipf_fallback_min: 0.0
+  lexicon_zipf_fallback_min_by_language:
+    ru: 3.0
+  provider_timeout_overrides:
+    ai: 12
+    tatoeba: 6
+    googletrans: 6
+    wiktionary: 6
+    deepl: 8
+    libretranslate: 8
+    azure_tts: 15
+    elevenlabs: 15
+    responsivevoice: 10
+  provider_retry_overrides:
+    ai: 0
+    tatoeba: 0
+    googletrans: 0
+    wiktionary: 0
+    deepl: 0
+    libretranslate: 0
+    azure_tts: 0
+    elevenlabs: 0
+    responsivevoice: 0
   concurrency: 1
   test_concurrency: 3
+  full_concurrency: 5
   audio_concurrency: 1
   test_audio_concurrency: 2
+  full_audio_concurrency: 2
+  max_minutes_per_level_test: 0
+  max_minutes_per_level_full: 20
+  sentence_ai_attempts: 2
+  sentence_ai_attempts_full: 1
+  definition_context_fallback: true
+  definition_context_fallback_full: true
+  low_yield_start_level_full: 2
+  low_yield_min_attempts_full: 1500
+  low_yield_min_acceptance_rate_full: 0.002
+  low_yield_max_accepted_full: 6
+  sentence_template_fallback_full: true
+  definition_word_fallback_full: true
   test_disable_audio: true
   seed: 42
   test_level_size: 10
   test_level_pool_multiplier: 1
   test_attempts_cap: true
   test_accept_all: true
+  cleanup_generated_artifacts: false
+  error_policy:
+    test:
+      max_soft_errors: 999
+      hard:
+        - definition_missing
+        - translation_missing
+        - sentence_missing
+        - focus_not_in_sentence
+        - invalid_focus_characters
+        - invalid_sentence_characters
+      soft:
+        - sentence_length_invalid
+        - sentence_profile_invalid
+        - sentence_too_hard_for_level1
+        - sentence_not_level2
+        - sentence_too_easy_for_level3
+        - definition_missing_pos
+        - definition_nonsemantic
+        - definition_wrong_language
+        - source_definition_wrong_language
+        - translation_same_as_source
+        - translation_wrong_language
+        - ipa_missing
+        - invalid_ipa
+        - word_audio_missing
+        - sentence_audio_missing
+        - duplicate_focus
+        - duplicate_sentence
+        - function_word
+        - focus_not_in_lexicon
+        - definition_too_similar_translation
+    full:
+      max_soft_errors: 1
+      hard:
+        - function_word
+        - focus_not_in_lexicon
+        - definition_missing
+        - definition_missing_pos
+        - definition_nonsemantic
+        - definition_wrong_language
+        - translation_missing
+        - translation_same_as_source
+        - translation_wrong_language
+        - sentence_missing
+        - focus_not_in_sentence
+        - sentence_wrong_language
+        - invalid_focus_characters
+        - invalid_sentence_characters
+        - duplicate_focus
+        - duplicate_sentence
+        - ipa_missing
+        - invalid_ipa
+      soft:
+        - sentence_length_invalid
+        - sentence_profile_invalid
+        - sentence_too_hard_for_level1
+        - sentence_not_level2
+        - sentence_too_easy_for_level3
+        - source_definition_wrong_language
+        - definition_too_similar_translation
+        - word_audio_missing
+        - sentence_audio_missing
   full_level_size: 1000
   ai_max_calls_per_word: 6
   ai_max_calls_per_field: 2
   level_pool_multiplier: 8
   max_attempts_per_level_test: 300
-  max_attempts_per_level_full: 6000
+  max_attempts_per_level_full: 8000
   exclude_closed_class_words: true
   cache_validation_version: 3
   enforce_translation_language: true
@@ -151,6 +264,6 @@ runtime:
       ai_max_calls_per_field: 2
     full:
       timeout_sec: 10
-      retries: 1
+      retries: 0
       ai_max_calls_per_word: 6
       ai_max_calls_per_field: 2

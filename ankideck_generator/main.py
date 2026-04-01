@@ -2,6 +2,7 @@
 
 import argparse
 from pathlib import Path
+import sys
 
 from colorama import Fore, Style, init as colorama_init
 
@@ -18,7 +19,12 @@ from .utils.config import load_config
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Anki Deck Generator")
     parser.add_argument("--language", default="en", help="Language code (en, es, fr, it, de, ru)")
-    parser.add_argument("--mode", default="test", choices=["test", "full"], help="Generation mode")
+    parser.add_argument(
+        "--mode",
+        default="test",
+        choices=["test", "full", "build"],
+        help="Generation mode (build is an alias of full)",
+    )
     parser.add_argument("--interactive", action="store_true", help="Interactive mode")
     parser.add_argument("--output", default="output/deck.apkg", help="Output .apkg path")
     parser.add_argument("--resume", action="store_true", default=False, help="Resume from progress")
@@ -42,7 +48,13 @@ def main() -> int:
         print("Available: " + ", ".join(sorted(languages.keys())))
         return 1
 
-    mode = args.mode
+    mode_input = args.mode
+    mode = "full" if mode_input == "build" else mode_input
+    if mode == "full" and sys.version_info[:2] != (3, 11):
+        print(
+            Fore.YELLOW
+            + "Warning: Python 3.11 is recommended for full generation (googletrans is unstable on newer versions)."
+        )
     runtime_cfg = config.get("runtime", {})
     profiles = runtime_cfg.get("profiles", {})
     mode_profile = profiles.get(mode, {})
@@ -66,6 +78,11 @@ def main() -> int:
         max_attempts_per_level = runtime_cfg.get(
             "max_attempts_per_level_test", max_attempts_per_level
         )
+    else:
+        concurrency = runtime_cfg.get("full_concurrency", concurrency)
+        audio_concurrency = runtime_cfg.get(
+            "full_audio_concurrency", audio_concurrency
+        )
     strict_quality = runtime_cfg.get("strict_quality", True)
     exclude_closed_class_words = bool(runtime_cfg.get("exclude_closed_class_words", True))
     cache_validation_version = int(runtime_cfg.get("cache_validation_version", 3) or 3)
@@ -79,6 +96,104 @@ def main() -> int:
         runtime_cfg.get("level_validation_mode", "profile_hard_zipf_soft")
     ).strip() or "profile_hard_zipf_soft"
     generate_audio = not (mode == "test" and bool(runtime_cfg.get("test_disable_audio", False)))
+    provider_timeout_overrides = dict(runtime_cfg.get("provider_timeout_overrides", {}) or {})
+    provider_timeout_overrides.update(dict(mode_profile.get("provider_timeout_overrides", {}) or {}))
+    provider_retry_overrides = dict(runtime_cfg.get("provider_retry_overrides", {}) or {})
+    provider_retry_overrides.update(dict(mode_profile.get("provider_retry_overrides", {}) or {}))
+    max_minutes_per_level = float(runtime_cfg.get("max_minutes_per_level_full", 0.0) or 0.0)
+    sentence_ai_attempts = int(runtime_cfg.get("sentence_ai_attempts", 2) or 2)
+    definition_context_fallback = bool(runtime_cfg.get("definition_context_fallback", True))
+    low_yield_min_attempts = int(runtime_cfg.get("low_yield_min_attempts", 0) or 0)
+    low_yield_min_acceptance_rate = float(
+        runtime_cfg.get("low_yield_min_acceptance_rate", 0.0) or 0.0
+    )
+    low_yield_max_accepted = int(runtime_cfg.get("low_yield_max_accepted", 0) or 0)
+    low_yield_start_level = int(runtime_cfg.get("low_yield_start_level", 1) or 1)
+    sentence_template_fallback = bool(runtime_cfg.get("sentence_template_fallback", False))
+    definition_word_fallback = bool(runtime_cfg.get("definition_word_fallback", False))
+    if mode == "test":
+        max_minutes_per_level = float(
+            runtime_cfg.get("max_minutes_per_level_test", max_minutes_per_level) or 0.0
+        )
+        sentence_ai_attempts = int(
+            runtime_cfg.get("sentence_ai_attempts_test", sentence_ai_attempts)
+            or sentence_ai_attempts
+        )
+        definition_context_fallback = bool(
+            runtime_cfg.get(
+                "definition_context_fallback_test", definition_context_fallback
+            )
+        )
+        low_yield_min_attempts = int(
+            runtime_cfg.get("low_yield_min_attempts_test", low_yield_min_attempts)
+            or low_yield_min_attempts
+        )
+        low_yield_min_acceptance_rate = float(
+            runtime_cfg.get(
+                "low_yield_min_acceptance_rate_test", low_yield_min_acceptance_rate
+            )
+            or low_yield_min_acceptance_rate
+        )
+        low_yield_max_accepted = int(
+            runtime_cfg.get("low_yield_max_accepted_test", low_yield_max_accepted)
+            or low_yield_max_accepted
+        )
+        low_yield_start_level = int(
+            runtime_cfg.get("low_yield_start_level_test", low_yield_start_level)
+            or low_yield_start_level
+        )
+        sentence_template_fallback = bool(
+            runtime_cfg.get(
+                "sentence_template_fallback_test", sentence_template_fallback
+            )
+        )
+        definition_word_fallback = bool(
+            runtime_cfg.get("definition_word_fallback_test", definition_word_fallback)
+        )
+    else:
+        sentence_ai_attempts = int(
+            runtime_cfg.get("sentence_ai_attempts_full", sentence_ai_attempts)
+            or sentence_ai_attempts
+        )
+        definition_context_fallback = bool(
+            runtime_cfg.get(
+                "definition_context_fallback_full", definition_context_fallback
+            )
+        )
+        low_yield_min_attempts = int(
+            runtime_cfg.get("low_yield_min_attempts_full", low_yield_min_attempts)
+            or low_yield_min_attempts
+        )
+        low_yield_min_acceptance_rate = float(
+            runtime_cfg.get(
+                "low_yield_min_acceptance_rate_full", low_yield_min_acceptance_rate
+            )
+            or low_yield_min_acceptance_rate
+        )
+        low_yield_max_accepted = int(
+            runtime_cfg.get("low_yield_max_accepted_full", low_yield_max_accepted)
+            or low_yield_max_accepted
+        )
+        low_yield_start_level = int(
+            runtime_cfg.get("low_yield_start_level_full", low_yield_start_level)
+            or low_yield_start_level
+        )
+        sentence_template_fallback = bool(
+            runtime_cfg.get(
+                "sentence_template_fallback_full", sentence_template_fallback
+            )
+        )
+        definition_word_fallback = bool(
+            runtime_cfg.get("definition_word_fallback_full", definition_word_fallback)
+        )
+    lexicon_zipf_fallback_min = float(runtime_cfg.get("lexicon_zipf_fallback_min", 0.0) or 0.0)
+    lexicon_zipf_fallback_by_language = dict(
+        runtime_cfg.get("lexicon_zipf_fallback_min_by_language", {}) or {}
+    )
+    lexicon_zipf_fallback_min = float(
+        lexicon_zipf_fallback_by_language.get(args.language, lexicon_zipf_fallback_min)
+        or lexicon_zipf_fallback_min
+    )
 
     run = RunConfig(
         language=lang_cfg.get("code", args.language),
@@ -107,6 +222,26 @@ def main() -> int:
         generate_audio=generate_audio,
         sentence_rewrite_from_web=sentence_rewrite_from_web,
         level_validation_mode=level_validation_mode,
+        provider_timeout_overrides={
+            str(key): int(value)
+            for key, value in provider_timeout_overrides.items()
+            if value is not None
+        },
+        provider_retry_overrides={
+            str(key): int(value)
+            for key, value in provider_retry_overrides.items()
+            if value is not None
+        },
+        lexicon_zipf_fallback_min=max(0.0, float(lexicon_zipf_fallback_min)),
+        max_minutes_per_level=max(0.0, max_minutes_per_level),
+        sentence_ai_attempts=max(0, int(sentence_ai_attempts)),
+        definition_context_fallback=bool(definition_context_fallback),
+        low_yield_min_attempts=max(0, int(low_yield_min_attempts)),
+        low_yield_min_acceptance_rate=max(0.0, float(low_yield_min_acceptance_rate)),
+        low_yield_max_accepted=max(0, int(low_yield_max_accepted)),
+        low_yield_start_level=max(1, int(low_yield_start_level)),
+        sentence_template_fallback=bool(sentence_template_fallback),
+        definition_word_fallback=bool(definition_word_fallback),
     )
 
     builder = DeckBuilder(args.config)

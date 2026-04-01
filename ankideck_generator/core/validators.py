@@ -8,6 +8,7 @@ from ..utils.definition_tools import definition_has_pos
 from ..utils.language_tools import (
     difficulty,
     is_semantic_definition,
+    text_contains_focus,
     text_matches_language,
     valid_focus_characters,
     valid_sentence_characters,
@@ -86,7 +87,7 @@ def validate_card(
             errors.append("duplicate_sentence")
 
     if validations.get("focus_in_sentence"):
-        if card.focus.lower() not in card.sentence.lower():
+        if not text_contains_focus(card.sentence, card.focus):
             errors.append("focus_not_in_sentence")
 
     if validations.get("sentence_matches_language"):
@@ -109,7 +110,7 @@ def validate_card(
             errors.append("definition_wrong_language")
 
     if validations.get("example_word_in_sentence"):
-        if card.example_word and card.example_word.lower() not in card.sentence.lower():
+        if card.example_word and not text_contains_focus(card.sentence, card.example_word):
             errors.append("example_word_not_in_sentence")
 
     if validations.get("valid_characters"):

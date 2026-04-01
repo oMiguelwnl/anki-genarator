@@ -44,3 +44,23 @@ def test_normalize_definition_keeps_cyrillic_body() -> None:
     )
     assert value.startswith("noun:")
     assert "важное понятие" in value
+
+
+def test_normalize_definition_strips_wiktionary_markup_noise() -> None:
+    value = normalize_definition(
+        "particle: there is not, there are no .mw-parser-output .object-usage-tag{font-style:italic}.mw-parser-output .deprecated{color:var} [ with genitive",
+        "en",
+        min_words=4,
+        max_words=12,
+    )
+    assert value == "particle: there is not, there are no."
+
+
+def test_normalize_definition_normalizes_list_spacing() -> None:
+    value = normalize_definition(
+        "adverb: maybe , perhaps , possibly",
+        "en",
+        min_words=2,
+        max_words=12,
+    )
+    assert value == "adverb: maybe, perhaps, possibly."

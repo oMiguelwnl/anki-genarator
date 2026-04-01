@@ -182,10 +182,89 @@ def test_wrap_disables_provider_after_repeated_timeouts() -> None:
         calls["count"] += 1
         raise requests.exceptions.ReadTimeout("timed out")
 
+    provider._wrap("responsivevoice", timeout_fn)
+    provider._wrap("responsivevoice", timeout_fn)
+    provider._wrap("responsivevoice", timeout_fn)
+
+    result = provider._wrap("responsivevoice", timeout_fn)
+    assert result.error == "provider_disabled"
+    assert calls["count"] == 3
+
+
+def test_wrap_does_not_disable_tatoeba_after_repeated_timeouts() -> None:
+    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
+    calls = {"count": 0}
+
+    def timeout_fn():
+        calls["count"] += 1
+        raise requests.exceptions.ReadTimeout("timed out")
+
     provider._wrap("tatoeba", timeout_fn)
     provider._wrap("tatoeba", timeout_fn)
     provider._wrap("tatoeba", timeout_fn)
 
     result = provider._wrap("tatoeba", timeout_fn)
+    assert result.error == "timed out"
+    assert calls["count"] == 4
+
+
+def test_sentence_tatoeba_uses_exact_query_and_pagination(monkeypatch) -> None:
+    config = {
+        "providers": {
+            "tatoeba": {
+                "endpoint": "https://tatoeba.test/api_v0/search",
+                "exact_match": True,
+                "native_only": True,
+                "exclude_orphans": True,
+                "exclude_unapproved": True,
+                "max_pages": 2,
+                "page_size": 2,
+            }
+        }
+    }
+    provider = ProviderManager(config, timeout_sec=1, retries=0)
+    seen_params: list[dict[str, object]] = []
+
+    def fake_get(url, params=None, timeout=None):
+        _ = (url, timeout)
+        seen_params.append(dict(params or {}))
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                if params.get("page") == 1:
+                    return {
+                        "results": [
+                            {"text": "The category changes fast."},
+                            {"text": "Another category appears here."},
+                        ]
+                    }
+                return {"results": [{"text": "The cat sleeps here."}]}
+
+        return FakeResponse()
+
+    monkeypatch.setattr(provider._session, "get", fake_get)
+    result = provider.sentence_web("cat", "en", min_words=3, max_words=6)
+
+    assert result.value == "The cat sleeps here."
+    assert seen_params[0]["query"] == "=cat"
+    assert seen_params[0]["native"] == "yes"
+    assert seen_params[0]["orphans"] == "no"
+    assert seen_params[0]["unapproved"] == "no"
+    assert seen_params[0]["page"] == 1
+    assert seen_params[1]["page"] == 2
+
+
+def test_fallback_reports_provider_disabled_when_all_candidates_are_disabled() -> None:
+    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
+    provider._disabled_providers.update({"gtts", "responsivevoice"})
+
+    result = provider._fallback(
+        [
+            ("gtts", lambda: "unused"),
+            ("responsivevoice", lambda: "unused"),
+        ]
+    )
+
     assert result.error == "provider_disabled"
-    assert calls["count"] == 3

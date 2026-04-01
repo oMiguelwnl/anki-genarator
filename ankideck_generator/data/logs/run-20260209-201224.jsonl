@@ -1,3 +1,0 @@
-{"focus": "de", "level": 1, "providers": {"definition": "ai", "ipa": "ai", "translation": "ai"}, "validations": ["definition_missing", "ipa_missing", "translation_missing"], "status": "discarded", "error": null, "timestamp": "2026-02-09T20:12:36.242287"}
-{"focus": "la", "level": 1, "providers": {"definition": "ai", "ipa": "ai", "translation": "ai"}, "validations": ["definition_missing", "ipa_missing", "translation_missing"], "status": "discarded", "error": null, "timestamp": "2026-02-09T20:12:44.295676"}
-{"focus": "que", "level": 1, "providers": {"definition": "ai", "ipa": "ai", "translation": "ai"}, "validations": ["definition_missing", "ipa_missing", "translation_missing"], "status": "discarded", "error": null, "timestamp": "2026-02-09T20:12:52.498800"}

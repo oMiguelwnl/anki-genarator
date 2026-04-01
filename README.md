@@ -9,8 +9,10 @@ Use Python **3.11**. O `googletrans` nao e estavel no Python 3.13 e pode falhar 
 Para gerar o deck final completo, execute sem retomada:
 
 ```bash
-python -m ankideck_generator --language es --mode full --no-resume --output output/deck.apkg
+python -m ankideck_generator --language es --mode build --no-resume --output output/deck.apkg
 ```
+
+`--mode build` e alias de `--mode full`.
 
 `--resume` existe para retomada de processamento, mas nao e recomendado para export final.
 

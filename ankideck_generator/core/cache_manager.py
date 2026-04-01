@@ -13,6 +13,7 @@ class CacheManager:
         self.language = language
         self.autosave_every = autosave_every
         self.caches: dict[str, dict[str, Any]] = {}
+        self._dirty_kinds: set[str] = set()
         self._lock = RLock()
         ensure_dir(self.base_path)
 
@@ -35,15 +36,25 @@ class CacheManager:
     def set(self, kind: str, key: str, value: Any) -> None:
         with self._lock:
             cache = self.load(kind)
+            if key in cache and cache[key] == value:
+                return
             cache[key] = value
+            self._dirty_kinds.add(kind)
+
+    def is_dirty(self, kind: str) -> bool:
+        with self._lock:
+            return kind in self._dirty_kinds
 
     def save(self, kind: str) -> None:
         with self._lock:
+            if kind not in self._dirty_kinds:
+                return
             cache = dict(self.load(kind))
+            self._dirty_kinds.discard(kind)
         atomic_write_json(self._cache_file(kind), cache)
 
     def save_all(self) -> None:
         with self._lock:
-            kinds = list(self.caches.keys())
+            kinds = list(self._dirty_kinds)
         for kind in kinds:
             self.save(kind)

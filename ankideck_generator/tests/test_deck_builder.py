@@ -7,6 +7,7 @@ from ankideck_generator.core.deck_builder import (
     AudioTaskResult,
     DeckBuilder,
     TextTaskResult,
+    _infer_discard_reason,
     _sentence_length_bounds,
 )
 from ankideck_generator.core.models import CardData, LogRecord, RunConfig
@@ -134,6 +135,14 @@ def test_sentence_length_bounds_follow_level_defaults() -> None:
     assert _sentence_length_bounds({1: (2, 7), 2: (4, 10), 3: (6, 15)}, 3) == (6, 15)
 
 
+def test_lexicon_zipf_fallback_accepts_high_frequency_words(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path, language="ru")
+    run.wordfreq_language = "ru"
+    run.lexicon_zipf_fallback_min = 3.0
+    assert builder._lexicon_zipf_fallback_ok("дом", run) is True
+
+
 def test_print_summary_includes_sentence_source_stats(tmp_path: Path, capsys) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
 
@@ -148,10 +157,16 @@ def test_print_summary_includes_sentence_source_stats(tmp_path: Path, capsys) ->
                 "sentence_tatoeba_hit": 7,
                 "sentence_ai_rewrite_hit": 3,
                 "sentence_ai_generate_hit": 2,
+                "sentence_template_fallback_hit": 5,
             }
         ),
+        {1: Counter({"sentence_tatoeba_hit": 7, "sentence_template_fallback_hit": 5})},
         Counter(),
         Counter(),
+        {},
+        {},
+        Counter(),
+        {},
     )
 
     output = capsys.readouterr().out
@@ -159,6 +174,8 @@ def test_print_summary_includes_sentence_source_stats(tmp_path: Path, capsys) ->
     assert "sentence_tatoeba_attempted: 12" in output
     assert "sentence_ai_rewrite_hit: 3" in output
     assert "sentence_ai_generate_hit: 2" in output
+    assert "sentence_template_fallback_hit: 5" in output
+    assert "source_mix: tatoeba=41.2%, rewrite=17.6%, ai=11.8%, template=29.4%" in output
 
 
 def test_process_word_uses_source_language_for_definition(tmp_path: Path) -> None:
@@ -316,6 +333,49 @@ def test_process_word_discards_missing_definition_even_in_test_mode(tmp_path: Pa
     assert card is None
     assert log.status == "discarded"
     assert "definition_missing" in log.validations
+
+
+def test_should_reject_errors_allows_single_soft_error_in_full_mode(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.mode = "full"
+
+    assert builder._should_reject_errors(["sentence_length_invalid"], run) is False
+
+
+def test_should_reject_errors_rejects_multiple_soft_errors_in_full_mode(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.mode = "full"
+
+    assert (
+        builder._should_reject_errors(
+            ["sentence_length_invalid", "sentence_profile_invalid"], run
+        )
+        is True
+    )
+
+
+def test_should_reject_errors_rejects_hard_error_in_test_mode(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+
+    assert builder._should_reject_errors(["definition_missing"], run) is True
+
+
+def test_should_reject_errors_allows_soft_errors_in_test_mode(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+
+    assert builder._should_reject_errors(["sentence_length_invalid"], run) is False
+
+
+def test_infer_discard_reason_prioritizes_definition_error() -> None:
+    reason = _infer_discard_reason(
+        ["definition_missing"],
+        {"sentence": "provider_disabled", "sentence:tatoeba": "provider_disabled"},
+    )
+    assert reason == "definition_generation_failed"
 
 
 def test_process_word_retries_sentence_web_before_ai(tmp_path: Path) -> None:
@@ -576,6 +636,96 @@ def test_process_word_uses_cached_audio_when_enabled(tmp_path: Path) -> None:
     assert card is not None
     assert card.word_audio == f"[sound:{word_path.name}]"
     assert card.sentence_audio == f"[sound:{sentence_path.name}]"
+
+
+def test_process_word_uses_azure_first_for_russian_audio(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path, language="ru")
+    ctx = ValidationContext()
+    builder.config["audio"]["enabled"] = True
+    builder.config["audio"]["required"] = False
+    builder.config["audio"]["output_dir"] = str(tmp_path / "audio")
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "azure_tts"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        audio_calls: list[tuple[list[str] | None, str | None]] = []
+
+        def word_exists(self, word, language):
+            _ = (word, language)
+            return Result(word, provider_name="wiktionary")
+
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("adverb: maybe, perhaps, possibly.", provider_name="wiktionary")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/может/", provider_name="ai")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("MO-zhyet", provider_name="ai")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result(f"Он думает, что {word} это возможно.", provider_name="tatoeba")
+
+        def sentence_ai(self, *args, **kwargs):
+            raise AssertionError("sentence_ai should not run when web sentence is valid")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("He thinks that maybe this is possible.", provider_name="googletrans")
+
+        def translation_ai(self, *args, **kwargs):
+            raise AssertionError("translation_ai should not run")
+
+        def audio(
+            self,
+            text,
+            language,
+            output_dir,
+            filename_hint,
+            provider_order=None,
+            voice=None,
+            voice_gender_preference=None,
+        ):
+            _ = (text, language, filename_hint, voice_gender_preference)
+            self.audio_calls.append((list(provider_order or []), voice))
+            path = Path(output_dir) / f"{filename_hint}.mp3"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"audio")
+            return Result(str(path), provider_name="azure_tts")
+
+    providers = FakeProviders()
+    card, _log = builder._process_word(
+        word="может",
+        level=3,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=providers,
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert providers.audio_calls
+    assert providers.audio_calls[0][0][:4] == ["azure_tts", "elevenlabs", "gtts", "pyttsx3"]
+    assert providers.audio_calls[0][1] == "ru-RU-DmitryNeural"
 
 
 def test_process_word_retries_when_sentence_is_wrong_language(tmp_path: Path) -> None:
@@ -1204,6 +1354,85 @@ def test_process_word_ignores_invalid_cached_translation_and_regenerates(tmp_pat
     assert card.translation == "This restricted file stays private."
 
 
+def test_process_word_uses_english_gloss_as_final_definition(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path, language="ru")
+    ctx = ValidationContext()
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "wiktionary"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        translation_web_calls = 0
+
+        def word_exists(self, word, language):
+            _ = (word, language)
+            return Result(word, provider_name="wiktionary")
+
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("adverb: maybe, perhaps, possibly.", provider_name="wiktionary")
+
+        def definition_ai(self, *args, **kwargs):
+            raise AssertionError("definition_ai should not run when gloss is already usable")
+
+        def definition_from_context(self, *args, **kwargs):
+            raise AssertionError("definition_from_context should not run when gloss is already usable")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result(f"Он говорит, что {word} все понимают.", provider_name="tatoeba")
+
+        def sentence_ai(self, *args, **kwargs):
+            raise AssertionError("sentence_ai should not run on valid sentence")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            self.translation_web_calls += 1
+            return Result("He says that maybe everyone understands.")
+
+        def translation_ai(self, *args, **kwargs):
+            raise AssertionError("translation_ai should not run")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/может/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("MO-zhyet")
+
+    providers = FakeProviders()
+    card, log = builder._process_word(
+        word="может",
+        level=3,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=providers,
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert card.definition == "adverb: maybe, perhaps, possibly."
+    assert card.source_definition == ""
+    assert "source_definition_wrong_language" not in log.validations
+    assert providers.translation_web_calls == 1
+
+
 def test_process_word_passes_sentence_bounds_to_sentence_providers(tmp_path: Path) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
@@ -1286,4 +1515,3 @@ def test_process_word_passes_sentence_bounds_to_sentence_providers(tmp_path: Pat
     assert card is not None
     assert providers.sentence_bounds
     assert providers.sentence_bounds[0] == (2, 7)
-

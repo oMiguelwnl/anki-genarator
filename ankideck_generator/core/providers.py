@@ -13,11 +13,14 @@ from xml.sax.saxutils import escape as xml_escape
 import requests
 from gtts import gTTS
 
+from ..utils.definition_tools import build_definition_policy
 from ..utils.file_utils import ensure_dir
 from ..utils.language_tools import (
     LANG_CODE_TO_NAME,
+    normalize_language_code,
     score_sentence,
     semantic_definition_reason,
+    text_contains_focus,
 )
 from .models import ProviderResult
 
@@ -43,11 +46,47 @@ class ProviderError(Exception):
     pass
 
 
+TATOEBA_LANGUAGE_CODES = {
+    "en": "eng",
+    "es": "spa",
+    "fr": "fra",
+    "it": "ita",
+    "de": "deu",
+    "ru": "rus",
+}
+
+TATOEBA_STEMMING_LANGUAGES = {
+    "en",
+    "es",
+    "fr",
+    "it",
+    "de",
+    "ru",
+}
+
+
 class ProviderManager:
-    def __init__(self, config: dict, timeout_sec: int, retries: int) -> None:
+    def __init__(
+        self,
+        config: dict,
+        timeout_sec: int,
+        retries: int,
+        timeout_overrides: dict[str, int] | None = None,
+        retry_overrides: dict[str, int] | None = None,
+    ) -> None:
         self.config = config
         self.timeout_sec = timeout_sec
         self.retries = retries
+        self.timeout_overrides = {
+            str(name): max(1, int(value))
+            for name, value in (timeout_overrides or {}).items()
+            if value is not None
+        }
+        self.retry_overrides = {
+            str(name): max(0, int(value))
+            for name, value in (retry_overrides or {}).items()
+            if value is not None
+        }
         self._session = requests.Session()
         self._session.headers.update(
             {
@@ -103,7 +142,8 @@ class ProviderManager:
             )
         start = time.time()
         last_exc: Exception | None = None
-        for attempt in range(self.retries + 1):
+        retries = self._retries_for(provider_name)
+        for attempt in range(retries + 1):
             try:
                 value = fn()
                 if value is None or value == "":
@@ -117,10 +157,16 @@ class ProviderManager:
                 self._register_provider_failure(provider_name, message, exc)
                 if self._is_deterministic_error(message):
                     break
-                if attempt >= self.retries:
+                if attempt >= retries:
                     break
         elapsed = int((time.time() - start) * 1000)
         return ProviderResult(value=None, provider_name=provider_name, elapsed_ms=elapsed, error=str(last_exc))
+
+    def _timeout_for(self, provider_name: str) -> int:
+        return int(self.timeout_overrides.get(provider_name, self.timeout_sec))
+
+    def _retries_for(self, provider_name: str) -> int:
+        return int(self.retry_overrides.get(provider_name, self.retries))
 
     def _register_provider_success(self, provider_name: str) -> None:
         self._provider_failure_streak[provider_name] = 0
@@ -135,7 +181,10 @@ class ProviderManager:
         if self._is_timeout_error(message, exc):
             timeout_streak = self._provider_timeout_streak.get(provider_name, 0) + 1
             self._provider_timeout_streak[provider_name] = timeout_streak
-            if timeout_streak >= self._provider_timeout_limit:
+            if (
+                provider_name not in {"ai", "tatoeba", "wiktionary"}
+                and timeout_streak >= self._provider_timeout_limit
+            ):
                 self._disabled_providers.add(provider_name)
             return
 
@@ -447,6 +496,17 @@ class ProviderManager:
             if fallback_errors:
                 last_result.fallback_errors = fallback_errors
             return last_result
+        if fallback_errors and all(
+            str(error).strip().lower() == "provider_disabled"
+            for error in fallback_errors.values()
+        ):
+            return ProviderResult(
+                value=None,
+                provider_name="none",
+                elapsed_ms=0,
+                error="provider_disabled",
+                fallback_errors=fallback_errors,
+            )
         return ProviderResult(value=None, provider_name="none", elapsed_ms=0, error="no providers")
 
     def _definition_wordnet(self, word: str, language: str) -> str | None:
@@ -473,7 +533,7 @@ class ProviderManager:
         if language != "en":
             return None
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{quote(word)}"
-        resp = self._session.get(url, timeout=self.timeout_sec)
+        resp = self._session.get(url, timeout=self._timeout_for("dictionaryapi"))
         if resp.status_code != 200:
             return None
         payload = resp.json()
@@ -502,7 +562,7 @@ class ProviderManager:
             "source_lang": src.upper(),
             "target_lang": dest.upper(),
         }
-        resp = self._session.post(endpoint, data=payload, timeout=self.timeout_sec)
+        resp = self._session.post(endpoint, data=payload, timeout=self._timeout_for("deepl"))
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -527,7 +587,11 @@ class ProviderManager:
         }
         if api_key:
             payload["api_key"] = api_key
-        resp = self._session.post(endpoint, data=payload, timeout=self.timeout_sec)
+        resp = self._session.post(
+            endpoint,
+            data=payload,
+            timeout=self._timeout_for("libretranslate"),
+        )
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -541,7 +605,7 @@ class ProviderManager:
 
         lang_name = LANG_CODE_TO_NAME.get(language, "English")
         url = f"https://en.wiktionary.org/api/rest_v1/page/definition/{quote(word)}"
-        resp = self._session.get(url, timeout=self.timeout_sec)
+        resp = self._session.get(url, timeout=self._timeout_for("wiktionary"))
         if resp.status_code != 200:
             self._wiktionary_definition_cache[cache_key] = []
             return []
@@ -558,7 +622,10 @@ class ProviderManager:
                 entry.get("partOfSpeech") or entry.get("part_of_speech") or ""
             )
             for definition in entry.get("definitions") or []:
-                text = _clean_wiktionary_text(definition.get("definition") or "")
+                text = _clean_wiktionary_text(
+                    definition.get("definition") or "",
+                    _definition_policy_from_config(self.config),
+                )
                 if text:
                     candidate = f"{part_of_speech}: {text}" if part_of_speech else text
                     if semantic_definition_reason(candidate, word) is None:
@@ -580,40 +647,70 @@ class ProviderManager:
         min_words: int | None = None,
         max_words: int | None = None,
     ) -> str | None:
-        endpoint = self.config.get("providers", {}).get("tatoeba", {}).get("endpoint")
+        config = self.config.get("providers", {}).get("tatoeba", {})
+        endpoint = config.get("endpoint")
         if not endpoint:
             return None
+        source_language = TATOEBA_LANGUAGE_CODES.get(language, language)
+        query = _tatoeba_query(word, language, bool(config.get("exact_match", False)))
+        page_size = max(1, int(config.get("page_size", 20) or 20))
+        max_pages = max(1, int(config.get("max_pages", 1) or 1))
         params = {
-            "query": word,
-            "from": language,
+            "query": query,
+            "from": source_language,
             "sort": "relevance",
-            "limit": 20,
+            "limit": page_size,
         }
-        resp = self._session.get(endpoint, params=params, timeout=self.timeout_sec)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        results = data.get("results") or []
-        if not results:
-            return None
-        word_lower = word.lower()
-        candidates: list[str] = []
-        for item in results:
-            sentence = (item.get("text") or "").strip()
-            if not sentence:
-                continue
-            if word_lower not in sentence.lower():
-                continue
-            candidates.append(sentence)
-        if not candidates:
-            return None
-        return _best_sentence(
-            candidates,
-            word,
-            language,
-            min_words=min_words or 5,
-            max_words=max_words or 25,
-        )
+        if bool(config.get("native_only", False)):
+            params["native"] = "yes"
+        if bool(config.get("exclude_orphans", False)):
+            params["orphans"] = "no"
+        if bool(config.get("exclude_unapproved", False)):
+            params["unapproved"] = "no"
+
+        best_sentence: str | None = None
+        best_score = 0.0
+        seen_sentences: set[str] = set()
+        resolved_min_words = min_words or 5
+        resolved_max_words = max_words or 25
+
+        for page in range(1, max_pages + 1):
+            page_params = dict(params)
+            page_params["page"] = page
+            resp = self._session.get(
+                endpoint,
+                params=page_params,
+                timeout=self._timeout_for("tatoeba"),
+            )
+            if resp.status_code != 200:
+                return None if page == 1 else best_sentence
+            data = resp.json()
+            results = data.get("results") or []
+            if not results:
+                break
+            for item in results:
+                sentence = _extract_tatoeba_sentence(item)
+                if not sentence or sentence in seen_sentences:
+                    continue
+                seen_sentences.add(sentence)
+                if not text_contains_focus(sentence, word):
+                    continue
+                score = score_sentence(
+                    sentence,
+                    word,
+                    language,
+                    min_words=resolved_min_words,
+                    max_words=resolved_max_words,
+                )
+                if score <= 0:
+                    continue
+                score -= min(0.15, float(page - 1) * 0.03)
+                if score > best_score:
+                    best_score = score
+                    best_sentence = sentence
+            if len(results) < page_size:
+                break
+        return best_sentence if best_score > 0 else None
 
     def _sentence_wordincontext(self, word: str, language: str) -> str | None:
         # Placeholder for paid API; return None to trigger fallback.
@@ -639,7 +736,11 @@ class ProviderManager:
             "src": text,
             "hl": language,
         }
-        resp = self._session.get(endpoint, params=params, timeout=self.timeout_sec)
+        resp = self._session.get(
+            endpoint,
+            params=params,
+            timeout=self._timeout_for("responsivevoice"),
+        )
         if resp.status_code != 200:
             return None
         ensure_dir(output_dir)
@@ -695,7 +796,12 @@ class ProviderManager:
             "X-Microsoft-OutputFormat": output_format,
             "User-Agent": "ankideck-generator",
         }
-        resp = self._session.post(endpoint, data=ssml.encode("utf-8"), headers=headers, timeout=self.timeout_sec)
+        resp = self._session.post(
+            endpoint,
+            data=ssml.encode("utf-8"),
+            headers=headers,
+            timeout=self._timeout_for("azure_tts"),
+        )
         if resp.status_code != 200:
             raise ProviderError(f"azure_tts HTTP {resp.status_code}: {resp.text[:200]}")
         ensure_dir(output_dir)
@@ -741,7 +847,12 @@ class ProviderManager:
             "text": text,
             "model_id": model_id,
         }
-        resp = self._session.post(url, json=payload, headers=headers, timeout=self.timeout_sec)
+        resp = self._session.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=self._timeout_for("elevenlabs"),
+        )
         if resp.status_code != 200:
             raise ProviderError(f"elevenlabs HTTP {resp.status_code}: {resp.text[:200]}")
         ensure_dir(output_dir)
@@ -787,7 +898,11 @@ class ProviderManager:
         config = self.config.get("providers", {}).get("elevenlabs", {})
         endpoint = config.get("voices_endpoint") or "https://api.elevenlabs.io/v1/voices"
         headers = {"xi-api-key": api_key}
-        resp = self._session.get(endpoint, headers=headers, timeout=self.timeout_sec)
+        resp = self._session.get(
+            endpoint,
+            headers=headers,
+            timeout=self._timeout_for("elevenlabs"),
+        )
         if resp.status_code != 200:
             raise ProviderError(f"elevenlabs voices HTTP {resp.status_code}: {resp.text[:200]}")
         data = resp.json()
@@ -829,7 +944,12 @@ class ProviderManager:
                         ],
                         "temperature": self._ai_config.get("temperature", 0.4),
                     }
-                    resp = self._session.post(endpoint, json=payload, headers=headers, timeout=self.timeout_sec)
+                    resp = self._session.post(
+                        endpoint,
+                        json=payload,
+                        headers=headers,
+                        timeout=self._timeout_for("ai"),
+                    )
                     if resp.status_code != 200:
                         last_error = f"{provider_name} HTTP {resp.status_code}: {resp.text[:200]}"
                         continue
@@ -1039,11 +1159,58 @@ def _extract_json_payload(text: str) -> Any | None:
             return None
 
 
-def _clean_wiktionary_text(value: str) -> str:
+def _clean_wiktionary_text(
+    value: str,
+    policy: dict[str, Any] | None = None,
+) -> str:
     text = unescape(str(value or ""))
     text = re.sub(r"<[^>]+>", " ", text)
+    resolved_policy = build_definition_policy(policy)
+    for pattern in resolved_policy.get("noise_patterns") or []:
+        text = re.sub(str(pattern), " ", text, flags=re.IGNORECASE)
+    if (resolved_policy.get("cleanup") or {}).get("strip_bracket_notes", True):
+        text = re.sub(r"\[[^\]]+\]", " ", text)
+        text = re.sub(r"\[[^\]]*$", " ", text)
+    for pattern, replacement in resolved_policy.get("spacing_replacements") or []:
+        text = re.sub(str(pattern), str(replacement), text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _definition_policy_from_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    definitions_cfg = (config or {}).get("definitions", {})
+    if not isinstance(definitions_cfg, dict):
+        return build_definition_policy()
+    policy = definitions_cfg.get("_resolved_policy")
+    if isinstance(policy, dict):
+        return policy
+    return build_definition_policy()
+
+
+def _extract_tatoeba_sentence(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    text = item.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    sentence = item.get("sentence")
+    if isinstance(sentence, str) and sentence.strip():
+        return sentence.strip()
+    if isinstance(sentence, dict):
+        nested = sentence.get("text")
+        if isinstance(nested, str):
+            return nested.strip()
+    return ""
+
+
+def _tatoeba_query(word: str, language: str, exact_match: bool) -> str:
+    query = str(word or "").strip()
+    if not query:
+        return ""
+    language_code = normalize_language_code(language)
+    if exact_match and language_code in TATOEBA_STEMMING_LANGUAGES and not query.startswith("="):
+        return f"={query}"
+    return query
 
 
 def _wiktionary_pos_label(value: str) -> str:
