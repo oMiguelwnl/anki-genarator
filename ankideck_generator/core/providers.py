@@ -13,7 +13,14 @@ from xml.sax.saxutils import escape as xml_escape
 import requests
 from gtts import gTTS
 
-from ..utils.definition_tools import build_definition_policy
+from ..utils.definition_tools import (
+    MetaDefinition,
+    build_definition_policy,
+    compose_resolved_meta_definition,
+    extract_meta_definition,
+    extract_meta_lemma,
+    strip_definition_usage_notes,
+)
 from ..utils.file_utils import ensure_dir
 from ..utils.language_tools import (
     LANG_CODE_TO_NAME,
@@ -597,11 +604,20 @@ class ProviderManager:
         data = resp.json()
         return data.get("translatedText")
 
-    def _wiktionary_definitions(self, word: str, language: str) -> list[str]:
+    def _wiktionary_definitions(
+        self,
+        word: str,
+        language: str,
+        _seen: set[tuple[str, str]] | None = None,
+    ) -> list[str]:
         cache_key = (word.strip().lower(), language.strip().lower())
         cached = self._wiktionary_definition_cache.get(cache_key)
         if cached is not None:
             return cached
+        seen = set(_seen or set())
+        if cache_key in seen:
+            return []
+        seen.add(cache_key)
 
         lang_name = LANG_CODE_TO_NAME.get(language, "English")
         url = f"https://en.wiktionary.org/api/rest_v1/page/definition/{quote(word)}"
@@ -617,6 +633,7 @@ class ProviderManager:
 
         preferred: list[str] = []
         fallback: list[str] = []
+        resolved_policy = _definition_policy_from_config(self.config)
         for entry in entries:
             part_of_speech = _wiktionary_pos_label(
                 entry.get("partOfSpeech") or entry.get("part_of_speech") or ""
@@ -624,17 +641,71 @@ class ProviderManager:
             for definition in entry.get("definitions") or []:
                 text = _clean_wiktionary_text(
                     definition.get("definition") or "",
-                    _definition_policy_from_config(self.config),
+                    resolved_policy,
                 )
-                if text:
-                    candidate = f"{part_of_speech}: {text}" if part_of_speech else text
-                    if semantic_definition_reason(candidate, word) is None:
-                        preferred.append(candidate)
-                    else:
-                        fallback.append(candidate)
+                if not text:
+                    continue
+                candidate = f"{part_of_speech}: {text}" if part_of_speech else text
+                if semantic_definition_reason(candidate, word) is None:
+                    preferred.append(candidate)
+                    continue
+
+                resolved = self._resolve_wiktionary_meta_candidate(
+                    word=word,
+                    language=language,
+                    entry=entry,
+                    definition_entry=definition,
+                    candidate=candidate,
+                    policy=resolved_policy,
+                    seen=seen,
+                )
+                if resolved and semantic_definition_reason(resolved, word) is None:
+                    preferred.append(resolved)
+                fallback.append(candidate)
         definitions = preferred or fallback
         self._wiktionary_definition_cache[cache_key] = definitions
         return definitions
+
+    def _resolve_wiktionary_meta_candidate(
+        self,
+        *,
+        word: str,
+        language: str,
+        entry: dict[str, Any],
+        definition_entry: dict[str, Any],
+        candidate: str,
+        policy: dict[str, Any],
+        seen: set[tuple[str, str]],
+    ) -> str | None:
+        meta = extract_meta_definition(candidate, policy=policy)
+        if meta is None:
+            return None
+
+        lemma = (
+            meta.lemma
+            or extract_meta_lemma(definition_entry, policy=policy)
+            or extract_meta_lemma(entry, policy=policy)
+        ).strip()
+        if not lemma or lemma.lower() == word.strip().lower():
+            return None
+
+        resolved_meta = MetaDefinition(
+            pos_label=meta.pos_label,
+            lemma=lemma,
+            tags=meta.tags,
+            raw_body=meta.raw_body,
+        )
+        for lemma_candidate in self._wiktionary_definitions(lemma, language, _seen=seen):
+            if semantic_definition_reason(lemma_candidate, lemma) is not None:
+                continue
+            composed = compose_resolved_meta_definition(
+                lemma_candidate,
+                resolved_meta,
+                policy=policy,
+            )
+            if composed:
+                return composed
+        return None
 
     def _word_exists_wiktionary(self, word: str, language: str) -> bool:
         return bool(self._wiktionary_definitions(word, language))
@@ -1069,7 +1140,9 @@ class ProviderManager:
             "Return exactly one definition, no examples, no quotes, and no extra commentary."
         )
         semantic_rule = (
-            "Explain the meaning of the word itself, not grammar labels, not inflection notes, not etymology, and not whether the word exists."
+            "Explain the meaning of the word itself, not grammar labels, not inflection notes, not etymology, and not whether the word exists. "
+            "If the word is an inflected verb form, keep the meaning semantic and add only a short tense or aspect note like 'past tense' or 'perfective'. "
+            "If the word is an inflected non-verb form, define only the base meaning and omit case, number, or gender notes."
             if semantic_only
             else "Define the word directly."
         )
@@ -1101,6 +1174,8 @@ class ProviderManager:
             f"Word: '{word}'. Sentence: '{sentence}'. "
             f"Define the word as used in this sentence, in {target_name}. "
             "Do not describe grammar notes like 'third-person singular', 'plural of', or 'imperative of'. "
+            "For inflected verb forms, keep the definition semantic and add only a short tense or aspect note. "
+            "For inflected non-verb forms, define only the base meaning and omit case, number, and gender notes. "
             "Always prefix exactly one POS label from this list: "
             "noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, article, determiner, numeral, auxiliary verb, proper noun, masculine noun, feminine noun, plural noun, expression. "
             "Use the POS label in English, even if the definition itself is in another language. "
@@ -1171,6 +1246,7 @@ def _clean_wiktionary_text(
     if (resolved_policy.get("cleanup") or {}).get("strip_bracket_notes", True):
         text = re.sub(r"\[[^\]]+\]", " ", text)
         text = re.sub(r"\[[^\]]*$", " ", text)
+    text = strip_definition_usage_notes(text)
     for pattern, replacement in resolved_policy.get("spacing_replacements") or []:
         text = re.sub(str(pattern), str(replacement), text)
     text = re.sub(r"\s+", " ", text).strip()

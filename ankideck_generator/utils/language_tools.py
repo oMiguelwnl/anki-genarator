@@ -7,6 +7,8 @@ from typing import Iterable
 
 from wordfreq import zipf_frequency
 
+from .definition_tools import extract_meta_definition
+
 try:
     from langdetect import DetectorFactory, detect_langs
 except Exception:  # pragma: no cover - optional
@@ -361,6 +363,9 @@ def semantic_definition_reason(text: str, focus: str = "") -> str | None:
     cleaned = (text or "").strip()
     if not cleaned:
         return "definition_missing"
+
+    if extract_meta_definition(cleaned) is not None:
+        return "definition_nonsemantic"
 
     alpha_tokens = [token for token in tokenize(cleaned) if token.isalpha()]
     if len(alpha_tokens) < 3:

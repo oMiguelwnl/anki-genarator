@@ -1,6 +1,10 @@
 from ankideck_generator.utils.definition_tools import (
+    compact_meta_note,
+    compose_resolved_meta_definition,
     definition_has_pos,
+    extract_meta_definition,
     normalize_definition,
+    strip_definition_usage_notes,
 )
 
 
@@ -64,3 +68,31 @@ def test_normalize_definition_normalizes_list_spacing() -> None:
         max_words=12,
     )
     assert value == "adverb: maybe, perhaps, possibly."
+
+
+def test_extract_meta_definition_builds_compact_verb_note() -> None:
+    meta = extract_meta_definition(
+        "verb: masculine singular past indicative imperfective of говори́ть"
+    )
+    assert meta is not None
+    assert meta.lemma == "говори́ть"
+    assert compact_meta_note(meta) == "past tense, imperfective"
+
+
+def test_compose_resolved_meta_definition_omits_noun_case_note() -> None:
+    meta = extract_meta_definition("noun: genitive singular of управление")
+    assert meta is not None
+
+    value = compose_resolved_meta_definition(
+        "noun: control, administration",
+        meta,
+    )
+
+    assert value == "noun: control, administration"
+
+
+def test_strip_definition_usage_notes_removes_case_hints() -> None:
+    value = strip_definition_usage_notes(
+        "to buy, to purchase [with accusative 'something']"
+    )
+    assert "with accusative" not in value

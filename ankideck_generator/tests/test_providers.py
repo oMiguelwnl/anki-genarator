@@ -1,4 +1,5 @@
 import requests
+from urllib.parse import quote
 
 from ankideck_generator.core.providers import ProviderManager
 
@@ -159,6 +160,87 @@ def test_wiktionary_definition_adds_part_of_speech_and_prefers_semantic(monkeypa
     monkeypatch.setattr(provider._session, "get", fake_get)
     result = provider.definition("tout", "fr", allow_ai=False)
     assert result.value == "pronoun: all people or things in a group"
+
+
+def test_wiktionary_meta_definition_resolves_lemma_meaning_for_verbs(monkeypatch):
+    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
+
+    def fake_get(url, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                if url.endswith("/" + quote("говорил")):
+                    return {
+                        "ru": [
+                            {
+                                "partOfSpeech": "verb",
+                                "definitions": [
+                                    {
+                                        "definition": "masculine singular past indicative imperfective of говори́ть"
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                return {
+                    "ru": [
+                        {
+                            "partOfSpeech": "verb",
+                            "definitions": [
+                                {"definition": "to speak, to talk"}
+                            ],
+                        }
+                    ]
+                }
+
+        _ = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(provider._session, "get", fake_get)
+    result = provider.definition("говорил", "ru", allow_ai=False)
+    assert result.value == "verb: to speak, to talk, past tense, imperfective"
+
+
+def test_wiktionary_meta_definition_uses_formof_lemma_for_nouns(monkeypatch):
+    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
+
+    def fake_get(url, timeout=None):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                if url.endswith("/" + quote("управления")):
+                    return {
+                        "ru": [
+                            {
+                                "partOfSpeech": "noun",
+                                "definitions": [
+                                    {
+                                        "definition": "genitive singular",
+                                        "formOf": [{"word": "управление"}],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                return {
+                    "ru": [
+                        {
+                            "partOfSpeech": "noun",
+                            "definitions": [
+                                {"definition": "control, administration"}
+                            ],
+                        }
+                    ]
+                }
+
+        _ = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(provider._session, "get", fake_get)
+    result = provider.definition("управления", "ru", allow_ai=False)
+    assert result.value == "noun: control, administration"
 
 
 def test_wrap_does_not_retry_deterministic_empty_result() -> None:
