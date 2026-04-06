@@ -338,6 +338,47 @@ def test_sentence_tatoeba_uses_exact_query_and_pagination(monkeypatch) -> None:
     assert seen_params[1]["page"] == 2
 
 
+def test_sentence_tatoeba_relaxes_query_when_exact_is_not_strong(monkeypatch) -> None:
+    config = {
+        "providers": {
+            "tatoeba": {
+                "endpoint": "https://tatoeba.test/api_v0/search",
+                "exact_match": True,
+                "max_pages": 1,
+                "page_size": 10,
+            }
+        }
+    }
+    provider = ProviderManager(config, timeout_sec=1, retries=0)
+    seen_queries: list[str] = []
+
+    def fake_get(url, params=None, timeout=None):
+        _ = (url, timeout)
+        seen_queries.append(str((params or {}).get("query", "")))
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                if params.get("query") == "=cat":
+                    return {"results": [{"text": "The cat."}]}
+                return {
+                    "results": [
+                        {"text": "The cat sleeps here."},
+                        {"text": "The cat sleeps here."},
+                    ]
+                }
+
+        return FakeResponse()
+
+    monkeypatch.setattr(provider._session, "get", fake_get)
+    result = provider.sentence_web_candidates("cat", "en", min_words=3, max_words=6)
+
+    assert [candidate.text for candidate in result.candidates] == ["The cat sleeps here."]
+    assert result.candidates[0].query_mode == "relaxed"
+    assert seen_queries == ["=cat", "cat"]
+
+
 def test_fallback_reports_provider_disabled_when_all_candidates_are_disabled() -> None:
     provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
     provider._disabled_providers.update({"gtts", "responsivevoice"})

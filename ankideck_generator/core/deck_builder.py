@@ -26,8 +26,10 @@ from ..utils.language_tools import (
     compact_audio_basename,
     filter_frequent_words,
     is_closed_class_word,
+    score_sentence,
     semantic_definition_reason,
     text_matches_language,
+    tokenize,
     unique_keep_order,
 )
 from ..utils.logger import JsonLogger
@@ -122,6 +124,24 @@ DEFAULT_SOFT_VALIDATION_ERRORS = {
     "sentence_audio_missing",
 }
 
+SENTENCE_CACHE_SELECTION_VERSION = 2
+STRONG_TATOEBA_SELECTION_SCORE = 1.6
+TATOEBA_SELECTION_MARGIN = 0.20
+MAX_TATOEBA_REWRITE_CANDIDATES = 2
+
+
+@dataclass
+class SentenceSelectionCandidate:
+    text: str
+    provider_name: str
+    source_kind: str
+    selection_score: float
+    seeded_from_tatoeba: bool = False
+    query_mode: str = ""
+    validation_errors: list[str] = field(default_factory=list)
+    core_errors: list[str] = field(default_factory=list)
+    level_errors: list[str] = field(default_factory=list)
+
 
 @dataclass
 class BuildStats:
@@ -164,6 +184,69 @@ class AudioTaskResult:
     card: CardData
     log_record: LogRecord
     media_files: list[str] = field(default_factory=list)
+
+
+def _count_focus_mentions(text: str, focus: str) -> int:
+    sentence_tokens = [token.lower() for token in tokenize(text)]
+    focus_tokens = [token.lower() for token in tokenize(focus)]
+    if not sentence_tokens or not focus_tokens:
+        return 0
+    if len(focus_tokens) == 1:
+        return sentence_tokens.count(focus_tokens[0])
+    matches = 0
+    window = len(focus_tokens)
+    for index in range(0, len(sentence_tokens) - window + 1):
+        if sentence_tokens[index : index + window] == focus_tokens:
+            matches += 1
+    return matches
+
+
+def _sentence_selection_score(
+    sentence: str,
+    focus: str,
+    language: str,
+    level: int,
+    min_words: int,
+    max_words: int,
+) -> float:
+    base_score = score_sentence(
+        sentence,
+        focus,
+        language,
+        min_words=min_words,
+        max_words=max_words,
+    )
+    if base_score <= 0:
+        relaxed_min = max(1, min_words - 2)
+        relaxed_max = max(max_words + 6, max_words)
+        base_score = score_sentence(
+            sentence,
+            focus,
+            language,
+            min_words=relaxed_min,
+            max_words=relaxed_max,
+        ) * 0.9
+    if base_score <= 0:
+        return 0.0
+
+    penalty = 0.0
+    focus_mentions = _count_focus_mentions(sentence, focus)
+    if focus_mentions > 1:
+        penalty += min(0.36, float(focus_mentions - 1) * 0.12)
+
+    structural_punctuation = sum(1 for ch in sentence if ch in {",", ";", ":", "—", "–"})
+    penalty += min(0.24, float(structural_punctuation) * 0.06)
+
+    quote_or_paren_count = sum(1 for ch in sentence if ch in {'"', "“", "”", "(", ")"})
+    penalty += min(0.18, float(quote_or_paren_count) * 0.06)
+
+    if any(ch.isdigit() for ch in sentence):
+        penalty += 0.2
+
+    if level <= 2 and any(ch in sentence for ch in {",", ";", ":", "—", "–", "(", ")"}):
+        penalty += 0.12 if level == 1 else 0.06
+
+    return max(0.0, base_score - penalty)
 
 
 class ProgressStore:
@@ -1075,7 +1158,7 @@ class DeckBuilder:
         cache_version = max(1, int(run.cache_validation_version or 1))
         normalized_word = word.strip().lower()
         sentence_cache_key = (
-            f"{normalized_word}::lvl{level}::{sentence_min_words}-{sentence_max_words}::v{cache_version}"
+            f"{normalized_word}::lvl{level}::{sentence_min_words}-{sentence_max_words}::sv{SENTENCE_CACHE_SELECTION_VERSION}::v{cache_version}"
         )
 
         def allow_ai(field: str) -> bool:
@@ -1191,10 +1274,6 @@ class DeckBuilder:
             level_errors = [error for error in errors if error in level_only_sentence_errors]
             return text, errors, core_errors, level_errors
 
-        def finalize_sentence(candidate: str) -> tuple[str, str | None]:
-            text, errors, _core_errors, _level_errors = analyze_sentence(candidate)
-            return (text, None) if not errors else ("", errors[0])
-
         def finalize_definition(
             candidate: str, expected_language: str
         ) -> tuple[str, str | None]:
@@ -1267,6 +1346,134 @@ class DeckBuilder:
 
         sentence = ""
         last_sentence_issue: str | None = None
+        valid_sentence_candidates: dict[str, SentenceSelectionCandidate] = {}
+        rewrite_seed_candidates: dict[str, SentenceSelectionCandidate] = {}
+        best_invalid_sentence_candidate: SentenceSelectionCandidate | None = None
+
+        def remember_valid_sentence_candidate(
+            candidate: SentenceSelectionCandidate,
+        ) -> None:
+            key = candidate.text.casefold()
+            existing = valid_sentence_candidates.get(key)
+            if existing is None or candidate.selection_score > existing.selection_score:
+                valid_sentence_candidates[key] = candidate
+
+        def remember_rewrite_seed(candidate: SentenceSelectionCandidate) -> None:
+            key = candidate.text.casefold()
+            existing = rewrite_seed_candidates.get(key)
+            if existing is None or candidate.selection_score > existing.selection_score:
+                rewrite_seed_candidates[key] = candidate
+
+        def remember_invalid_sentence_candidate(
+            candidate: SentenceSelectionCandidate,
+        ) -> None:
+            nonlocal last_sentence_issue, best_invalid_sentence_candidate
+            if not candidate.validation_errors:
+                return
+            if (
+                best_invalid_sentence_candidate is None
+                or candidate.selection_score
+                > best_invalid_sentence_candidate.selection_score
+            ):
+                best_invalid_sentence_candidate = candidate
+                last_sentence_issue = candidate.validation_errors[0]
+
+        def evaluate_sentence_candidate(
+            candidate_text: str,
+            *,
+            provider_name: str,
+            source_kind: str,
+            seeded_from_tatoeba: bool = False,
+            query_mode: str = "",
+        ) -> SentenceSelectionCandidate:
+            text, errors, core_errors, level_errors = analyze_sentence(candidate_text)
+            final_text = text or (candidate_text or "").strip()
+            return SentenceSelectionCandidate(
+                text=final_text,
+                provider_name=provider_name,
+                source_kind=source_kind,
+                selection_score=_sentence_selection_score(
+                    final_text,
+                    word,
+                    run.language,
+                    level,
+                    sentence_min_words,
+                    sentence_max_words,
+                ),
+                seeded_from_tatoeba=seeded_from_tatoeba,
+                query_mode=query_mode,
+                validation_errors=errors,
+                core_errors=core_errors,
+                level_errors=level_errors,
+            )
+
+        def submit_sentence_candidate(
+            candidate: SentenceSelectionCandidate,
+        ) -> None:
+            if not candidate.text:
+                remember_invalid_sentence_candidate(candidate)
+                return
+            if not candidate.validation_errors:
+                remember_valid_sentence_candidate(candidate)
+                return
+            if (
+                candidate.source_kind == "tatoeba"
+                and candidate.level_errors
+                and not candidate.core_errors
+            ):
+                remember_rewrite_seed(candidate)
+            remember_invalid_sentence_candidate(candidate)
+
+        def ranked_sentence_candidates(
+            candidates: dict[str, SentenceSelectionCandidate],
+        ) -> list[SentenceSelectionCandidate]:
+            return sorted(
+                candidates.values(),
+                key=lambda candidate: candidate.selection_score,
+                reverse=True,
+            )
+
+        def choose_sentence_candidate() -> SentenceSelectionCandidate | None:
+            ranked = ranked_sentence_candidates(valid_sentence_candidates)
+            if not ranked:
+                return None
+            best_tatoeba = next(
+                (candidate for candidate in ranked if candidate.source_kind == "tatoeba"),
+                None,
+            )
+            best_other = next(
+                (candidate for candidate in ranked if candidate.source_kind != "tatoeba"),
+                None,
+            )
+            if best_tatoeba and best_other:
+                if (
+                    best_tatoeba.selection_score + TATOEBA_SELECTION_MARGIN
+                    >= best_other.selection_score
+                ):
+                    return best_tatoeba
+                return best_other
+            return best_tatoeba or best_other or ranked[0]
+
+        def finalize_selected_sentence(
+            candidate: SentenceSelectionCandidate,
+        ) -> str:
+            nonlocal sentence, last_sentence_issue
+            sentence = candidate.text
+            last_sentence_issue = None
+            if candidate.source_kind == "tatoeba":
+                count_event("sentence_tatoeba_hit")
+            elif candidate.source_kind == "rewrite":
+                count_event("sentence_ai_rewrite_hit")
+            elif candidate.source_kind == "ai":
+                count_event("sentence_ai_generate_hit")
+            if candidate.seeded_from_tatoeba:
+                count_event("sentence_tatoeba_seeded_hit")
+            if candidate.query_mode == "relaxed" and (
+                candidate.source_kind == "tatoeba" or candidate.seeded_from_tatoeba
+            ):
+                count_event("sentence_tatoeba_relaxed_query_hit")
+            cache.set("sentences", sentence_cache_key, sentence)
+            return sentence
 
         def build_sentence() -> str:
             nonlocal sentence, last_sentence_issue
@@ -1283,69 +1490,110 @@ class DeckBuilder:
             last_sentence_issue = cached_errors[0] if cached_errors else None
 
             count_event("sentence_tatoeba_attempted")
-            result = providers.sentence_web(
-                word,
-                run.language,
-                min_words=sentence_min_words,
-                max_words=sentence_max_words,
-            )
-            trace_result("sentence", result, stage_key="sentence_web_ms")
-            web_text, web_errors, web_core_errors, web_level_errors = analyze_sentence(
-                result.value or ""
-            )
-            if not web_errors:
-                sentence = web_text
-                last_sentence_issue = None
-                if result.provider_name == "tatoeba":
-                    count_event("sentence_tatoeba_hit")
-                cache.set("sentences", sentence_cache_key, sentence)
-                return sentence
-            last_sentence_issue = web_errors[0] if web_errors else None
-
-            sentence_rewrite = getattr(providers, "sentence_rewrite", None)
-            should_rewrite = (
-                web_text
-                and web_level_errors
-                and not web_core_errors
-                and run.sentence_rewrite_from_web
-                and callable(sentence_rewrite)
-                and allow_ai("sentence")
-            )
-            if should_rewrite:
-                count_event("sentence_ai_rewrite_attempted")
-                result = sentence_rewrite(
-                    web_text,
+            sentence_web_candidates = getattr(providers, "sentence_web_candidates", None)
+            if callable(sentence_web_candidates):
+                result = sentence_web_candidates(
                     word,
                     run.language,
-                    level=level,
                     min_words=sentence_min_words,
                     max_words=sentence_max_words,
                 )
-                trace_result(
-                    "sentence_rewrite",
-                    result,
-                    ai_field="sentence",
-                    stage_key="sentence_rewrite_ms",
+                trace_result("sentence", result, stage_key="sentence_web_ms")
+                for web_candidate in list(getattr(result, "candidates", []) or []):
+                    source_kind = (
+                        "tatoeba"
+                        if getattr(web_candidate, "source", "") == "tatoeba"
+                        or web_candidate.provider_name == "tatoeba"
+                        else getattr(web_candidate, "source", web_candidate.provider_name)
+                    )
+                    submit_sentence_candidate(
+                        evaluate_sentence_candidate(
+                            web_candidate.text,
+                            provider_name=web_candidate.provider_name,
+                            source_kind=source_kind,
+                            query_mode=getattr(web_candidate, "query_mode", ""),
+                        )
+                    )
+            else:
+                result = providers.sentence_web(
+                    word,
+                    run.language,
+                    min_words=sentence_min_words,
+                    max_words=sentence_max_words,
                 )
-                rewritten_text, rewritten_errors, _rewrite_core, _rewrite_level = (
-                    analyze_sentence(result.value or "")
-                )
-                if not rewritten_errors:
-                    sentence = rewritten_text
-                    last_sentence_issue = None
-                    count_event("sentence_ai_rewrite_hit")
-                    cache.set("sentences", sentence_cache_key, sentence)
-                    return sentence
-                last_sentence_issue = (
-                    rewritten_errors[0] if rewritten_errors else last_sentence_issue
-                )
+                trace_result("sentence", result, stage_key="sentence_web_ms")
+                if result.value:
+                    source_kind = (
+                        "tatoeba"
+                        if result.provider_name == "tatoeba"
+                        else result.provider_name
+                    )
+                    submit_sentence_candidate(
+                        evaluate_sentence_candidate(
+                            result.value or "",
+                            provider_name=result.provider_name,
+                            source_kind=source_kind,
+                        )
+                    )
 
+            sentence_rewrite = getattr(providers, "sentence_rewrite", None)
+            best_tatoeba_candidate = next(
+                (
+                    candidate
+                    for candidate in ranked_sentence_candidates(valid_sentence_candidates)
+                    if candidate.source_kind == "tatoeba"
+                ),
+                None,
+            )
+            strong_tatoeba_available = bool(
+                best_tatoeba_candidate
+                and best_tatoeba_candidate.selection_score >= STRONG_TATOEBA_SELECTION_SCORE
+            )
+            if strong_tatoeba_available:
+                count_event("sentence_ai_skipped_good_tatoeba")
+            elif run.sentence_rewrite_from_web and callable(sentence_rewrite):
+                rewrite_candidates = ranked_sentence_candidates(rewrite_seed_candidates)[
+                    :MAX_TATOEBA_REWRITE_CANDIDATES
+                ]
+                for rewrite_candidate in rewrite_candidates:
+                    if not allow_ai("sentence"):
+                        break
+                    count_event("sentence_ai_rewrite_attempted")
+                    result = sentence_rewrite(
+                        rewrite_candidate.text,
+                        word,
+                        run.language,
+                        level=level,
+                        min_words=sentence_min_words,
+                        max_words=sentence_max_words,
+                    )
+                    trace_result(
+                        "sentence_rewrite",
+                        result,
+                        ai_field="sentence",
+                        stage_key="sentence_rewrite_ms",
+                    )
+                    submit_sentence_candidate(
+                        evaluate_sentence_candidate(
+                            result.value or "",
+                            provider_name=result.provider_name,
+                            source_kind="rewrite",
+                            seeded_from_tatoeba=True,
+                            query_mode=rewrite_candidate.query_mode,
+                        )
+                    )
+
+            has_valid_rewrite_candidate = any(
+                candidate.source_kind == "rewrite"
+                for candidate in valid_sentence_candidates.values()
+            )
             sentence_attempts = 0
             max_sentence_ai_attempts = max(0, int(run.sentence_ai_attempts or 0))
             while (
-                sentence_attempts < max_sentence_ai_attempts
+                not strong_tatoeba_available
+                and not has_valid_rewrite_candidate
+                and sentence_attempts < max_sentence_ai_attempts
                 and allow_ai("sentence")
-                and not sentence
             ):
                 count_event("sentence_ai_generate_attempted")
                 result = providers.sentence_ai(
@@ -1360,18 +1608,14 @@ class DeckBuilder:
                     ai_field="sentence",
                     stage_key="sentence_ai_ms",
                 )
-                generated_text, generated_errors, _gen_core, _gen_level = analyze_sentence(
-                    result.value or ""
+                generated_candidate = evaluate_sentence_candidate(
+                    result.value or "",
+                    provider_name=result.provider_name,
+                    source_kind="ai",
                 )
-                if not generated_errors:
-                    sentence = generated_text
-                    last_sentence_issue = None
-                    count_event("sentence_ai_generate_hit")
-                    cache.set("sentences", sentence_cache_key, sentence)
+                submit_sentence_candidate(generated_candidate)
+                if not generated_candidate.validation_errors:
                     break
-                last_sentence_issue = (
-                    generated_errors[0] if generated_errors else last_sentence_issue
-                )
                 error_text = (result.error or "").lower()
                 if error_text and any(
                     token in error_text
@@ -1385,17 +1629,26 @@ class DeckBuilder:
                 ):
                     break
                 sentence_attempts += 1
+
+            selected_candidate = choose_sentence_candidate()
+            if selected_candidate is not None:
+                return finalize_selected_sentence(selected_candidate)
+
             if not sentence and run.sentence_template_fallback:
                 templated = _sentence_template_fallback(word, run.language, level)
                 if templated:
-                    templated_text, templated_errors, _templ_core, _templ_level = (
-                        analyze_sentence(templated)
+                    templated_candidate = evaluate_sentence_candidate(
+                        templated,
+                        provider_name="template",
+                        source_kind="template",
                     )
-                    if not templated_errors:
-                        sentence = templated_text
+                    if not templated_candidate.validation_errors:
+                        sentence = templated_candidate.text
                         last_sentence_issue = None
                         count_event("sentence_template_fallback_hit")
                         cache.set("sentences", sentence_cache_key, sentence)
+                    else:
+                        remember_invalid_sentence_candidate(templated_candidate)
             return sentence
 
         if run.exclude_closed_class_words and is_closed_class_word(word, run.language):
@@ -2068,10 +2321,13 @@ class DeckBuilder:
         sentence_event_keys = [
             "sentence_tatoeba_attempted",
             "sentence_tatoeba_hit",
+            "sentence_tatoeba_seeded_hit",
+            "sentence_tatoeba_relaxed_query_hit",
             "sentence_ai_rewrite_attempted",
             "sentence_ai_rewrite_hit",
             "sentence_ai_generate_attempted",
             "sentence_ai_generate_hit",
+            "sentence_ai_skipped_good_tatoeba",
             "sentence_template_fallback_hit",
         ]
         sentence_events = [
@@ -2085,6 +2341,7 @@ class DeckBuilder:
                 print(f"  {name}: {count}")
             attempts = event_counter.get("sentence_tatoeba_attempted", 0)
             tatoeba_hits = event_counter.get("sentence_tatoeba_hit", 0)
+            tatoeba_seeded_hits = event_counter.get("sentence_tatoeba_seeded_hit", 0)
             rewrite_hits = event_counter.get("sentence_ai_rewrite_hit", 0)
             ai_hits = event_counter.get("sentence_ai_generate_hit", 0)
             template_hits = event_counter.get("sentence_template_fallback_hit", 0)
@@ -2098,6 +2355,10 @@ class DeckBuilder:
                     f"rewrite={rewrite_hits / total_hits * 100.0:.1f}%, "
                     f"ai={ai_hits / total_hits * 100.0:.1f}%, "
                     f"template={template_hits / total_hits * 100.0:.1f}%"
+                )
+                print(
+                    "  tatoeba_seeded_share: "
+                    f"{(tatoeba_hits + tatoeba_seeded_hits) / total_hits * 100.0:.1f}%"
                 )
             for level in sorted(event_counter_by_level.keys()):
                 level_events = event_counter_by_level.get(level, Counter())

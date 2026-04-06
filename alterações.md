@@ -1,4 +1,3 @@
-De acordo com o ultimo deck gerado, o Fontes de Frases:
+- Na definition das palavras que sao verbos quero que o definition seja, verb: o significado do verbo e dizer qual tempo verbal ele está e de qual verbo, exemplo palavra "falou": exprimir por meio de palavras no tempo passado perfeito
 
-tatoeba_hit_rate: A taxa de acerto no Tatoeba foi de 12.5%, uma melhora significativa em relação ao relatório anterior (que era de 0.4%). Isso pode indicar que as palavras neste lote eram mais comuns.
-source_mix: A IA ainda é a principal fonte para gerar frases (86.7%), mas o Tatoeba teve uma contribuição mais relevante desta vez, Faça com que isso aumente, crie um plano que faça com que o ele selecione a melhor frase da palavra,
+- Tem palavras como управления onde o DEFINITIONS é: noun: genitive singular. Quero que a definition seja o significado da palavra e nao dizer que ele é genitivo etc.

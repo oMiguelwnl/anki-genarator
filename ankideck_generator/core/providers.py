@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -70,6 +71,27 @@ TATOEBA_STEMMING_LANGUAGES = {
     "de",
     "ru",
 }
+
+TATOEBA_MAX_CANDIDATES = 5
+TATOEBA_STRONG_SENTENCE_SCORE = 1.6
+
+
+@dataclass
+class SentenceCandidate:
+    text: str
+    provider_name: str
+    score: float
+    source: str = "tatoeba"
+    query_mode: str = "exact"
+
+
+@dataclass
+class SentenceCandidatesResult:
+    candidates: list[SentenceCandidate]
+    provider_name: str
+    elapsed_ms: int
+    error: str | None = None
+    fallback_errors: dict[str, str] | None = None
 
 
 class ProviderManager:
@@ -168,6 +190,49 @@ class ProviderManager:
                     break
         elapsed = int((time.time() - start) * 1000)
         return ProviderResult(value=None, provider_name=provider_name, elapsed_ms=elapsed, error=str(last_exc))
+
+    def _wrap_candidates(
+        self,
+        provider_name: str,
+        fn: Callable[[], list[SentenceCandidate] | None],
+    ) -> SentenceCandidatesResult:
+        if provider_name in self._disabled_providers:
+            return SentenceCandidatesResult(
+                candidates=[],
+                provider_name=provider_name,
+                elapsed_ms=0,
+                error="provider_disabled",
+            )
+        start = time.time()
+        last_exc: Exception | None = None
+        retries = self._retries_for(provider_name)
+        for attempt in range(retries + 1):
+            try:
+                candidates = fn() or []
+                if not candidates:
+                    raise ProviderError("empty result")
+                self._register_provider_success(provider_name)
+                elapsed = int((time.time() - start) * 1000)
+                return SentenceCandidatesResult(
+                    candidates=candidates,
+                    provider_name=provider_name,
+                    elapsed_ms=elapsed,
+                )
+            except Exception as exc:  # pragma: no cover - network errors
+                last_exc = exc
+                message = str(exc)
+                self._register_provider_failure(provider_name, message, exc)
+                if self._is_deterministic_error(message):
+                    break
+                if attempt >= retries:
+                    break
+        elapsed = int((time.time() - start) * 1000)
+        return SentenceCandidatesResult(
+            candidates=[],
+            provider_name=provider_name,
+            elapsed_ms=elapsed,
+            error=str(last_exc),
+        )
 
     def _timeout_for(self, provider_name: str) -> int:
         return int(self.timeout_overrides.get(provider_name, self.timeout_sec))
@@ -382,16 +447,41 @@ class ProviderManager:
         min_words: int | None = None,
         max_words: int | None = None,
     ) -> ProviderResult:
-        providers = [
-            (
-                "tatoeba",
-                lambda: self._sentence_tatoeba(
-                    word, language, min_words=min_words, max_words=max_words
-                ),
+        candidates_result = self.sentence_web_candidates(
+            word,
+            language,
+            min_words=min_words,
+            max_words=max_words,
+        )
+        if candidates_result.candidates:
+            best = candidates_result.candidates[0]
+            return ProviderResult(
+                value=best.text,
+                provider_name=best.provider_name,
+                elapsed_ms=candidates_result.elapsed_ms,
+                fallback_errors=candidates_result.fallback_errors,
+            )
+        return self._fallback(
+            [("wordincontext", lambda: self._sentence_wordincontext(word, language))]
+        )
+
+    def sentence_web_candidates(
+        self,
+        word: str,
+        language: str,
+        *,
+        min_words: int | None = None,
+        max_words: int | None = None,
+    ) -> SentenceCandidatesResult:
+        return self._wrap_candidates(
+            "tatoeba",
+            lambda: self._sentence_tatoeba_candidates(
+                word,
+                language,
+                min_words=min_words,
+                max_words=max_words,
             ),
-            ("wordincontext", lambda: self._sentence_wordincontext(word, language)),
-        ]
-        return self._fallback(providers)
+        )
 
     def translation_ai(self, text: str, src: str, dest: str) -> ProviderResult:
         return self._wrap("ai", lambda: self._translate_ai(text, src, dest))
@@ -718,16 +808,30 @@ class ProviderManager:
         min_words: int | None = None,
         max_words: int | None = None,
     ) -> str | None:
+        candidates = self._sentence_tatoeba_candidates(
+            word,
+            language,
+            min_words=min_words,
+            max_words=max_words,
+        )
+        return candidates[0].text if candidates else None
+
+    def _sentence_tatoeba_candidates(
+        self,
+        word: str,
+        language: str,
+        *,
+        min_words: int | None = None,
+        max_words: int | None = None,
+    ) -> list[SentenceCandidate]:
         config = self.config.get("providers", {}).get("tatoeba", {})
         endpoint = config.get("endpoint")
         if not endpoint:
-            return None
+            return []
         source_language = TATOEBA_LANGUAGE_CODES.get(language, language)
-        query = _tatoeba_query(word, language, bool(config.get("exact_match", False)))
         page_size = max(1, int(config.get("page_size", 20) or 20))
         max_pages = max(1, int(config.get("max_pages", 1) or 1))
         params = {
-            "query": query,
             "from": source_language,
             "sort": "relevance",
             "limit": page_size,
@@ -739,49 +843,79 @@ class ProviderManager:
         if bool(config.get("exclude_unapproved", False)):
             params["unapproved"] = "no"
 
-        best_sentence: str | None = None
-        best_score = 0.0
-        seen_sentences: set[str] = set()
         resolved_min_words = min_words or 5
         resolved_max_words = max_words or 25
+        exact_match = bool(config.get("exact_match", False))
+        query_modes = [("exact", exact_match)]
+        if exact_match:
+            query_modes.append(("relaxed", False))
 
-        for page in range(1, max_pages + 1):
-            page_params = dict(params)
-            page_params["page"] = page
-            resp = self._session.get(
-                endpoint,
-                params=page_params,
-                timeout=self._timeout_for("tatoeba"),
-            )
-            if resp.status_code != 200:
-                return None if page == 1 else best_sentence
-            data = resp.json()
-            results = data.get("results") or []
-            if not results:
-                break
-            for item in results:
-                sentence = _extract_tatoeba_sentence(item)
-                if not sentence or sentence in seen_sentences:
-                    continue
-                seen_sentences.add(sentence)
-                if not text_contains_focus(sentence, word):
-                    continue
-                score = score_sentence(
-                    sentence,
-                    word,
-                    language,
-                    min_words=resolved_min_words,
-                    max_words=resolved_max_words,
+        candidates_by_text: dict[str, SentenceCandidate] = {}
+        strong_exact_candidate = False
+
+        for query_mode, use_exact_query in query_modes:
+            query = _tatoeba_query(word, language, use_exact_query)
+            if not query:
+                continue
+            for page in range(1, max_pages + 1):
+                page_params = dict(params)
+                page_params["query"] = query
+                page_params["page"] = page
+                resp = self._session.get(
+                    endpoint,
+                    params=page_params,
+                    timeout=self._timeout_for("tatoeba"),
                 )
-                if score <= 0:
-                    continue
-                score -= min(0.15, float(page - 1) * 0.03)
-                if score > best_score:
-                    best_score = score
-                    best_sentence = sentence
-            if len(results) < page_size:
+                if resp.status_code != 200:
+                    if page == 1 and not candidates_by_text:
+                        return []
+                    break
+                data = resp.json()
+                results = data.get("results") or []
+                if not results:
+                    break
+                for item in results:
+                    sentence = _extract_tatoeba_sentence(item)
+                    if not sentence or not text_contains_focus(sentence, word):
+                        continue
+                    score = score_sentence(
+                        sentence,
+                        word,
+                        language,
+                        min_words=resolved_min_words,
+                        max_words=resolved_max_words,
+                    )
+                    if score <= 0:
+                        continue
+                    score -= min(0.15, float(page - 1) * 0.03)
+                    if query_mode == "relaxed":
+                        score -= 0.04
+                    candidate = SentenceCandidate(
+                        text=sentence,
+                        provider_name="tatoeba",
+                        score=score,
+                        source="tatoeba",
+                        query_mode=query_mode,
+                    )
+                    existing = candidates_by_text.get(sentence)
+                    if existing is None or candidate.score > existing.score:
+                        candidates_by_text[sentence] = candidate
+                    if (
+                        query_mode == "exact"
+                        and candidate.score >= TATOEBA_STRONG_SENTENCE_SCORE
+                    ):
+                        strong_exact_candidate = True
+                if len(results) < page_size:
+                    break
+            if query_mode == "exact" and strong_exact_candidate:
                 break
-        return best_sentence if best_score > 0 else None
+
+        ranked_candidates = sorted(
+            candidates_by_text.values(),
+            key=lambda candidate: candidate.score,
+            reverse=True,
+        )
+        return ranked_candidates[:TATOEBA_MAX_CANDIDATES]
 
     def _sentence_wordincontext(self, word: str, language: str) -> str | None:
         # Placeholder for paid API; return None to trigger fallback.

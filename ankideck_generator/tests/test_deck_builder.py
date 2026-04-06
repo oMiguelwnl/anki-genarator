@@ -155,8 +155,10 @@ def test_print_summary_includes_sentence_source_stats(tmp_path: Path, capsys) ->
             {
                 "sentence_tatoeba_attempted": 12,
                 "sentence_tatoeba_hit": 7,
+                "sentence_tatoeba_seeded_hit": 4,
                 "sentence_ai_rewrite_hit": 3,
                 "sentence_ai_generate_hit": 2,
+                "sentence_ai_skipped_good_tatoeba": 6,
                 "sentence_template_fallback_hit": 5,
             }
         ),
@@ -176,6 +178,7 @@ def test_print_summary_includes_sentence_source_stats(tmp_path: Path, capsys) ->
     assert "sentence_ai_generate_hit: 2" in output
     assert "sentence_template_fallback_hit: 5" in output
     assert "source_mix: tatoeba=41.2%, rewrite=17.6%, ai=11.8%, template=29.4%" in output
+    assert "tatoeba_seeded_share: 64.7%" in output
 
 
 def test_process_word_uses_source_language_for_definition(tmp_path: Path) -> None:
@@ -906,6 +909,294 @@ def test_process_word_rewrites_tatoeba_sentence_when_only_level_validation_fails
     assert "sentence_ai_generate_attempted" not in log.event_counts
 
 
+def test_process_word_skips_sentence_ai_when_tatoeba_is_strong_enough(
+    tmp_path: Path, monkeypatch
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path)
+    ctx = ValidationContext()
+    tatoeba_sentence = "Hoy me siento bien en casa."
+
+    monkeypatch.setattr(
+        deck_builder_module,
+        "_sentence_selection_score",
+        lambda text, *_args, **_kwargs: 1.72 if text == tatoeba_sentence else 1.0,
+    )
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "ai"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class Candidate:
+        def __init__(self, text: str, query_mode: str = "exact"):
+            self.text = text
+            self.provider_name = "tatoeba"
+            self.source = "tatoeba"
+            self.query_mode = query_mode
+
+    class CandidateResult:
+        def __init__(self, candidates):
+            self.candidates = candidates
+            self.provider_name = "tatoeba"
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("adjective: en buen estado o calidad")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/bjen/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("byen")
+
+        def sentence_web_candidates(self, word, language, **kwargs):
+            _ = (word, language, kwargs)
+            return CandidateResult([Candidate(tatoeba_sentence)])
+
+        def sentence_rewrite(self, *args, **kwargs):
+            raise AssertionError("sentence_rewrite should not run for a strong Tatoeba hit")
+
+        def sentence_ai(self, *args, **kwargs):
+            raise AssertionError("sentence_ai should not run for a strong Tatoeba hit")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            if text.startswith("adjective:"):
+                return Result("adjective: in good condition or quality", provider_name="googletrans")
+            return Result("I feel good at home today.", provider_name="googletrans")
+
+        def translation_ai(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("I feel good at home today.", provider_name="ai")
+
+    card, log = builder._process_word(
+        word="bien",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=FakeProviders(),
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert card.sentence == tatoeba_sentence
+    assert log.event_counts["sentence_tatoeba_hit"] == 1
+    assert log.event_counts["sentence_ai_skipped_good_tatoeba"] == 1
+    assert "sentence_ai_generate_attempted" not in log.event_counts
+
+
+def test_process_word_prefers_tatoeba_when_ai_margin_is_small(
+    tmp_path: Path, monkeypatch
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path)
+    ctx = ValidationContext()
+    tatoeba_sentence = "Hoy me siento bien en casa."
+    ai_sentence = "Hoy bien parece normal en casa."
+    scores = {
+        tatoeba_sentence: 1.55,
+        ai_sentence: 1.70,
+    }
+
+    monkeypatch.setattr(
+        deck_builder_module,
+        "_sentence_selection_score",
+        lambda text, *_args, **_kwargs: scores.get(text, 0.0),
+    )
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "ai"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class Candidate:
+        def __init__(self, text: str):
+            self.text = text
+            self.provider_name = "tatoeba"
+            self.source = "tatoeba"
+            self.query_mode = "exact"
+
+    class CandidateResult:
+        def __init__(self, candidates):
+            self.candidates = candidates
+            self.provider_name = "tatoeba"
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("adjective: en buen estado o calidad")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/bjen/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("byen")
+
+        def sentence_web_candidates(self, word, language, **kwargs):
+            _ = (word, language, kwargs)
+            return CandidateResult([Candidate(tatoeba_sentence)])
+
+        def sentence_ai(self, word, language, **kwargs):
+            _ = (word, language, kwargs)
+            return Result(ai_sentence, provider_name="ai")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            if text.startswith("adjective:"):
+                return Result("adjective: in good condition or quality", provider_name="googletrans")
+            return Result("I feel good at home today.", provider_name="googletrans")
+
+        def translation_ai(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("I feel good at home today.", provider_name="ai")
+
+    card, log = builder._process_word(
+        word="bien",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=FakeProviders(),
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert card.sentence == tatoeba_sentence
+    assert log.event_counts["sentence_tatoeba_hit"] == 1
+    assert log.event_counts["sentence_ai_generate_attempted"] == 1
+    assert "sentence_ai_generate_hit" not in log.event_counts
+
+
+def test_process_word_uses_ai_when_it_is_materially_better_than_tatoeba(
+    tmp_path: Path, monkeypatch
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path)
+    ctx = ValidationContext()
+    tatoeba_sentence = "Hoy me siento bien en casa."
+    ai_sentence = "Hoy bien parece estable en casa."
+    scores = {
+        tatoeba_sentence: 1.42,
+        ai_sentence: 1.78,
+    }
+
+    monkeypatch.setattr(
+        deck_builder_module,
+        "_sentence_selection_score",
+        lambda text, *_args, **_kwargs: scores.get(text, 0.0),
+    )
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "ai"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class Candidate:
+        def __init__(self, text: str):
+            self.text = text
+            self.provider_name = "tatoeba"
+            self.source = "tatoeba"
+            self.query_mode = "exact"
+
+    class CandidateResult:
+        def __init__(self, candidates):
+            self.candidates = candidates
+            self.provider_name = "tatoeba"
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("adjective: en buen estado o calidad")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/bjen/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("byen")
+
+        def sentence_web_candidates(self, word, language, **kwargs):
+            _ = (word, language, kwargs)
+            return CandidateResult([Candidate(tatoeba_sentence)])
+
+        def sentence_ai(self, word, language, **kwargs):
+            _ = (word, language, kwargs)
+            return Result(ai_sentence, provider_name="ai")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            if text.startswith("adjective:"):
+                return Result("adjective: in good condition or quality", provider_name="googletrans")
+            return Result("I feel good at home today.", provider_name="googletrans")
+
+        def translation_ai(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("I feel good at home today.", provider_name="ai")
+
+    card, log = builder._process_word(
+        word="bien",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=FakeProviders(),
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert card.sentence == ai_sentence
+    assert log.event_counts["sentence_ai_generate_attempted"] == 1
+    assert log.event_counts["sentence_ai_generate_hit"] == 1
+    assert "sentence_tatoeba_hit" not in log.event_counts
+
+
 def test_process_word_retries_meta_definition_with_semantic_ai(tmp_path: Path) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
@@ -1261,6 +1552,84 @@ def test_parallel_build_only_generates_audio_for_textually_valid_cards(monkeypat
     assert audio_calls == ["bom", "yate", "wafle"]
 
 
+def test_process_word_ignores_legacy_sentence_cache_key(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path, language="fr")
+    ctx = ValidationContext()
+
+    legacy_sentence = "Ce dossier exclus reste prive."
+    legacy_sentence_key = "exclus::lvl1::2-7::v3"
+
+    class FakeCache:
+        def __init__(self):
+            self.data = {"sentences": {legacy_sentence_key: legacy_sentence}}
+
+        def get(self, kind, key):
+            return self.data.get(kind, {}).get(key)
+
+        def set(self, kind, key, value):
+            self.data.setdefault(kind, {})[key] = value
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "tatoeba"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        sentence_web_calls = 0
+
+        def word_exists(self, word, language):
+            _ = (word, language)
+            return Result(word, provider_name="wiktionary")
+
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("adjective: reserve a un usage interne.", provider_name="wiktionary")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            self.sentence_web_calls += 1
+            return Result("Ce dossier exclus reste prive.", provider_name="tatoeba")
+
+        def sentence_ai(self, *args, **kwargs):
+            raise AssertionError("sentence_ai should not run on a valid rebuilt sentence")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            if text.startswith("adjective:"):
+                return Result("adjective: restricted to internal use only", provider_name="googletrans")
+            return Result("This restricted file stays private.", provider_name="googletrans")
+
+        def translation_ai(self, *args, **kwargs):
+            raise AssertionError("translation_ai should not run")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/ekskly/", provider_name="ai")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("eks-KLU", provider_name="ai")
+
+    providers = FakeProviders()
+    card, _log = builder._process_word(
+        word="exclus",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=providers,
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert providers.sentence_web_calls == 1
+
+
 def test_process_word_ignores_invalid_cached_translation_and_regenerates(tmp_path: Path) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
@@ -1270,7 +1639,7 @@ def test_process_word_ignores_invalid_cached_translation_and_regenerates(tmp_pat
     sentence = "Ce dossier exclus reste prive."
     source_key = "exclus::fr::v3"
     definition_key = "exclus::en::v3"
-    sentence_key = "exclus::lvl1::2-7::v3"
+    sentence_key = "exclus::lvl1::2-7::sv2::v3"
     translation_key = f"{sentence}::fr->en::v3"
 
     class FakeCache:
