@@ -1802,6 +1802,160 @@ def test_process_word_uses_english_gloss_as_final_definition(tmp_path: Path) -> 
     assert providers.translation_web_calls == 1
 
 
+def test_process_word_accepts_single_word_definition_gloss(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path, language="ru")
+    ctx = ValidationContext()
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "wiktionary"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        def word_exists(self, word, language):
+            _ = (word, language)
+            return Result(word, provider_name="wiktionary")
+
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("adverb: already", provider_name="ai")
+
+        def definition_ai(self, *args, **kwargs):
+            raise AssertionError("definition_ai should not run when one-word gloss is valid")
+
+        def definition_from_context(self, *args, **kwargs):
+            raise AssertionError("definition_from_context should not run when one-word gloss is valid")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result(f"\u041e\u043d \u0443\u0436\u0435 \u0434\u043e\u043c\u0430.", provider_name="tatoeba")
+
+        def sentence_ai(self, *args, **kwargs):
+            raise AssertionError("sentence_ai should not run on valid sentence")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("He is already home.", provider_name="googletrans")
+
+        def translation_ai(self, *args, **kwargs):
+            raise AssertionError("translation_ai should not run")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/u\u0290e/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("oo-ZHE")
+
+    card, log = builder._process_word(
+        word="\u0443\u0436\u0435",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=FakeProviders(),
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert card.definition == "adverb: already."
+    assert "definition_wrong_language" not in log.validations
+
+
+def test_process_word_translates_single_word_source_definition(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path, language="es")
+    ctx = ValidationContext()
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "wiktionary"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        translation_ai_calls = 0
+
+        def word_exists(self, word, language):
+            _ = (word, language)
+            return Result(word, provider_name="wiktionary")
+
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("adverb: ya", provider_name="wiktionary")
+
+        def definition_ai(self, *args, **kwargs):
+            raise AssertionError("definition_ai should not run when source gloss is usable")
+
+        def definition_from_context(self, *args, **kwargs):
+            raise AssertionError("definition_from_context should not run when source gloss is usable")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result("Ya estoy en casa.", provider_name="tatoeba")
+
+        def sentence_ai(self, *args, **kwargs):
+            raise AssertionError("sentence_ai should not run on valid sentence")
+
+        def translation_web(self, text, src, dest):
+            _ = (src, dest)
+            if text.startswith("adverb:"):
+                return Result("adverb: already", provider_name="googletrans")
+            return Result("I am already home.", provider_name="googletrans")
+
+        def translation_ai(self, *args, **kwargs):
+            self.translation_ai_calls += 1
+            raise AssertionError("translation_ai should not run")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/ʝa/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("ya")
+
+    providers = FakeProviders()
+    card, log = builder._process_word(
+        word="ya",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=providers,
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert card.source_definition == "adverb: ya."
+    assert card.definition == "adverb: already."
+    assert providers.translation_ai_calls == 0
+    assert "definition_wrong_language" not in log.validations
+
+
 def test_process_word_passes_sentence_bounds_to_sentence_providers(tmp_path: Path) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False

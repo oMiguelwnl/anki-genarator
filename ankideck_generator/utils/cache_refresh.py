@@ -189,7 +189,7 @@ def normalize_semantic_definition(value: str, *, policy: dict | None = None) -> 
     normalized = normalize_definition(
         value,
         "en",
-        min_words=2,
+        min_words=1,
         max_words=12,
         policy=policy,
     )

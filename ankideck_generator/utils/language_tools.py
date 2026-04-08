@@ -73,6 +73,12 @@ META_DEFINITION_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(
+        r"\b(?:alternative|dated|nonstandard|obsolete|variant)\s+"
+        r"(?:spelling|form)\s+of\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bmisspelling\s+of\b", re.IGNORECASE),
+    re.compile(
         r"\b(?:simple past|past participle|present participle)\s+of\b",
         re.IGNORECASE,
     ),
@@ -367,8 +373,9 @@ def semantic_definition_reason(text: str, focus: str = "") -> str | None:
     if extract_meta_definition(cleaned) is not None:
         return "definition_nonsemantic"
 
-    alpha_tokens = [token for token in tokenize(cleaned) if token.isalpha()]
-    if len(alpha_tokens) < 3:
+    body = cleaned.split(":", 1)[1].strip() if ":" in cleaned else cleaned
+    alpha_tokens = [token for token in tokenize(body) if token.isalpha()]
+    if not alpha_tokens:
         return "definition_too_short"
 
     for pattern in META_DEFINITION_PATTERNS:

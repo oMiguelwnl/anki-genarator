@@ -97,17 +97,35 @@ def validate_card(
             errors.append("sentence_wrong_language")
 
     if validations.get("source_definition_matches_language"):
-        if card.source_definition and not text_matches_language(
-            card.source_definition, card.language, min_score=0.25, min_tokens=3
-        ):
-            errors.append("source_definition_wrong_language")
+        if card.source_definition:
+            body = (
+                card.source_definition.split(":", 1)[1].strip()
+                if ":" in card.source_definition
+                else card.source_definition.strip()
+            )
+            alpha_tokens = [
+                token for token in body.split() if any(char.isalpha() for char in token)
+            ]
+            if len(alpha_tokens) >= 2 and not text_matches_language(
+                body, card.language, min_score=0.25, min_tokens=2
+            ):
+                errors.append("source_definition_wrong_language")
 
     if validations.get("definition_matches_translation_language"):
         expected_language = card.translation_language or "en"
-        if card.definition and not text_matches_language(
-            card.definition, expected_language, min_score=0.25, min_tokens=3
-        ):
-            errors.append("definition_wrong_language")
+        if card.definition:
+            body = (
+                card.definition.split(":", 1)[1].strip()
+                if ":" in card.definition
+                else card.definition.strip()
+            )
+            alpha_tokens = [
+                token for token in body.split() if any(char.isalpha() for char in token)
+            ]
+            if len(alpha_tokens) >= 2 and not text_matches_language(
+                body, expected_language, min_score=0.25, min_tokens=2
+            ):
+                errors.append("definition_wrong_language")
 
     if validations.get("example_word_in_sentence"):
         if card.example_word and not text_contains_focus(card.sentence, card.example_word):

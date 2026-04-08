@@ -1276,14 +1276,18 @@ class ProviderManager:
         semantic_rule = (
             "Explain the meaning of the word itself, not grammar labels, not inflection notes, not etymology, and not whether the word exists. "
             "If the word is an inflected verb form, keep the meaning semantic and add only a short tense or aspect note like 'past tense' or 'perfective'. "
-            "If the word is an inflected non-verb form, define only the base meaning and omit case, number, or gender notes."
+            "If the word is an inflected non-verb form, define only the base meaning and omit case, number, or gender notes. "
+            "Choose the most specific core meaning, not a vague nearby synonym. "
+            "Avoid fallback glosses such as 'maybe', 'possibly', 'thing', or 'something' unless that is truly the main meaning. "
+            "Never answer with spelling or relation notes like 'alternative spelling of', 'variant of', or 'form of'; define the underlying meaning instead. "
+            "One-word definitions are allowed when they are the most accurate gloss."
             if semantic_only
             else "Define the word directly."
         )
         user = (
             f"Target language: {language_name} ({language}). Define the word '{word}' only in {language_name}. "
             f"{semantic_rule} "
-            "Return 4 to 12 words. Always prefix exactly one POS label from this list: "
+            "Return 1 to 12 words. Always prefix exactly one POS label from this list: "
             "noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, article, determiner, numeral, auxiliary verb, proper noun, masculine noun, feminine noun, plural noun, expression. "
             "Use the POS label in English, even if the definition itself is in another language."
         )
@@ -1308,12 +1312,15 @@ class ProviderManager:
             f"Word: '{word}'. Sentence: '{sentence}'. "
             f"Define the word as used in this sentence, in {target_name}. "
             "Do not describe grammar notes like 'third-person singular', 'plural of', or 'imperative of'. "
+            "Use the sentence to disambiguate the exact sense and choose the most specific core meaning. "
+            "Avoid broad nearby synonyms or vague fallbacks such as 'maybe', 'possibly', 'thing', or 'something' unless the context clearly requires them. "
+            "Never answer with spelling or relation notes like 'alternative spelling of', 'variant of', or 'form of'; define the underlying meaning instead. "
             "For inflected verb forms, keep the definition semantic and add only a short tense or aspect note. "
             "For inflected non-verb forms, define only the base meaning and omit case, number, and gender notes. "
             "Always prefix exactly one POS label from this list: "
             "noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, article, determiner, numeral, auxiliary verb, proper noun, masculine noun, feminine noun, plural noun, expression. "
             "Use the POS label in English, even if the definition itself is in another language. "
-            "Return 4 to 12 words."
+            "Return 1 to 12 words."
         )
         return self._ai_request(system, user)
 

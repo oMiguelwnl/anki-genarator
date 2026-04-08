@@ -105,6 +105,16 @@ MORPHOLOGICAL_CASE_LABELS = {
     "prepositional",
     "vocative",
 }
+ORTHOGRAPHIC_META_TAGS = {
+    "alternative form",
+    "alternative spelling",
+    "dated spelling",
+    "misspelling",
+    "nonstandard spelling",
+    "obsolete spelling",
+    "spelling variant",
+    "variant",
+}
 _GRAMMATICAL_USAGE_PATTERN = (
     r"(?:accusative|ablative|dative|genitive|instrumental|locative|nominative|"
     r"prepositional|vocative)"
@@ -143,6 +153,14 @@ _MORPHOLOGY_TAG_PATTERNS: list[tuple[str, str]] = [
     ("plural", r"\bplural\b"),
     ("form", r"\bform\b"),
     ("inflection", r"\binflection\b"),
+    ("alternative spelling", r"\balternative\s+spelling\b"),
+    ("alternative form", r"\balternative(?:\s+case)?\s+form\b"),
+    ("variant", r"\bvariant\b"),
+    ("spelling variant", r"\bspelling\s+variant\b"),
+    ("dated spelling", r"\bdated\s+spelling\b"),
+    ("obsolete spelling", r"\bobsolete\s+spelling\b"),
+    ("nonstandard spelling", r"\bnonstandard\s+spelling\b"),
+    ("misspelling", r"\bmisspelling\b"),
 ]
 _MORPHOLOGY_TAG_PATTERNS.extend(
     (label, rf"\b{label}\b") for label in sorted(MORPHOLOGICAL_CASE_LABELS)
@@ -296,7 +314,16 @@ def extract_meta_definition(
         token_hits = sum(1 for token in tokens if token in tagged_tokens)
         has_meta_marker = bool(lemma) or any(
             marker in normalized
-            for marker in ("form", "inflection", "imperative", "participle")
+            for marker in (
+                "alternative",
+                "form",
+                "inflection",
+                "imperative",
+                "misspelling",
+                "participle",
+                "spelling",
+                "variant",
+            )
         )
         if not has_meta_marker and token_hits < max(2, len(tokens) - 1):
             return None
@@ -380,7 +407,7 @@ def compact_meta_note(meta: MetaDefinition) -> str:
     elif "imperfective" in tags:
         parts.append("imperfective")
 
-    if not parts and meta.tags:
+    if not parts and any(tag not in ORTHOGRAPHIC_META_TAGS for tag in tags):
         parts.append("inflected form")
     return ", ".join(dict.fromkeys(parts))
 
@@ -395,7 +422,7 @@ def compose_resolved_meta_definition(
     normalized = normalize_definition(
         semantic_definition,
         "en",
-        min_words=2,
+        min_words=1,
         max_words=12,
         policy=resolved_policy,
     )

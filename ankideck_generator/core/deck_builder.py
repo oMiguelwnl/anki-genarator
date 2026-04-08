@@ -1208,7 +1208,7 @@ class DeckBuilder:
                 text,
                 language,
                 pos_mode="auto",
-                min_words=2,
+                min_words=1,
                 max_words=12,
                 policy=self.definition_policy,
             )
@@ -1218,10 +1218,33 @@ class DeckBuilder:
                 return "definition_missing"
             if not definition_has_pos(text, policy=self.definition_policy):
                 return "definition_missing_pos"
-            if strict_quality and not text_matches_language(
-                text, expected_language, min_score=0.25, min_tokens=3
+            body = text.split(":", 1)[1].strip() if ":" in text else text.strip()
+            alpha_body_tokens = [
+                token for token in body.split() if any(char.isalpha() for char in token)
+            ]
+            normalized_expected = str(expected_language or "").strip().lower().split("-", 1)[0]
+            if (
+                strict_quality
+                and len(alpha_body_tokens) >= 2
+                and not text_matches_language(
+                    body, expected_language, min_score=0.25, min_tokens=2
+                )
             ):
                 return "definition_wrong_language"
+            if strict_quality and len(alpha_body_tokens) == 1 and normalized_expected:
+                token = alpha_body_tokens[0].strip(".,;:!?").lower()
+                candidate_languages = ("en", "es", "fr", "it", "de", "ru")
+                expected_zipf = zipf_frequency(token, normalized_expected)
+                competing_zipf = max(
+                    (
+                        zipf_frequency(token, language_code)
+                        for language_code in candidate_languages
+                        if language_code != normalized_expected
+                    ),
+                    default=0.0,
+                )
+                if competing_zipf - expected_zipf >= 1.0:
+                    return "definition_wrong_language"
             semantic_issue = semantic_definition_reason(text, word)
             if semantic_issue:
                 if semantic_issue == "definition_mentions_other_language":

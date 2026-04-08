@@ -36,3 +36,19 @@ def test_semantic_definition_reason_rejects_case_form_definitions() -> None:
         "vas",
     )
     assert reason == "definition_nonsemantic"
+
+
+def test_semantic_definition_reason_accepts_single_word_gloss() -> None:
+    reason = semantic_definition_reason(
+        "adverb: already.",
+        "\u0443\u0436\u0435",
+    )
+    assert reason is None
+
+
+def test_semantic_definition_reason_rejects_alternative_spelling_definitions() -> None:
+    reason = semantic_definition_reason(
+        "adverb: alternative spelling of \u0435\u0449\u0451.",
+        "\u0435\u0449\u0435",
+    )
+    assert reason == "definition_nonsemantic"

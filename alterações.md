@@ -1,3 +1,5 @@
-- Na definition das palavras que sao verbos quero que o definition seja, verb: o significado do verbo e dizer qual tempo verbal ele está e de qual verbo, exemplo palavra "falou": exprimir por meio de palavras no tempo passado perfeito
+1- As definitions estão com um pouco de errada, Exemplo Palavra "уже" definition"adverb: by now, now.", tinha que ser already e nao maybe (Ou seja, faça a ai ser mais precisa nas definições, evitando palavras vagas como "maybe" e utilizando termos mais específicos e corretos para cada definição).
 
-- Tem palavras como управления onde o DEFINITIONS é: noun: genitive singular. Quero que a definition seja o significado da palavra e nao dizer que ele é genitivo etc.
+2-Definition sem nenhum sentido, exemplo , palavra "еще" defenition"adverb: alternative spelling of ещё."
+
+Faça isso para todas as linguas

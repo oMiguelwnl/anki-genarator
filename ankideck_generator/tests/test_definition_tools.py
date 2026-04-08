@@ -70,6 +70,16 @@ def test_normalize_definition_normalizes_list_spacing() -> None:
     assert value == "adverb: maybe, perhaps, possibly."
 
 
+def test_normalize_definition_accepts_single_word_gloss() -> None:
+    value = normalize_definition(
+        "adverb: already",
+        "en",
+        min_words=1,
+        max_words=12,
+    )
+    assert value == "adverb: already."
+
+
 def test_extract_meta_definition_builds_compact_verb_note() -> None:
     meta = extract_meta_definition(
         "verb: masculine singular past indicative imperfective of говори́ть"
@@ -77,6 +87,15 @@ def test_extract_meta_definition_builds_compact_verb_note() -> None:
     assert meta is not None
     assert meta.lemma == "говори́ть"
     assert compact_meta_note(meta) == "past tense, imperfective"
+
+
+def test_extract_meta_definition_handles_alternative_spelling() -> None:
+    meta = extract_meta_definition(
+        "adverb: alternative spelling of \u0435\u0449\u0451"
+    )
+    assert meta is not None
+    assert meta.lemma == "\u0435\u0449\u0451"
+    assert compact_meta_note(meta) == ""
 
 
 def test_compose_resolved_meta_definition_omits_noun_case_note() -> None:

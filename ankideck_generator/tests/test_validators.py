@@ -202,6 +202,74 @@ def test_validate_card_requires_definition_pos() -> None:
     assert "definition_missing_pos" in errors
 
 
+def test_validate_card_allows_single_word_english_definition_gloss() -> None:
+    card = CardData(
+        focus="\u0443\u0436\u0435",
+        definition="adverb: already.",
+        sentence="\u041e\u043d \u0443\u0436\u0435 \u0434\u043e\u043c\u0430.",
+        source_definition="",
+        translation="He is already home.",
+        level=1,
+        language="ru",
+        translation_language="en",
+    )
+    ctx = ValidationContext()
+    errors = validate_card(card, ctx, {
+        "definition_required": True,
+        "definition_semantic": True,
+        "definition_requires_pos": True,
+        "definition_matches_translation_language": True,
+        "source_definition_matches_language": True,
+        "ipa_required": False,
+        "translation_required": False,
+        "focus_in_sentence": True,
+        "sentence_matches_language": False,
+        "no_duplicate_focus": False,
+        "no_duplicate_sentences": False,
+        "valid_characters": False,
+        "ipa_format": False,
+        "audio_generated": False,
+        "definition_not_literal_translation": False,
+        "sentence_length": {1: (1, 20)},
+        "sentence_difficulty_matches_level": False,
+    })
+    assert "definition_wrong_language" not in errors
+
+
+def test_validate_card_allows_single_word_source_definition_gloss() -> None:
+    card = CardData(
+        focus="ya",
+        definition="adverb: already.",
+        sentence="Ya estoy en casa.",
+        source_definition="adverb: ya.",
+        translation="I am already home.",
+        level=1,
+        language="es",
+        translation_language="en",
+    )
+    ctx = ValidationContext()
+    errors = validate_card(card, ctx, {
+        "definition_required": True,
+        "definition_semantic": True,
+        "definition_requires_pos": True,
+        "definition_matches_translation_language": True,
+        "source_definition_matches_language": True,
+        "ipa_required": False,
+        "translation_required": False,
+        "focus_in_sentence": True,
+        "sentence_matches_language": False,
+        "no_duplicate_focus": False,
+        "no_duplicate_sentences": False,
+        "valid_characters": False,
+        "ipa_format": False,
+        "audio_generated": False,
+        "definition_not_literal_translation": False,
+        "sentence_length": {1: (1, 20)},
+        "sentence_difficulty_matches_level": False,
+    })
+    assert "source_definition_wrong_language" not in errors
+
+
 def test_validate_card_profile_hard_zipf_soft_skips_level2_and_level3_zipf_errors(
     monkeypatch,
 ) -> None:
