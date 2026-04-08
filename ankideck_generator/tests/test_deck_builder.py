@@ -1,3 +1,4 @@
+import json
 from collections import Counter
 from pathlib import Path
 import time
@@ -5,6 +6,7 @@ import time
 import ankideck_generator.core.deck_builder as deck_builder_module
 from ankideck_generator.core.deck_builder import (
     AudioTaskResult,
+    BuildStats,
     DeckBuilder,
     TextTaskResult,
     _infer_discard_reason,
@@ -110,10 +112,10 @@ def test_build_continues_until_level_target_is_met(monkeypatch, tmp_path: Path) 
     assert [card.focus for card in cards] == ["dos", "tres", "seis", "siete", "diez", "once"]
 
 
-def test_prepare_levels_preserves_frequency_order(monkeypatch, tmp_path: Path) -> None:
+def test_prepare_levels_uses_seeded_selection_within_level_bands(monkeypatch, tmp_path: Path) -> None:
     _ = tmp_path
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
-    frequency_words = [f"mot{i}" for i in range(1, 40)]
+    frequency_words = [f"mot{i}" for i in range(1, 121)]
 
     monkeypatch.setattr(deck_builder_module, "top_n_list", lambda language, total: frequency_words[:total])
     monkeypatch.setattr(
@@ -123,10 +125,14 @@ def test_prepare_levels_preserves_frequency_order(monkeypatch, tmp_path: Path) -
     )
 
     levels = builder._prepare_levels("fr", level_size=2, seed=1, pool_multiplier=2)
+    levels_again = builder._prepare_levels("fr", level_size=2, seed=1, pool_multiplier=2)
+    levels_other_seed = builder._prepare_levels("fr", level_size=2, seed=2, pool_multiplier=2)
 
-    assert levels[1] == ["mot1", "mot2", "mot3", "mot4"]
-    assert levels[2] == ["mot5", "mot6", "mot7", "mot8"]
-    assert levels[3] == ["mot9", "mot10", "mot11", "mot12"]
+    assert levels == levels_again
+    assert levels != levels_other_seed
+    assert all(word in frequency_words[:24] for word in levels[1])
+    assert all(word in frequency_words[24:48] for word in levels[2])
+    assert all(word in frequency_words[48:72] for word in levels[3])
 
 
 def test_sentence_length_bounds_follow_level_defaults() -> None:
@@ -1559,7 +1565,7 @@ def test_process_word_ignores_legacy_sentence_cache_key(tmp_path: Path) -> None:
     ctx = ValidationContext()
 
     legacy_sentence = "Ce dossier exclus reste prive."
-    legacy_sentence_key = "exclus::lvl1::2-7::v3"
+    legacy_sentence_key = "exclus::lvl1::2-7::v4"
 
     class FakeCache:
         def __init__(self):
@@ -1637,10 +1643,10 @@ def test_process_word_ignores_invalid_cached_translation_and_regenerates(tmp_pat
     ctx = ValidationContext()
 
     sentence = "Ce dossier exclus reste prive."
-    source_key = "exclus::fr::v3"
-    definition_key = "exclus::en::v3"
-    sentence_key = "exclus::lvl1::2-7::sv2::v3"
-    translation_key = f"{sentence}::fr->en::v3"
+    source_key = "exclus::fr::v4"
+    definition_key = "exclus::en::v4"
+    sentence_key = "exclus::lvl1::2-7::sv2::v4"
+    translation_key = f"{sentence}::fr->en::v4"
 
     class FakeCache:
         def __init__(self):
@@ -1723,6 +1729,87 @@ def test_process_word_ignores_invalid_cached_translation_and_regenerates(tmp_pat
     assert card.translation == "This restricted file stays private."
 
 
+def test_process_word_refresh_text_cache_bypasses_cached_text(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path, language="fr")
+    run.refresh_text_cache = True
+    ctx = ValidationContext()
+
+    class FakeCache:
+        def get(self, kind, key):
+            if kind in {"definitions", "sentences", "translations", "word_translations"}:
+                return "stale cached text"
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "wiktionary"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        definition_calls = 0
+        sentence_calls = 0
+        translation_calls = 0
+
+        def word_exists(self, word, language):
+            _ = (word, language)
+            return Result(word, provider_name="wiktionary")
+
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            self.definition_calls += 1
+            return Result("adjective: reserve a un usage interne.")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            self.sentence_calls += 1
+            return Result("Ce dossier exclus reste prive.", provider_name="tatoeba")
+
+        def sentence_ai(self, *args, **kwargs):
+            raise AssertionError("sentence_ai should not be needed")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            self.translation_calls += 1
+            if text.startswith("adjective:"):
+                return Result("adjective: restricted to internal use only.", provider_name="googletrans")
+            return Result("This restricted file stays private.", provider_name="googletrans")
+
+        def translation_ai(self, *args, **kwargs):
+            raise AssertionError("translation_ai should not be needed")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/ekskly/", provider_name="ai")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("eks-KLU", provider_name="ai")
+
+    providers = FakeProviders()
+    card, _log = builder._process_word(
+        word="exclus",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=providers,
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert providers.definition_calls == 1
+    assert providers.sentence_calls == 1
+    assert providers.translation_calls >= 1
+
+
 def test_process_word_uses_english_gloss_as_final_definition(tmp_path: Path) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
@@ -1800,160 +1887,6 @@ def test_process_word_uses_english_gloss_as_final_definition(tmp_path: Path) -> 
     assert card.source_definition == ""
     assert "source_definition_wrong_language" not in log.validations
     assert providers.translation_web_calls == 1
-
-
-def test_process_word_accepts_single_word_definition_gloss(tmp_path: Path) -> None:
-    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
-    builder.config["audio"]["enabled"] = False
-    run = _run_config(tmp_path, language="ru")
-    ctx = ValidationContext()
-
-    class FakeCache:
-        def get(self, *_args, **_kwargs):
-            return None
-
-        def set(self, *_args, **_kwargs):
-            return None
-
-    class Result:
-        def __init__(self, value: str, provider_name: str = "wiktionary"):
-            self.value = value
-            self.provider_name = provider_name
-            self.elapsed_ms = 1
-            self.error = None
-
-    class FakeProviders:
-        def word_exists(self, word, language):
-            _ = (word, language)
-            return Result(word, provider_name="wiktionary")
-
-        def definition(self, word, language, allow_ai=True, definition_language=None):
-            _ = (word, language, allow_ai, definition_language)
-            return Result("adverb: already", provider_name="ai")
-
-        def definition_ai(self, *args, **kwargs):
-            raise AssertionError("definition_ai should not run when one-word gloss is valid")
-
-        def definition_from_context(self, *args, **kwargs):
-            raise AssertionError("definition_from_context should not run when one-word gloss is valid")
-
-        def sentence_web(self, word, language, level=None, **kwargs):
-            _ = (word, language, level, kwargs)
-            return Result(f"\u041e\u043d \u0443\u0436\u0435 \u0434\u043e\u043c\u0430.", provider_name="tatoeba")
-
-        def sentence_ai(self, *args, **kwargs):
-            raise AssertionError("sentence_ai should not run on valid sentence")
-
-        def translation_web(self, text, src, dest):
-            _ = (text, src, dest)
-            return Result("He is already home.", provider_name="googletrans")
-
-        def translation_ai(self, *args, **kwargs):
-            raise AssertionError("translation_ai should not run")
-
-        def ipa(self, word, language, allow_ai=True):
-            _ = (word, language, allow_ai)
-            return Result("/u\u0290e/")
-
-        def phonetic_spelling(self, ipa, language, allow_ai=True):
-            _ = (ipa, language, allow_ai)
-            return Result("oo-ZHE")
-
-    card, log = builder._process_word(
-        word="\u0443\u0436\u0435",
-        level=1,
-        index=1,
-        run=run,
-        cache=FakeCache(),
-        providers=FakeProviders(),
-        ctx=ctx,
-        media_files=[],
-    )
-
-    assert card is not None
-    assert card.definition == "adverb: already."
-    assert "definition_wrong_language" not in log.validations
-
-
-def test_process_word_translates_single_word_source_definition(tmp_path: Path) -> None:
-    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
-    builder.config["audio"]["enabled"] = False
-    run = _run_config(tmp_path, language="es")
-    ctx = ValidationContext()
-
-    class FakeCache:
-        def get(self, *_args, **_kwargs):
-            return None
-
-        def set(self, *_args, **_kwargs):
-            return None
-
-    class Result:
-        def __init__(self, value: str, provider_name: str = "wiktionary"):
-            self.value = value
-            self.provider_name = provider_name
-            self.elapsed_ms = 1
-            self.error = None
-
-    class FakeProviders:
-        translation_ai_calls = 0
-
-        def word_exists(self, word, language):
-            _ = (word, language)
-            return Result(word, provider_name="wiktionary")
-
-        def definition(self, word, language, allow_ai=True, definition_language=None):
-            _ = (word, language, allow_ai, definition_language)
-            return Result("adverb: ya", provider_name="wiktionary")
-
-        def definition_ai(self, *args, **kwargs):
-            raise AssertionError("definition_ai should not run when source gloss is usable")
-
-        def definition_from_context(self, *args, **kwargs):
-            raise AssertionError("definition_from_context should not run when source gloss is usable")
-
-        def sentence_web(self, word, language, level=None, **kwargs):
-            _ = (word, language, level, kwargs)
-            return Result("Ya estoy en casa.", provider_name="tatoeba")
-
-        def sentence_ai(self, *args, **kwargs):
-            raise AssertionError("sentence_ai should not run on valid sentence")
-
-        def translation_web(self, text, src, dest):
-            _ = (src, dest)
-            if text.startswith("adverb:"):
-                return Result("adverb: already", provider_name="googletrans")
-            return Result("I am already home.", provider_name="googletrans")
-
-        def translation_ai(self, *args, **kwargs):
-            self.translation_ai_calls += 1
-            raise AssertionError("translation_ai should not run")
-
-        def ipa(self, word, language, allow_ai=True):
-            _ = (word, language, allow_ai)
-            return Result("/ʝa/")
-
-        def phonetic_spelling(self, ipa, language, allow_ai=True):
-            _ = (ipa, language, allow_ai)
-            return Result("ya")
-
-    providers = FakeProviders()
-    card, log = builder._process_word(
-        word="ya",
-        level=1,
-        index=1,
-        run=run,
-        cache=FakeCache(),
-        providers=providers,
-        ctx=ctx,
-        media_files=[],
-    )
-
-    assert card is not None
-    assert card.source_definition == "adverb: ya."
-    assert card.definition == "adverb: already."
-    assert providers.translation_ai_calls == 0
-    assert "definition_wrong_language" not in log.validations
 
 
 def test_process_word_passes_sentence_bounds_to_sentence_providers(tmp_path: Path) -> None:
@@ -2038,3 +1971,47 @@ def test_process_word_passes_sentence_bounds_to_sentence_providers(tmp_path: Pat
     assert card is not None
     assert providers.sentence_bounds
     assert providers.sentence_bounds[0] == (2, 7)
+
+
+def test_write_quality_outputs_persists_review_queue(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.review_queue_path = str(tmp_path / "output" / "review_queue.json")
+    run.quality_report_path = str(tmp_path / "output" / "quality_report.json")
+
+    stats = BuildStats()
+    stats.cards.append(
+        CardData(
+            focus="bien",
+            definition="adjective: in good condition or quality.",
+            sentence="Hoy me siento bien en casa.",
+            translation="I feel good at home today.",
+            level=1,
+            language="es",
+        )
+    )
+    stats.attempted_by_level[1] = 2
+    stats.accepted_by_level[1] = 1
+    stats.validation_counter["definition_missing"] = 1
+    stats.definition_source_counter["translated_source"] = 1
+    stats.ambiguous_focus_counter["bien"] = 1
+    stats.definition_score_total = 1.6
+    stats.definition_score_samples = 2
+    stats.needs_review_items.append(
+        {
+            "focus": "bien",
+            "level": 1,
+            "status": "candidate",
+            "review_notes": ["definition_polysemy_detected"],
+        }
+    )
+
+    builder._write_quality_outputs(run, stats)
+
+    report = json.loads(Path(run.quality_report_path).read_text(encoding="utf-8"))
+    review_queue = json.loads(Path(run.review_queue_path).read_text(encoding="utf-8"))
+
+    assert report["needs_review"] == 1
+    assert report["definition_sources"]["translated_source"] == 1
+    assert report["definition_score"]["average"] == 0.8
+    assert review_queue[0]["focus"] == "bien"

@@ -27,6 +27,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--interactive", action="store_true", help="Interactive mode")
     parser.add_argument("--output", default="output/deck.apkg", help="Output .apkg path")
+    parser.add_argument("--seed", type=int, default=None, help="Override random seed")
+    parser.add_argument(
+        "--refresh-text-cache",
+        action="store_true",
+        help="Ignore cached sentences, definitions, and translations for this run",
+    )
     parser.add_argument("--resume", action="store_true", default=False, help="Resume from progress")
     parser.add_argument("--no-resume", action="store_false", dest="resume", help="Disable resume")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
@@ -85,7 +91,7 @@ def main() -> int:
         )
     strict_quality = runtime_cfg.get("strict_quality", True)
     exclude_closed_class_words = bool(runtime_cfg.get("exclude_closed_class_words", True))
-    cache_validation_version = int(runtime_cfg.get("cache_validation_version", 3) or 3)
+    cache_validation_version = int(runtime_cfg.get("cache_validation_version", 4) or 4)
     enforce_translation_language = bool(
         runtime_cfg.get("enforce_translation_language", True)
     )
@@ -111,6 +117,16 @@ def main() -> int:
     low_yield_start_level = int(runtime_cfg.get("low_yield_start_level", 1) or 1)
     sentence_template_fallback = bool(runtime_cfg.get("sentence_template_fallback", False))
     definition_word_fallback = bool(runtime_cfg.get("definition_word_fallback", False))
+    definition_context_first = bool(runtime_cfg.get("definition_context_first", True))
+    definition_candidates_limit = int(runtime_cfg.get("definition_candidates_limit", 5) or 5)
+    review_queue_path = str(
+        runtime_cfg.get("review_queue_path", "output/review_queue.json")
+        or "output/review_queue.json"
+    )
+    quality_report_path = str(
+        runtime_cfg.get("quality_report_path", "output/quality_report.json")
+        or "output/quality_report.json"
+    )
     if mode == "test":
         max_minutes_per_level = float(
             runtime_cfg.get("max_minutes_per_level_test", max_minutes_per_level) or 0.0
@@ -206,9 +222,10 @@ def main() -> int:
         wordfreq_language=lang_cfg.get("wordfreq_code", args.language),
         timeout_sec=timeout_sec,
         retries=retries,
-        seed=runtime_cfg.get("seed", 42),
+        seed=args.seed if args.seed is not None else runtime_cfg.get("seed", 42),
         cache_path=config.get("cache", {}).get("path", "ankideck_generator/data/cache"),
         autosave_every=config.get("cache", {}).get("autosave_every", 10),
+        refresh_text_cache=bool(args.refresh_text_cache),
         ai_max_calls_per_word=ai_max_calls_per_word,
         ai_max_calls_per_field=ai_max_calls_per_field,
         level_pool_multiplier=level_pool_multiplier,
@@ -242,6 +259,10 @@ def main() -> int:
         low_yield_start_level=max(1, int(low_yield_start_level)),
         sentence_template_fallback=bool(sentence_template_fallback),
         definition_word_fallback=bool(definition_word_fallback),
+        definition_context_first=bool(definition_context_first),
+        definition_candidates_limit=max(1, int(definition_candidates_limit)),
+        review_queue_path=review_queue_path,
+        quality_report_path=quality_report_path,
     )
 
     builder = DeckBuilder(args.config)

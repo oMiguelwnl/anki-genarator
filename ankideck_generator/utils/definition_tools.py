@@ -105,16 +105,6 @@ MORPHOLOGICAL_CASE_LABELS = {
     "prepositional",
     "vocative",
 }
-ORTHOGRAPHIC_META_TAGS = {
-    "alternative form",
-    "alternative spelling",
-    "dated spelling",
-    "misspelling",
-    "nonstandard spelling",
-    "obsolete spelling",
-    "spelling variant",
-    "variant",
-}
 _GRAMMATICAL_USAGE_PATTERN = (
     r"(?:accusative|ablative|dative|genitive|instrumental|locative|nominative|"
     r"prepositional|vocative)"
@@ -153,14 +143,6 @@ _MORPHOLOGY_TAG_PATTERNS: list[tuple[str, str]] = [
     ("plural", r"\bplural\b"),
     ("form", r"\bform\b"),
     ("inflection", r"\binflection\b"),
-    ("alternative spelling", r"\balternative\s+spelling\b"),
-    ("alternative form", r"\balternative(?:\s+case)?\s+form\b"),
-    ("variant", r"\bvariant\b"),
-    ("spelling variant", r"\bspelling\s+variant\b"),
-    ("dated spelling", r"\bdated\s+spelling\b"),
-    ("obsolete spelling", r"\bobsolete\s+spelling\b"),
-    ("nonstandard spelling", r"\bnonstandard\s+spelling\b"),
-    ("misspelling", r"\bmisspelling\b"),
 ]
 _MORPHOLOGY_TAG_PATTERNS.extend(
     (label, rf"\b{label}\b") for label in sorted(MORPHOLOGICAL_CASE_LABELS)
@@ -266,6 +248,45 @@ def normalize_definition(
     return result
 
 
+def split_definition(
+    text: str,
+    *,
+    policy: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    resolved_policy = _resolve_policy(policy)
+    cleaned = _strip_noise(text, resolved_policy)
+    if not cleaned:
+        return "", ""
+    pos_label, body = _extract_pos(cleaned, resolved_policy)
+    body = _clean_body(body, resolved_policy).strip().rstrip(".")
+    return pos_label, body
+
+
+def build_definition(
+    pos_label: str,
+    body: str,
+    *,
+    policy: dict[str, Any] | None = None,
+) -> str:
+    resolved_policy = _resolve_policy(policy)
+    normalized_pos = _normalize_pos(pos_label, resolved_policy) or str(pos_label or "").strip()
+    cleaned_body = _clean_body(body, resolved_policy).strip().rstrip(".")
+    if not cleaned_body:
+        return ""
+    if normalized_pos:
+        cleaned_body = _capitalize_after_colon(cleaned_body)
+        text = f"{normalized_pos}: {cleaned_body}"
+    else:
+        text = _capitalize_sentence(cleaned_body)
+    text = _normalize_spacing(text, resolved_policy)
+    return text if text.endswith(".") else f"{text}."
+
+
+def trim_definition_body(text: str, min_words: int, max_words: int) -> str:
+    trimmed = _trim_to_range(text, min_words, max_words)
+    return trimmed.strip().rstrip(".")
+
+
 def definition_has_pos(
     text: str,
     *,
@@ -314,16 +335,7 @@ def extract_meta_definition(
         token_hits = sum(1 for token in tokens if token in tagged_tokens)
         has_meta_marker = bool(lemma) or any(
             marker in normalized
-            for marker in (
-                "alternative",
-                "form",
-                "inflection",
-                "imperative",
-                "misspelling",
-                "participle",
-                "spelling",
-                "variant",
-            )
+            for marker in ("form", "inflection", "imperative", "participle")
         )
         if not has_meta_marker and token_hits < max(2, len(tokens) - 1):
             return None
@@ -407,7 +419,7 @@ def compact_meta_note(meta: MetaDefinition) -> str:
     elif "imperfective" in tags:
         parts.append("imperfective")
 
-    if not parts and any(tag not in ORTHOGRAPHIC_META_TAGS for tag in tags):
+    if not parts and meta.tags:
         parts.append("inflected form")
     return ", ".join(dict.fromkeys(parts))
 
@@ -422,7 +434,7 @@ def compose_resolved_meta_definition(
     normalized = normalize_definition(
         semantic_definition,
         "en",
-        min_words=1,
+        min_words=2,
         max_words=12,
         policy=resolved_policy,
     )

@@ -73,12 +73,6 @@ META_DEFINITION_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:alternative|dated|nonstandard|obsolete|variant)\s+"
-        r"(?:spelling|form)\s+of\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\bmisspelling\s+of\b", re.IGNORECASE),
-    re.compile(
         r"\b(?:simple past|past participle|present participle)\s+of\b",
         re.IGNORECASE,
     ),
@@ -194,6 +188,46 @@ class DifficultyScore:
 
 def tokenize(text: str) -> list[str]:
     return WORD_RE.findall(text.lower())
+
+
+def content_tokens(
+    text: str,
+    language: str,
+    *,
+    drop: Iterable[str] | None = None,
+) -> list[str]:
+    language_code = normalize_language_code(language)
+    ignored = {
+        token.lower()
+        for token in (drop or [])
+        if isinstance(token, str) and token.strip()
+    }
+    stopwords = STOPWORDS.get(language_code, set()) | CLOSED_CLASS_WORDS.get(language_code, set())
+    result: list[str] = []
+    for token in tokenize(text):
+        if not any(char.isalpha() for char in token):
+            continue
+        if token in stopwords or token in ignored:
+            continue
+        result.append(token)
+    return result
+
+
+def token_overlap_score(
+    left: str,
+    right: str,
+    language: str,
+    *,
+    drop: Iterable[str] | None = None,
+) -> float:
+    left_tokens = set(content_tokens(left, language, drop=drop))
+    right_tokens = set(content_tokens(right, language, drop=drop))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    shared = left_tokens.intersection(right_tokens)
+    if not shared:
+        return 0.0
+    return len(shared) / min(len(left_tokens), len(right_tokens))
 
 
 def _normalize_focus_token(value: str) -> str:
@@ -373,9 +407,8 @@ def semantic_definition_reason(text: str, focus: str = "") -> str | None:
     if extract_meta_definition(cleaned) is not None:
         return "definition_nonsemantic"
 
-    body = cleaned.split(":", 1)[1].strip() if ":" in cleaned else cleaned
-    alpha_tokens = [token for token in tokenize(body) if token.isalpha()]
-    if not alpha_tokens:
+    alpha_tokens = [token for token in tokenize(cleaned) if token.isalpha()]
+    if len(alpha_tokens) < 3:
         return "definition_too_short"
 
     for pattern in META_DEFINITION_PATTERNS:

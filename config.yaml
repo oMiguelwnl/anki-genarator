@@ -175,6 +175,10 @@ runtime:
   low_yield_max_accepted_full: 6
   sentence_template_fallback_full: true
   definition_word_fallback_full: true
+  definition_context_first: true
+  definition_candidates_limit: 5
+  review_queue_path: "output/review_queue.json"
+  quality_report_path: "output/quality_report.json"
   test_disable_audio: true
   seed: 42
   test_level_size: 10
@@ -251,7 +255,7 @@ runtime:
   max_attempts_per_level_test: 300
   max_attempts_per_level_full: 8000
   exclude_closed_class_words: true
-  cache_validation_version: 3
+  cache_validation_version: 4
   enforce_translation_language: true
   sentence_rewrite_from_web: true
   level_validation_mode: "profile_hard_zipf_soft"

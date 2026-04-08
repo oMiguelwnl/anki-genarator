@@ -94,6 +94,23 @@ class SentenceCandidatesResult:
     fallback_errors: dict[str, str] | None = None
 
 
+@dataclass
+class DefinitionCandidate:
+    text: str
+    provider_name: str
+    source: str = "provider"
+    expected_language: str = ""
+
+
+@dataclass
+class DefinitionCandidatesResult:
+    candidates: list[DefinitionCandidate]
+    provider_name: str
+    elapsed_ms: int
+    error: str | None = None
+    fallback_errors: dict[str, str] | None = None
+
+
 class ProviderManager:
     def __init__(
         self,
@@ -332,6 +349,98 @@ class ProviderManager:
             lambda: self._definition_from_context_ai(
                 word, sentence, language, target_language
             ),
+        )
+
+    def definition_candidates(
+        self,
+        word: str,
+        language: str,
+        allow_ai: bool = True,
+        definition_language: str | None = None,
+        sentence: str | None = None,
+    ) -> DefinitionCandidatesResult:
+        target_language = definition_language or language
+        start = time.time()
+        errors: dict[str, str] = {}
+        candidates: list[DefinitionCandidate] = []
+        seen: set[str] = set()
+
+        def push(text: str | None, provider_name: str, source: str) -> None:
+            cleaned = str(text or "").strip()
+            if not cleaned:
+                return
+            key = cleaned.casefold()
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(
+                DefinitionCandidate(
+                    text=cleaned,
+                    provider_name=provider_name,
+                    source=source,
+                    expected_language=target_language,
+                )
+            )
+
+        def call(provider_name: str, fn: Callable[[], str | None], source: str) -> None:
+            result = self._wrap(provider_name, fn)
+            if result.value:
+                push(result.value, provider_name, source)
+                return
+            if result.error:
+                errors[provider_name] = result.error
+
+        if target_language == language:
+            for definition in self._wiktionary_definitions(word, language):
+                push(definition, "wiktionary", "lexicon")
+            call("wordnet", lambda: self._definition_wordnet(word, language), "lexicon")
+            call(
+                "dictionaryapi",
+                lambda: self._definition_dictionaryapi(word, language),
+                "lexicon",
+            )
+            if sentence and allow_ai:
+                call(
+                    "ai",
+                    lambda: self._definition_from_context_ai(
+                        word,
+                        sentence,
+                        language,
+                        target_language,
+                    ),
+                    "context",
+                )
+            if allow_ai:
+                call(
+                    "ai",
+                    lambda: self._definition_ai(word, target_language, semantic_only=True),
+                    "ai",
+                )
+        else:
+            if sentence and allow_ai:
+                call(
+                    "ai",
+                    lambda: self._definition_from_context_ai(
+                        word,
+                        sentence,
+                        language,
+                        target_language,
+                    ),
+                    "context",
+                )
+            if allow_ai:
+                call(
+                    "ai",
+                    lambda: self._definition_ai(word, target_language, semantic_only=True),
+                    "ai",
+                )
+
+        return DefinitionCandidatesResult(
+            candidates=candidates,
+            provider_name=candidates[0].provider_name if candidates else "none",
+            elapsed_ms=int((time.time() - start) * 1000),
+            error=None if candidates else errors.get("ai") or "empty result",
+            fallback_errors=errors or None,
         )
 
     def word_exists(self, word: str, language: str) -> ProviderResult:
@@ -1276,18 +1385,14 @@ class ProviderManager:
         semantic_rule = (
             "Explain the meaning of the word itself, not grammar labels, not inflection notes, not etymology, and not whether the word exists. "
             "If the word is an inflected verb form, keep the meaning semantic and add only a short tense or aspect note like 'past tense' or 'perfective'. "
-            "If the word is an inflected non-verb form, define only the base meaning and omit case, number, or gender notes. "
-            "Choose the most specific core meaning, not a vague nearby synonym. "
-            "Avoid fallback glosses such as 'maybe', 'possibly', 'thing', or 'something' unless that is truly the main meaning. "
-            "Never answer with spelling or relation notes like 'alternative spelling of', 'variant of', or 'form of'; define the underlying meaning instead. "
-            "One-word definitions are allowed when they are the most accurate gloss."
+            "If the word is an inflected non-verb form, define only the base meaning and omit case, number, or gender notes."
             if semantic_only
             else "Define the word directly."
         )
         user = (
             f"Target language: {language_name} ({language}). Define the word '{word}' only in {language_name}. "
             f"{semantic_rule} "
-            "Return 1 to 12 words. Always prefix exactly one POS label from this list: "
+            "Return 4 to 12 words. Always prefix exactly one POS label from this list: "
             "noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, article, determiner, numeral, auxiliary verb, proper noun, masculine noun, feminine noun, plural noun, expression. "
             "Use the POS label in English, even if the definition itself is in another language."
         )
@@ -1312,15 +1417,12 @@ class ProviderManager:
             f"Word: '{word}'. Sentence: '{sentence}'. "
             f"Define the word as used in this sentence, in {target_name}. "
             "Do not describe grammar notes like 'third-person singular', 'plural of', or 'imperative of'. "
-            "Use the sentence to disambiguate the exact sense and choose the most specific core meaning. "
-            "Avoid broad nearby synonyms or vague fallbacks such as 'maybe', 'possibly', 'thing', or 'something' unless the context clearly requires them. "
-            "Never answer with spelling or relation notes like 'alternative spelling of', 'variant of', or 'form of'; define the underlying meaning instead. "
             "For inflected verb forms, keep the definition semantic and add only a short tense or aspect note. "
             "For inflected non-verb forms, define only the base meaning and omit case, number, and gender notes. "
             "Always prefix exactly one POS label from this list: "
             "noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, article, determiner, numeral, auxiliary verb, proper noun, masculine noun, feminine noun, plural noun, expression. "
             "Use the POS label in English, even if the definition itself is in another language. "
-            "Return 1 to 12 words."
+            "Return 4 to 12 words."
         )
         return self._ai_request(system, user)
 

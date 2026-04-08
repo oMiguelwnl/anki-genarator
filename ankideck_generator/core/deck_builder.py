@@ -2,6 +2,7 @@
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+import hashlib
 import random
 import re
 import shutil
@@ -16,18 +17,23 @@ from tqdm import tqdm
 
 from ..utils.config import load_config
 from ..utils.definition_tools import (
+    build_definition,
     build_definition_policy,
     definition_has_pos,
     normalize_definition,
     set_default_definition_policy,
+    split_definition,
+    trim_definition_body,
 )
 from ..utils.file_utils import atomic_write_json, ensure_dir, read_json
 from ..utils.language_tools import (
     compact_audio_basename,
+    content_tokens,
     filter_frequent_words,
     is_closed_class_word,
     score_sentence,
     semantic_definition_reason,
+    token_overlap_score,
     text_matches_language,
     tokenize,
     unique_keep_order,
@@ -144,15 +150,35 @@ class SentenceSelectionCandidate:
 
 
 @dataclass
+class DefinitionSelectionCandidate:
+    text: str
+    expected_language: str
+    provider_name: str
+    source_kind: str
+    selection_score: float
+    pos: str = ""
+    body: str = ""
+    lemma: str = ""
+    sense_note: str = ""
+    alignment_score: float = 0.0
+    specificity_score: float = 0.0
+    review_notes: list[str] = field(default_factory=list)
+    selection_reason: str = ""
+
+
+@dataclass
 class BuildStats:
     cards: list[CardData] = field(default_factory=list)
     media_files: list[str] = field(default_factory=list)
+    needs_review_items: list[dict[str, object]] = field(default_factory=list)
     processed: int = 0
     next_sort_index: int = 1
     accepted_by_level: Counter[int] = field(default_factory=Counter)
     attempted_by_level: Counter[int] = field(default_factory=Counter)
     validation_counter: Counter[str] = field(default_factory=Counter)
     provider_counter: Counter[str] = field(default_factory=Counter)
+    definition_source_counter: Counter[str] = field(default_factory=Counter)
+    ambiguous_focus_counter: Counter[str] = field(default_factory=Counter)
     event_counter: Counter[str] = field(default_factory=Counter)
     event_counter_by_level: dict[int, Counter[str]] = field(
         default_factory=lambda: defaultdict(Counter)
@@ -169,6 +195,8 @@ class BuildStats:
     discard_by_level: dict[int, Counter[str]] = field(
         default_factory=lambda: defaultdict(Counter)
     )
+    definition_score_total: float = 0.0
+    definition_score_samples: int = 0
 
 
 @dataclass
@@ -380,6 +408,7 @@ class DeckBuilder:
             stats.discard_counter,
             stats.discard_by_level,
         )
+        self._write_quality_outputs(run, stats)
         return stats.cards, stats.media_files
 
     def _build_level_serial(
@@ -733,14 +762,44 @@ class DeckBuilder:
         level = int(log_record.level or 0)
         for field_name, provider_name in log_record.providers.items():
             stats.provider_counter[f"{field_name}:{provider_name}"] += 1
+        definition_reason = (log_record.selection_reasons or {}).get("definition", "")
+        if definition_reason:
+            source_kind = definition_reason.split(";", 1)[0].strip()
+            if source_kind:
+                stats.definition_source_counter[source_kind] += 1
         for event_name, count in (log_record.event_counts or {}).items():
             stats.event_counter[event_name] += int(count or 0)
             stats.event_counter_by_level[level][event_name] += int(count or 0)
+        if "definition_polysemy_detected" in (log_record.review_notes or []):
+            stats.ambiguous_focus_counter[log_record.focus] += 1
         for validation_error in log_record.validations:
             stats.validation_counter[validation_error] += 1
         if log_record.discard_reason:
             stats.discard_counter[log_record.discard_reason] += 1
             stats.discard_by_level[level][log_record.discard_reason] += 1
+        definition_score = (log_record.quality_scores or {}).get("definition")
+        if isinstance(definition_score, (int, float)):
+            stats.definition_score_total += float(definition_score)
+            stats.definition_score_samples += 1
+        if log_record.review_notes or str(getattr(log_record, "status", "")) == "discarded":
+            stats.needs_review_items.append(
+                {
+                    "focus": log_record.focus,
+                    "level": level,
+                    "status": log_record.status,
+                    "discard_reason": log_record.discard_reason,
+                    "review_notes": list(log_record.review_notes or []),
+                    "validations": list(log_record.validations or []),
+                    "definition_candidates": list(
+                        (log_record.candidate_preview or {}).get("definitions", [])
+                    ),
+                    "source_definition_candidates": list(
+                        (log_record.candidate_preview or {}).get("source_definitions", [])
+                    ),
+                    "quality_scores": dict(log_record.quality_scores or {}),
+                    "selection_reasons": dict(log_record.selection_reasons or {}),
+                }
+            )
         for stage_name, elapsed_ms in (log_record.stage_timings or {}).items():
             stats.stage_counter[stage_name] += int(elapsed_ms or 0)
             stats.stage_samples[stage_name] += 1
@@ -903,7 +962,6 @@ class DeckBuilder:
         exclude_closed_class_words: bool = True,
         attempt_budget: int = 0,
     ) -> dict[int, list[str]]:
-        random.seed(seed)
         pool_multiplier = max(1, int(pool_multiplier))
         attempt_budget = max(0, int(attempt_budget))
         pool_size = max(level_size * pool_multiplier, level_size)
@@ -925,14 +983,33 @@ class DeckBuilder:
                 break
             target_total *= 2
 
-        level1 = filtered_top[:pool_size]
-        level2 = filtered_top[pool_size : pool_size * 2]
-        level3 = filtered_top[pool_size * 2 : pool_size * 3]
+        band_size = max(
+            pool_size,
+            min(len(filtered_top) // 3, max(pool_size * 4, level_size * 12)),
+        )
+
+        def select_pool(words: list[str], *, selection_seed: int) -> list[str]:
+            unique_words = unique_keep_order(words)
+            if len(unique_words) <= pool_size:
+                return unique_words
+            chooser = random.Random(selection_seed)
+            selected_indexes = sorted(chooser.sample(range(len(unique_words)), pool_size))
+            return [unique_words[index] for index in selected_indexes]
+
+        level1 = select_pool(filtered_top[:band_size], selection_seed=seed * 10 + 1)
+        level2 = select_pool(
+            filtered_top[band_size : band_size * 2],
+            selection_seed=seed * 10 + 2,
+        )
+        level3 = select_pool(
+            filtered_top[band_size * 2 : band_size * 3],
+            selection_seed=seed * 10 + 3,
+        )
 
         return {
-            1: unique_keep_order(level1),
-            2: unique_keep_order(level2),
-            3: unique_keep_order(level3),
+            1: level1,
+            2: level2,
+            3: level3,
         }
 
     def _deck_config_for_language(self, language: str) -> tuple[dict, list[str]]:
@@ -1049,7 +1126,7 @@ class DeckBuilder:
 
         if run.interactive:
             try:
-                card = self._interactive_edit(card)
+                card = self._interactive_edit(card, log_record)
             except ValueError:
                 return None, LogRecord(
                     focus=word,
@@ -1059,6 +1136,10 @@ class DeckBuilder:
                     stage_timings=log_record.stage_timings,
                     event_counts=log_record.event_counts,
                     validations=["skipped_by_user"],
+                    review_notes=log_record.review_notes,
+                    candidate_preview=log_record.candidate_preview,
+                    quality_scores=log_record.quality_scores,
+                    selection_reasons=log_record.selection_reasons,
                     status="skipped",
                 )
 
@@ -1144,6 +1225,10 @@ class DeckBuilder:
         ai_calls_total = 0
         ai_calls_by_field: dict[str, int] = {}
         quality_errors: list[str] = []
+        review_notes: list[str] = []
+        candidate_preview: dict[str, list[str]] = {}
+        quality_scores: dict[str, float] = {}
+        selection_reasons: dict[str, str] = {}
         strict_quality = bool(run.strict_quality)
         validation_rules = _validations_for_language(
             run.language,
@@ -1160,6 +1245,12 @@ class DeckBuilder:
         sentence_cache_key = (
             f"{normalized_word}::lvl{level}::{sentence_min_words}-{sentence_max_words}::sv{SENTENCE_CACHE_SELECTION_VERSION}::v{cache_version}"
         )
+        refresh_text_kinds = {"sentences", "definitions", "translations", "word_translations"}
+
+        def cache_get(kind: str, key: str) -> object | None:
+            if run.refresh_text_cache and kind in refresh_text_kinds:
+                return None
+            return cache.get(kind, key)
 
         def allow_ai(field: str) -> bool:
             if ai_calls_total >= run.ai_max_calls_per_word:
@@ -1195,9 +1286,49 @@ class DeckBuilder:
                     getattr(result, "elapsed_ms", 0) or 0
                 )
 
+        def trace_candidates_result(
+            field: str,
+            result: object,
+            *,
+            ai_field: str | None = None,
+            stage_key: str | None = None,
+        ) -> None:
+            provider_name = str(getattr(result, "provider_name", "none") or "none")
+            providers_used[field] = provider_name
+            error = getattr(result, "error", None)
+            if error:
+                provider_errors[field] = str(error)
+            fallback_errors = getattr(result, "fallback_errors", None)
+            if isinstance(fallback_errors, dict):
+                for name, item_error in fallback_errors.items():
+                    if item_error:
+                        provider_errors[f"{field}:{name}"] = str(item_error)
+            if ai_field:
+                used_ai = provider_name == "ai"
+                if not used_ai and isinstance(getattr(result, "candidates", None), list):
+                    used_ai = any(
+                        getattr(candidate, "provider_name", "") == "ai"
+                        for candidate in getattr(result, "candidates", [])
+                    )
+                if used_ai:
+                    mark_ai(ai_field)
+            if stage_key:
+                stage_timings[stage_key] = stage_timings.get(stage_key, 0) + int(
+                    getattr(result, "elapsed_ms", 0) or 0
+                )
+
         def remember_quality_error(name: str | None) -> None:
             if name and name not in quality_errors:
                 quality_errors.append(name)
+
+        def remember_review_note(name: str | None) -> None:
+            if name and name not in review_notes:
+                review_notes.append(name)
+
+        def set_candidate_preview(name: str, values: list[str]) -> None:
+            previews = [str(value).strip() for value in values if str(value).strip()]
+            if previews:
+                candidate_preview[name] = previews[: max(1, int(run.definition_candidates_limit or 5))]
 
         def count_event(name: str) -> None:
             if name:
@@ -1208,7 +1339,7 @@ class DeckBuilder:
                 text,
                 language,
                 pos_mode="auto",
-                min_words=1,
+                min_words=2,
                 max_words=12,
                 policy=self.definition_policy,
             )
@@ -1218,33 +1349,10 @@ class DeckBuilder:
                 return "definition_missing"
             if not definition_has_pos(text, policy=self.definition_policy):
                 return "definition_missing_pos"
-            body = text.split(":", 1)[1].strip() if ":" in text else text.strip()
-            alpha_body_tokens = [
-                token for token in body.split() if any(char.isalpha() for char in token)
-            ]
-            normalized_expected = str(expected_language or "").strip().lower().split("-", 1)[0]
-            if (
-                strict_quality
-                and len(alpha_body_tokens) >= 2
-                and not text_matches_language(
-                    body, expected_language, min_score=0.25, min_tokens=2
-                )
+            if strict_quality and not text_matches_language(
+                text, expected_language, min_score=0.25, min_tokens=3
             ):
                 return "definition_wrong_language"
-            if strict_quality and len(alpha_body_tokens) == 1 and normalized_expected:
-                token = alpha_body_tokens[0].strip(".,;:!?").lower()
-                candidate_languages = ("en", "es", "fr", "it", "de", "ru")
-                expected_zipf = zipf_frequency(token, normalized_expected)
-                competing_zipf = max(
-                    (
-                        zipf_frequency(token, language_code)
-                        for language_code in candidate_languages
-                        if language_code != normalized_expected
-                    ),
-                    default=0.0,
-                )
-                if competing_zipf - expected_zipf >= 1.0:
-                    return "definition_wrong_language"
             semantic_issue = semantic_definition_reason(text, word)
             if semantic_issue:
                 if semantic_issue == "definition_mentions_other_language":
@@ -1304,6 +1412,152 @@ class DeckBuilder:
             issue = definition_issue(text, expected_language)
             return (text, None) if not issue else ("", issue)
 
+        def definition_specificity_score(text: str) -> float:
+            _pos_label, body = split_definition(text, policy=self.definition_policy)
+            alpha_tokens = [token for token in tokenize(body) if any(char.isalpha() for char in token)]
+            if not alpha_tokens:
+                return 0.0
+            target_min, target_max = {
+                1: (2, 6),
+                2: (3, 8),
+                3: (4, 10),
+            }.get(level, (3, 8))
+            count = len(alpha_tokens)
+            if count < target_min:
+                return max(0.0, count / max(1, target_min))
+            if count > target_max:
+                overflow = min(1.0, (count - target_max) / max(1, target_max))
+                return max(0.2, 1.0 - overflow)
+            return 1.0
+
+        def definition_alignment_score(
+            text: str,
+            expected_language: str,
+            *,
+            inherited_alignment: float = 0.0,
+            translation_reference: str = "",
+        ) -> float:
+            _pos_label, body = split_definition(text, policy=self.definition_policy)
+            if not body:
+                return inherited_alignment
+            reference = ""
+            reference_language = expected_language
+            if expected_language == run.language:
+                reference = sentence
+                reference_language = run.language
+            elif translation_reference and expected_language == run.target_translation:
+                reference = translation_reference
+                reference_language = run.target_translation
+            if not reference:
+                return inherited_alignment
+            overlap = token_overlap_score(
+                body,
+                reference,
+                reference_language,
+                drop=tokenize(word),
+            )
+            return max(inherited_alignment, overlap)
+
+        def make_definition_selection_reason(
+            source_kind: str,
+            provider_name: str,
+            alignment: float,
+            specificity: float,
+        ) -> str:
+            parts = [source_kind, provider_name]
+            if alignment > 0:
+                parts.append(f"align={alignment:.2f}")
+            parts.append(f"specificity={specificity:.2f}")
+            return "; ".join(parts)
+
+        def make_definition_candidate(
+            candidate: str,
+            expected_language: str,
+            *,
+            provider_name: str,
+            source_kind: str,
+            inherited_alignment: float = 0.0,
+            lemma_value: str = "",
+            sense_note_value: str = "",
+            translation_reference: str = "",
+        ) -> DefinitionSelectionCandidate | None:
+            text, issue = finalize_definition(candidate, expected_language)
+            if issue:
+                return None
+            pos_label, body = split_definition(text, policy=self.definition_policy)
+            specificity = definition_specificity_score(text)
+            alignment = definition_alignment_score(
+                text,
+                expected_language,
+                inherited_alignment=inherited_alignment,
+                translation_reference=translation_reference,
+            )
+            selection_score = specificity + alignment * 1.8
+            if source_kind in {"cache_context", "context", "translated_context"}:
+                selection_score += 0.3
+            elif source_kind.startswith("cache"):
+                selection_score += 0.15
+            elif source_kind.startswith("translated"):
+                selection_score += 0.1
+            if provider_name == "ai" and sentence:
+                selection_score += 0.08
+            review_flags: list[str] = []
+            if sentence and alignment < 0.08:
+                review_flags.append("definition_low_context_alignment")
+            if specificity < 0.55:
+                review_flags.append("definition_low_specificity")
+            return DefinitionSelectionCandidate(
+                text=text,
+                expected_language=expected_language,
+                provider_name=provider_name,
+                source_kind=source_kind,
+                selection_score=selection_score,
+                pos=pos_label,
+                body=body,
+                lemma=lemma_value,
+                sense_note=sense_note_value,
+                alignment_score=alignment,
+                specificity_score=specificity,
+                review_notes=review_flags,
+                selection_reason=make_definition_selection_reason(
+                    source_kind,
+                    provider_name,
+                    alignment,
+                    specificity,
+                ),
+            )
+
+        def definition_variants(
+            pos_label: str,
+            body: str,
+        ) -> tuple[str, str]:
+            precise_body = trim_definition_body(
+                body,
+                2 if level <= 2 else 3,
+                10 if level == 1 else 12,
+            ) or body.strip().rstrip(".")
+            short_body = trim_definition_body(
+                body,
+                2,
+                5 if level == 1 else 7,
+            )
+            precise = build_definition(pos_label, precise_body, policy=self.definition_policy)
+            short = build_definition(pos_label, short_body, policy=self.definition_policy)
+            if short == precise:
+                short = ""
+            return short, precise
+
+        def should_cache_definition_candidate(
+            candidate: DefinitionSelectionCandidate | None,
+        ) -> bool:
+            if candidate is None:
+                return False
+            if candidate.review_notes:
+                return False
+            if candidate.source_kind in {"word_fallback", "ai"}:
+                return False
+            return candidate.selection_score >= 1.0
+
         def translation_issue(text: str, source_sentence: str) -> str | None:
             value = (text or "").strip()
             if not value:
@@ -1339,6 +1593,10 @@ class DeckBuilder:
                 stage_timings=stage_timings,
                 event_counts=dict(event_counts),
                 validations=validations,
+                review_notes=review_notes,
+                candidate_preview=candidate_preview,
+                quality_scores=quality_scores,
+                selection_reasons=selection_reasons,
                 status="discarded",
                 discard_reason=_infer_discard_reason(validations, provider_errors),
             )
@@ -1502,7 +1760,7 @@ class DeckBuilder:
             nonlocal sentence, last_sentence_issue
             if sentence:
                 return sentence
-            cached_sentence = cache.get("sentences", sentence_cache_key) or ""
+            cached_sentence = cache_get("sentences", sentence_cache_key) or ""
             cached_text, cached_errors, _cached_core, _cached_level = analyze_sentence(
                 cached_sentence
             )
@@ -1654,6 +1912,10 @@ class DeckBuilder:
                 sentence_attempts += 1
 
             selected_candidate = choose_sentence_candidate()
+            set_candidate_preview(
+                "sentences",
+                [candidate.text for candidate in ranked_sentence_candidates(valid_sentence_candidates)],
+            )
             if selected_candidate is not None:
                 return finalize_selected_sentence(selected_candidate)
 
@@ -1673,6 +1935,27 @@ class DeckBuilder:
                     else:
                         remember_invalid_sentence_candidate(templated_candidate)
             return sentence
+
+        source_definition_candidates: dict[str, DefinitionSelectionCandidate] = {}
+        final_definition_candidates: dict[str, DefinitionSelectionCandidate] = {}
+        chosen_definition_candidate: DefinitionSelectionCandidate | None = None
+        definition_ambiguity_detected = False
+
+        def remember_source_definition_candidate(
+            candidate: DefinitionSelectionCandidate,
+        ) -> None:
+            key = candidate.text.casefold()
+            existing = source_definition_candidates.get(key)
+            if existing is None or candidate.selection_score > existing.selection_score:
+                source_definition_candidates[key] = candidate
+
+        def remember_final_definition_candidate(
+            candidate: DefinitionSelectionCandidate,
+        ) -> None:
+            key = candidate.text.casefold()
+            existing = final_definition_candidates.get(key)
+            if existing is None or candidate.selection_score > existing.selection_score:
+                final_definition_candidates[key] = candidate
 
         if run.exclude_closed_class_words and is_closed_class_word(word, run.language):
             cache.set(
@@ -1707,198 +1990,325 @@ class DeckBuilder:
                             remember_quality_error("focus_not_in_lexicon")
                             return discard_log(quality_errors)
 
+        if run.definition_context_first:
+            build_sentence()
+
         definition_lang = "en"
         definition_key = f"{normalized_word}::{definition_lang}::v{cache_version}"
         source_key = f"{normalized_word}::{run.language}::v{cache_version}"
+        context_definition_key = _definition_cache_key(
+            normalized_word,
+            level,
+            sentence,
+            definition_lang,
+            cache_version,
+        )
+        context_source_key = _definition_cache_key(
+            normalized_word,
+            level,
+            sentence,
+            run.language,
+            cache_version,
+        )
 
         source_definition = ""
         definition = ""
         source_definition_issue: str | None = None
         final_definition_issue: str | None = None
+        pos = ""
+        lemma = word
+        sense_note = ""
+        definition_selection_reason = ""
 
-        def classify_definition_candidate(
-            candidate: str,
-        ) -> tuple[str | None, str, str | None]:
-            source_value, source_issue = finalize_definition(candidate, run.language)
-            if source_value:
-                return "source", source_value, None
-            direct_definition, direct_issue = finalize_definition(candidate, "en")
-            if direct_definition:
-                return "definition", direct_definition, None
-            return None, "", source_issue or direct_issue
+        def load_cached_definition_candidate(
+            key: str,
+            expected_language: str,
+            *,
+            source_kind: str,
+        ) -> DefinitionSelectionCandidate | None:
+            cached_value = (cache_get("definitions", key) or "").strip()
+            if not cached_value:
+                return None
+            return make_definition_candidate(
+                cached_value,
+                expected_language,
+                provider_name="cache",
+                source_kind=source_kind,
+            )
+
+        def collect_provider_definition_candidates(
+            expected_language: str,
+            *,
+            stage_key: str,
+            field_name: str,
+        ) -> list[DefinitionSelectionCandidate]:
+            provider_method = getattr(providers, "definition_candidates", None)
+            collected: list[DefinitionSelectionCandidate] = []
+            if callable(provider_method):
+                result = provider_method(
+                    word,
+                    run.language,
+                    allow_ai=allow_ai("definition"),
+                    definition_language=expected_language,
+                    sentence=sentence or None,
+                )
+                trace_candidates_result(
+                    field_name,
+                    result,
+                    ai_field="definition",
+                    stage_key=stage_key,
+                )
+                for raw_candidate in list(getattr(result, "candidates", []) or []):
+                    candidate = make_definition_candidate(
+                        getattr(raw_candidate, "text", ""),
+                        expected_language,
+                        provider_name=getattr(raw_candidate, "provider_name", result.provider_name),
+                        source_kind=str(getattr(raw_candidate, "source", "provider") or "provider"),
+                    )
+                    if candidate is not None:
+                        collected.append(candidate)
+                        continue
+                    if expected_language != definition_lang:
+                        english_candidate = make_definition_candidate(
+                            getattr(raw_candidate, "text", ""),
+                            definition_lang,
+                            provider_name=getattr(raw_candidate, "provider_name", result.provider_name),
+                            source_kind="provider_gloss",
+                        )
+                        if english_candidate is not None:
+                            remember_final_definition_candidate(english_candidate)
+                return collected
+
+            result = providers.definition(
+                word,
+                run.language,
+                allow_ai=allow_ai("definition"),
+                definition_language=expected_language,
+            )
+            trace_result(
+                field_name,
+                result,
+                ai_field="definition",
+                stage_key=stage_key,
+            )
+            candidate = make_definition_candidate(
+                result.value or "",
+                expected_language,
+                provider_name=result.provider_name,
+                source_kind="provider",
+            )
+            if candidate is None and expected_language != definition_lang:
+                english_candidate = make_definition_candidate(
+                    result.value or "",
+                    definition_lang,
+                    provider_name=result.provider_name,
+                    source_kind="provider_gloss",
+                )
+                if english_candidate is not None:
+                    remember_final_definition_candidate(english_candidate)
+            return [candidate] if candidate is not None else []
+
+        cached_final_candidates = [
+            load_cached_definition_candidate(
+                context_definition_key,
+                definition_lang,
+                source_kind="cache_context",
+            ),
+            load_cached_definition_candidate(
+                definition_key,
+                definition_lang,
+                source_kind="cache_word",
+            ),
+        ]
+        for cached_candidate in cached_final_candidates:
+            if cached_candidate is not None:
+                remember_final_definition_candidate(cached_candidate)
+
+        cached_source_candidates = [
+            load_cached_definition_candidate(
+                context_source_key,
+                run.language,
+                source_kind="cache_context",
+            ),
+            load_cached_definition_candidate(
+                source_key,
+                run.language,
+                source_kind="cache_word",
+            ),
+        ]
+        for cached_candidate in cached_source_candidates:
+            if cached_candidate is not None:
+                remember_source_definition_candidate(cached_candidate)
 
         if run.language == "en":
-            cached_definition = cache.get("definitions", definition_key) or ""
-            definition, final_definition_issue = finalize_definition(
-                cached_definition, "en"
-            )
-            if not definition:
-                result = providers.definition(
-                    word,
-                    run.language,
-                    allow_ai=allow_ai("definition"),
-                    definition_language="en",
-                )
-                trace_result(
-                    "definition",
-                    result,
-                    ai_field="definition",
+            if not final_definition_candidates:
+                for candidate in collect_provider_definition_candidates(
+                    "en",
                     stage_key="definition_source_ms",
-                )
-                definition, final_definition_issue = finalize_definition(
-                    result.value or "", "en"
-                )
-                if (
-                    not definition
-                    and allow_ai("definition")
-                    and run.mode == "full"
-                    and run.definition_context_fallback
+                    field_name="definition",
                 ):
-                    context_sentence = build_sentence()
-                    if context_sentence:
-                        result = request_definition_from_context("en", context_sentence)
-                    else:
-                        result = request_definition_ai("en")
-                    trace_result(
-                        "definition",
-                        result,
-                        ai_field="definition",
-                        stage_key="definition_context_ms",
-                    )
-                    definition, final_definition_issue = finalize_definition(
-                        result.value or "", "en"
-                    )
+                    remember_final_definition_candidate(candidate)
         else:
-            cached_definition = cache.get("definitions", definition_key) or ""
-            definition, final_definition_issue = finalize_definition(
-                cached_definition, "en"
-            )
-            if not definition:
-                cached_source = cache.get("definitions", source_key) or ""
-                source_kind, source_value, source_issue = classify_definition_candidate(
-                    cached_source
-                )
-                if source_kind == "source":
-                    source_definition = source_value
-                    source_definition_issue = None
-                elif source_kind == "definition":
-                    definition = source_value
-                    final_definition_issue = None
-                else:
-                    source_definition_issue = source_issue
-
-            if not definition and not source_definition:
-                result = providers.definition(
-                    word,
+            if not source_definition_candidates and not final_definition_candidates:
+                for candidate in collect_provider_definition_candidates(
                     run.language,
-                    allow_ai=allow_ai("definition"),
-                    definition_language=run.language,
-                )
-                trace_result(
-                    "definition_source",
-                    result,
-                    ai_field="definition",
                     stage_key="definition_source_ms",
-                )
-                source_kind, source_value, source_issue = classify_definition_candidate(
-                    result.value or ""
-                )
-                if source_kind == "source":
-                    source_definition = source_value
-                    source_definition_issue = None
-                elif source_kind == "definition":
-                    definition = source_value
-                    final_definition_issue = None
-                else:
-                    source_definition_issue = source_issue
-                if (
-                    not definition
-                    and not source_definition
-                    and allow_ai("definition")
-                    and run.mode == "full"
-                    and run.definition_context_fallback
+                    field_name="definition_source",
                 ):
-                    context_sentence = build_sentence()
-                    if context_sentence:
-                        result = request_definition_from_context(
-                            run.language, context_sentence
+                    remember_source_definition_candidate(candidate)
+
+            ranked_source_candidates = sorted(
+                source_definition_candidates.values(),
+                key=lambda item: item.selection_score,
+                reverse=True,
+            )
+            unique_source_bodies = {candidate.body.casefold() for candidate in ranked_source_candidates if candidate.body}
+            definition_ambiguity_detected = len(unique_source_bodies) > 1
+            if definition_ambiguity_detected:
+                count_event("definition_polysemy_detected")
+                remember_review_note("definition_polysemy_detected")
+
+            if ranked_source_candidates:
+                source_definition = ranked_source_candidates[0].text
+                source_definition_issue = None
+                if (
+                    not definition_ambiguity_detected
+                    and should_cache_definition_candidate(ranked_source_candidates[0])
+                ):
+                    cache.set("definitions", source_key, source_definition)
+                    if context_source_key and ranked_source_candidates[0].alignment_score > 0:
+                        cache.set("definitions", context_source_key, source_definition)
+
+            if not final_definition_candidates:
+                for source_candidate in ranked_source_candidates[: max(1, int(run.definition_candidates_limit or 5))]:
+                    result = providers.translation_web(source_candidate.text, run.language, "en")
+                    trace_result("definition", result, stage_key="definition_translate_ms")
+                    translated_candidate = make_definition_candidate(
+                        result.value or "",
+                        "en",
+                        provider_name=result.provider_name,
+                        source_kind=(
+                            "translated_context"
+                            if source_candidate.alignment_score > 0
+                            else "translated_source"
+                        ),
+                        inherited_alignment=source_candidate.alignment_score,
+                        lemma_value=source_candidate.lemma or word,
+                        sense_note_value=source_candidate.sense_note,
+                    )
+                    if translated_candidate is not None:
+                        remember_final_definition_candidate(translated_candidate)
+                        continue
+                    if allow_ai("definition"):
+                        result = providers.translation_ai(source_candidate.text, run.language, "en")
+                        trace_result(
+                            "definition",
+                            result,
+                            ai_field="definition",
+                            stage_key="definition_translate_ms",
                         )
-                    else:
-                        result = request_definition_ai(run.language)
-                    trace_result(
-                        "definition_source",
-                        result,
-                        ai_field="definition",
-                        stage_key="definition_context_ms",
-                    )
-                    source_kind, source_value, source_issue = classify_definition_candidate(
-                        result.value or ""
-                    )
-                    if source_kind == "source":
-                        source_definition = source_value
-                        source_definition_issue = None
-                    elif source_kind == "definition":
-                        definition = source_value
-                        final_definition_issue = None
-                    else:
-                        source_definition_issue = source_issue
+                        translated_candidate = make_definition_candidate(
+                            result.value or "",
+                            "en",
+                            provider_name=result.provider_name,
+                            source_kind=(
+                                "translated_context"
+                                if source_candidate.alignment_score > 0
+                                else "translated_source"
+                            ),
+                            inherited_alignment=source_candidate.alignment_score,
+                            lemma_value=source_candidate.lemma or word,
+                            sense_note_value=source_candidate.sense_note,
+                        )
+                        if translated_candidate is not None:
+                            remember_final_definition_candidate(translated_candidate)
 
-            if source_definition:
-                cache.set("definitions", source_key, source_definition)
-            if not definition and source_definition:
-                result = providers.translation_web(source_definition, run.language, "en")
-                trace_result("definition", result, stage_key="definition_translate_ms")
-                definition, final_definition_issue = finalize_definition(
-                    result.value or "", "en"
-                )
-                if not definition and allow_ai("definition"):
-                    result = providers.translation_ai(source_definition, run.language, "en")
-                    trace_result(
-                        "definition",
-                        result,
-                        ai_field="definition",
-                        stage_key="definition_translate_ms",
-                    )
-                    definition, final_definition_issue = finalize_definition(
-                        result.value or "", "en"
-                    )
-                if (
-                    not definition
-                    and allow_ai("definition")
-                    and run.mode == "full"
-                    and run.definition_context_fallback
-                ):
-                    context_sentence = build_sentence()
-                    if context_sentence:
-                        result = request_definition_from_context("en", context_sentence)
-                    else:
-                        result = request_definition_ai("en")
-                    trace_result(
-                        "definition",
-                        result,
-                        ai_field="definition",
-                        stage_key="definition_context_ms",
-                    )
-                    definition, final_definition_issue = finalize_definition(
-                        result.value or "", "en"
-                    )
-
-            if not definition and allow_ai("definition"):
-                result = request_definition_ai("en")
+            if not final_definition_candidates and allow_ai("definition"):
+                direct_ai = request_definition_ai("en")
                 trace_result(
                     "definition",
-                    result,
+                    direct_ai,
                     ai_field="definition",
                     stage_key="definition_context_ms",
                 )
-                definition, final_definition_issue = finalize_definition(
-                    result.value or "", "en"
+                direct_candidate = make_definition_candidate(
+                    direct_ai.value or "",
+                    "en",
+                    provider_name=direct_ai.provider_name,
+                    source_kind="ai",
                 )
+                if direct_candidate is not None:
+                    remember_final_definition_candidate(direct_candidate)
+            if (
+                sentence
+                and allow_ai("definition")
+                and run.definition_context_fallback
+                and (not final_definition_candidates or definition_ambiguity_detected)
+            ):
+                context_ai = request_definition_from_context("en", sentence)
+                trace_result(
+                    "definition",
+                    context_ai,
+                    ai_field="definition",
+                    stage_key="definition_context_ms",
+                )
+                context_candidate = make_definition_candidate(
+                    context_ai.value or "",
+                    "en",
+                    provider_name=context_ai.provider_name,
+                    source_kind="context",
+                )
+                if context_candidate is not None:
+                    remember_final_definition_candidate(context_candidate)
+
+        if not final_definition_candidates and sentence and run.language == "en" and allow_ai("definition"):
+            context_ai = request_definition_from_context("en", sentence)
+            trace_result(
+                "definition",
+                context_ai,
+                ai_field="definition",
+                stage_key="definition_context_ms",
+            )
+            context_candidate = make_definition_candidate(
+                context_ai.value or "",
+                "en",
+                provider_name=context_ai.provider_name,
+                source_kind="context",
+            )
+            if context_candidate is not None:
+                remember_final_definition_candidate(context_candidate)
+
+        ranked_final_candidates = sorted(
+            final_definition_candidates.values(),
+            key=lambda item: item.selection_score,
+            reverse=True,
+        )
+        set_candidate_preview(
+            "definitions",
+            [candidate.text for candidate in ranked_final_candidates],
+        )
+        set_candidate_preview(
+            "source_definitions",
+            [candidate.text for candidate in source_definition_candidates.values()],
+        )
+
+        if ranked_final_candidates:
+            chosen_definition_candidate = ranked_final_candidates[0]
+            definition = chosen_definition_candidate.text
+            definition_selection_reason = chosen_definition_candidate.selection_reason
+            final_definition_issue = None
+            pos = chosen_definition_candidate.pos
+            lemma = chosen_definition_candidate.lemma or lemma
+            sense_note = chosen_definition_candidate.sense_note
+            quality_scores["definition"] = round(chosen_definition_candidate.selection_score, 4)
+            selection_reasons["definition"] = definition_selection_reason
+            for note in chosen_definition_candidate.review_notes:
+                remember_review_note(note)
 
         if not definition and run.definition_word_fallback:
             fallback_translation_key = f"{normalized_word}::{run.language}->en::v{cache_version}"
             fallback_translation = (
-                cache.get("word_translations", fallback_translation_key) or ""
+                cache_get("word_translations", fallback_translation_key) or ""
             ).strip()
             if not fallback_translation:
                 result = providers.translation_web(word, run.language, "en")
@@ -1908,16 +2318,32 @@ class DeckBuilder:
                     cache.set(
                         "word_translations", fallback_translation_key, fallback_translation
                     )
-            fallback_definition = _definition_from_word_translation(fallback_translation)
-            if fallback_definition:
-                definition, final_definition_issue = finalize_definition(
-                    fallback_definition, "en"
-                )
-                if definition:
-                    count_event("definition_word_fallback_hit")
+            fallback_definition = _definition_from_word_translation(
+                fallback_translation,
+                pos_hint=pos,
+                level=level,
+            )
+            fallback_candidate = make_definition_candidate(
+                fallback_definition,
+                "en",
+                provider_name="template",
+                source_kind="word_fallback",
+            )
+            if fallback_candidate is not None:
+                chosen_definition_candidate = fallback_candidate
+                definition = fallback_candidate.text
+                pos = fallback_candidate.pos
+                definition_selection_reason = fallback_candidate.selection_reason
+                quality_scores["definition"] = round(fallback_candidate.selection_score, 4)
+                selection_reasons["definition"] = definition_selection_reason
+                count_event("definition_word_fallback_hit")
+                remember_review_note("definition_word_fallback_used")
 
         if definition:
-            cache.set("definitions", definition_key, definition)
+            if should_cache_definition_candidate(chosen_definition_candidate):
+                cache.set("definitions", definition_key, definition)
+                if context_definition_key and chosen_definition_candidate and chosen_definition_candidate.alignment_score > 0:
+                    cache.set("definitions", context_definition_key, definition)
 
         if not definition:
             remember_quality_error(
@@ -1935,7 +2361,7 @@ class DeckBuilder:
         translation_key = (
             f"{sentence}::{run.language}->{run.target_translation}::v{cache_version}"
         )
-        cached_translation = cache.get("translations", translation_key) or ""
+        cached_translation = cache_get("translations", translation_key) or ""
         translation, translation_issue_name = finalize_translation(
             cached_translation, sentence
         )
@@ -1973,7 +2399,7 @@ class DeckBuilder:
                     f"{normalized_word}::{run.language}->en::v{cache_version}"
                 )
                 fallback_word_translation = (
-                    cache.get("word_translations", fallback_translation_key) or ""
+                    cache_get("word_translations", fallback_translation_key) or ""
                 ).strip()
                 if not fallback_word_translation:
                     result = providers.translation_web(word, run.language, "en")
@@ -2003,6 +2429,29 @@ class DeckBuilder:
             remember_quality_error(translation_issue_name or "translation_missing")
             return discard_log(quality_errors)
 
+        definition_translation_alignment = definition_alignment_score(
+            definition,
+            definition_lang,
+            translation_reference=translation,
+        )
+        quality_scores["definition_translation_alignment"] = round(
+            definition_translation_alignment,
+            4,
+        )
+        if run.language != "en" and definition_translation_alignment < 0.08:
+            remember_review_note("definition_low_translation_alignment")
+
+        selected_pos, selected_body = split_definition(
+            definition,
+            policy=self.definition_policy,
+        )
+        pos = pos or selected_pos
+        if definition_ambiguity_detected and not sense_note:
+            sense_note = "Chosen for the example sentence context."
+        if not sense_note and chosen_definition_candidate and chosen_definition_candidate.source_kind.startswith("translated"):
+            sense_note = "Built from the best source-language sense."
+        _short_definition, precise_definition = definition_variants(pos, selected_body)
+
         ipa = cache.get("ipa", normalized_word)
         if not ipa:
             result = providers.ipa(word, run.language, allow_ai=allow_ai("ipa"))
@@ -2029,7 +2478,7 @@ class DeckBuilder:
             index=index if level == 1 else 0,
             ipa=_normalize_ipa(ipa),
             source_definition=source_definition,
-            definition=definition,
+            definition=precise_definition or definition,
             sentence=sentence,
             translation=translation,
             translation_language=run.target_translation,
@@ -2049,6 +2498,10 @@ class DeckBuilder:
             stage_timings=stage_timings,
             event_counts=dict(event_counts),
             validations=quality_errors,
+            review_notes=review_notes,
+            candidate_preview=candidate_preview,
+            quality_scores=quality_scores,
+            selection_reasons=selection_reasons,
             status="candidate",
         )
 
@@ -2442,25 +2895,89 @@ class DeckBuilder:
                         f"  level{level}_{key}: total {total_ms} ms, avg {avg_ms:.1f} ms"
                     )
 
-    def _interactive_edit(self, card: CardData) -> CardData:
+    def _write_quality_outputs(self, run: RunConfig, stats: BuildStats) -> None:
+        average_definition_score = 0.0
+        if stats.definition_score_samples:
+            average_definition_score = (
+                stats.definition_score_total / stats.definition_score_samples
+            )
+        report = {
+            "generated_at": datetime.utcnow().isoformat(),
+            "language": run.language,
+            "mode": run.mode,
+            "cards": len(stats.cards),
+            "attempted_by_level": dict(stats.attempted_by_level),
+            "accepted_by_level": dict(stats.accepted_by_level),
+            "discard_reasons": dict(stats.discard_counter),
+            "top_validation_errors": dict(stats.validation_counter.most_common(10)),
+            "definition_sources": dict(stats.definition_source_counter),
+            "ambiguous_focuses": dict(stats.ambiguous_focus_counter.most_common(20)),
+            "needs_review": len(stats.needs_review_items),
+            "definition_score": {
+                "average": round(average_definition_score, 4),
+                "samples": stats.definition_score_samples,
+            },
+            "provider_counter": dict(stats.provider_counter),
+            "event_counter": dict(stats.event_counter),
+        }
+        ensure_dir(Path(run.quality_report_path).parent)
+        atomic_write_json(run.quality_report_path, report)
+        ensure_dir(Path(run.review_queue_path).parent)
+        atomic_write_json(run.review_queue_path, stats.needs_review_items)
+
+    def _interactive_edit(self, card: CardData, log_record: LogRecord) -> CardData:
         print("\n--- Review Card ---")
         print(card.model_dump())
+        definition_options = list((log_record.candidate_preview or {}).get("definitions", []))
+        sentence_options = list((log_record.candidate_preview or {}).get("sentences", []))
+        if definition_options:
+            print("Definition options:")
+            for index, value in enumerate(definition_options, start=1):
+                print(f"  {index}. {value}")
+        if sentence_options:
+            print("Sentence options:")
+            for index, value in enumerate(sentence_options, start=1):
+                print(f"  {index}. {value}")
+        if log_record.selection_reasons:
+            print(f"Selection reasons: {log_record.selection_reasons}")
+        if log_record.review_notes:
+            print(f"Review notes: {', '.join(log_record.review_notes)}")
+
+        def apply_definition_choice(value: str) -> None:
+            card.definition = value
+
         while True:
-            choice = input("Accept (a), edit field (e), or skip (s)? ").strip().lower()
+            choice = input(
+                "Accept (a), choose definition (d), choose sentence (n), edit field (e), or skip (s)? "
+            ).strip().lower()
             if choice == "a":
                 return card
             if choice == "s":
                 raise ValueError("card skipped")
+            if choice == "d":
+                selected = input("Definition option number: ").strip()
+                if selected.isdigit():
+                    index = int(selected) - 1
+                    if 0 <= index < len(definition_options):
+                        apply_definition_choice(definition_options[index])
+                continue
+            if choice == "n":
+                selected = input("Sentence option number: ").strip()
+                if selected.isdigit():
+                    index = int(selected) - 1
+                    if 0 <= index < len(sentence_options):
+                        card.sentence = sentence_options[index]
+                continue
             if choice == "e":
                 field = input(
-                    "Field to edit (focus, definition, sentence, translation, ipa, image, "
-                    "spellings, example_word, word_translation, letter_audio, word_audio, sentence_audio): "
+                    "Field to edit (focus, definition, sentence, translation, ipa, image, spellings, example_word, word_translation, letter_audio, word_audio, sentence_audio): "
                 ).strip()
                 if hasattr(card, field):
                     value = input("New value: ")
                     setattr(card, field, value)
                 else:
                     print("Unknown field")
+                continue
 
     def _cleanup_run_artifacts(
         self,
@@ -2562,7 +3079,32 @@ def _sentence_template_fallback(word: str, language: str, level: int) -> str | N
     return template.format(focus=word)
 
 
-def _definition_from_word_translation(value: str) -> str:
+def _definition_context_signature(sentence: str) -> str:
+    normalized = re.sub(r"\s+", " ", (sentence or "").strip().lower())
+    if not normalized:
+        return ""
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:10]
+
+
+def _definition_cache_key(
+    word: str,
+    level: int,
+    sentence: str,
+    target_language: str,
+    cache_version: int,
+) -> str:
+    signature = _definition_context_signature(sentence)
+    if not signature:
+        return ""
+    return f"{word}::lvl{level}::{signature}::{target_language}::v{cache_version}"
+
+
+def _definition_from_word_translation(
+    value: str,
+    *,
+    pos_hint: str = "",
+    level: int = 1,
+) -> str:
     cleaned = re.sub(r"\s+", " ", (value or "").strip())
     cleaned = re.sub(r"[^A-Za-z0-9\s'\-]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -2572,7 +3114,19 @@ def _definition_from_word_translation(value: str) -> str:
     phrase = " ".join(tokens[:8]).strip()
     if not phrase:
         return ""
-    return f"noun: common concept related to {phrase}"
+    pos_label = (pos_hint or "noun").strip().lower() or "noun"
+    if pos_label in {"verb", "auxiliary verb"}:
+        body = f"to use or express {phrase}"
+    elif pos_label == "adjective":
+        body = f"having a quality related to {phrase}"
+    elif pos_label == "adverb":
+        body = f"in a way related to {phrase}"
+    elif pos_label == "expression":
+        body = f"expression related to {phrase}"
+    else:
+        prefix = "basic idea" if int(level or 1) == 1 else "concept"
+        body = f"{prefix} related to {phrase}"
+    return build_definition(pos_label, body)
 
 
 def _translation_from_word(value: str) -> str:
@@ -2592,7 +3146,7 @@ def _translation_from_definition(value: str) -> str:
     text = (value or "").strip()
     if not text:
         return ""
-    cleaned = re.sub(r"^[A-Za-z\s]+:\s*", "", text)
+    _pos_label, cleaned = split_definition(text)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = re.sub(r"[^A-Za-z0-9\s'\-]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()

@@ -243,63 +243,40 @@ def test_wiktionary_meta_definition_uses_formof_lemma_for_nouns(monkeypatch):
     assert result.value == "noun: control, administration"
 
 
-def test_wiktionary_meta_definition_resolves_alternative_spelling(monkeypatch):
+def test_definition_candidates_collect_multiple_sources(monkeypatch):
     provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
 
-    def fake_get(url, timeout=None):
-        class FakeResponse:
-            status_code = 200
+    monkeypatch.setattr(
+        provider,
+        "_wiktionary_definitions",
+        lambda *args, **kwargs: [
+            "adjective: in good condition or quality",
+            "adverb: well, satisfactorily",
+        ],
+    )
+    monkeypatch.setattr(
+        provider,
+        "_definition_ai",
+        lambda *args, **kwargs: "adjective: suitable for the current situation",
+    )
+    monkeypatch.setattr(
+        provider,
+        "_definition_from_context_ai",
+        lambda *args, **kwargs: "adjective: fitting the example sentence context",
+    )
 
-            def json(self):
-                if url.endswith("/" + quote("\u0435\u0449\u0435")):
-                    return {
-                        "ru": [
-                            {
-                                "partOfSpeech": "adverb",
-                                "definitions": [
-                                    {
-                                        "definition": "alternative spelling of \u0435\u0449\u0451"
-                                    }
-                                ],
-                            }
-                        ]
-                    }
-                return {
-                    "ru": [
-                        {
-                            "partOfSpeech": "adverb",
-                            "definitions": [
-                                {"definition": "still, yet, more"}
-                            ],
-                        }
-                    ]
-                }
+    result = provider.definition_candidates(
+        "bien",
+        "es",
+        allow_ai=True,
+        definition_language="es",
+        sentence="Hoy me siento bien en casa.",
+    )
 
-        _ = timeout
-        return FakeResponse()
-
-    monkeypatch.setattr(provider._session, "get", fake_get)
-    result = provider.definition("\u0435\u0449\u0435", "ru", allow_ai=False)
-    assert result.value == "adverb: still, yet, more"
-
-
-def test_definition_ai_prompt_requests_precise_gloss(monkeypatch):
-    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
-    captured: dict[str, str] = {}
-
-    def fake_ai_request(system_prompt, user_prompt, first_line_only=True):
-        _ = system_prompt
-        _ = first_line_only
-        captured["user"] = user_prompt
-        return "adverb: already"
-
-    monkeypatch.setattr(provider, "_ai_request", fake_ai_request)
-    result = provider._definition_ai("\u0443\u0436\u0435", "en", semantic_only=True)
-
-    assert result == "adverb: already"
-    assert "Choose the most specific core meaning" in captured["user"]
-    assert "One-word definitions are allowed" in captured["user"]
-    assert "alternative spelling of" in captured["user"]
+    values = [candidate.text for candidate in result.candidates]
+    assert "adjective: in good condition or quality" in values
+    assert "adverb: well, satisfactorily" in values
+    assert "adjective: fitting the example sentence context" in values
 
 
 def test_wrap_does_not_retry_deterministic_empty_result() -> None:

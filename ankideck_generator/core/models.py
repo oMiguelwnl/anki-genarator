@@ -102,6 +102,7 @@ class RunConfig(BaseModel):
     seed: int
     cache_path: str
     autosave_every: int
+    refresh_text_cache: bool = False
     ai_max_calls_per_word: int = 6
     ai_max_calls_per_field: int = 2
     level_pool_multiplier: int = 8
@@ -110,7 +111,7 @@ class RunConfig(BaseModel):
     strict_quality: bool = True
     max_attempts_per_level: int = 0
     exclude_closed_class_words: bool = True
-    cache_validation_version: int = 3
+    cache_validation_version: int = 4
     enforce_translation_language: bool = True
     generate_audio: bool = True
     sentence_rewrite_from_web: bool = True
@@ -127,6 +128,10 @@ class RunConfig(BaseModel):
     low_yield_start_level: int = 1
     sentence_template_fallback: bool = False
     definition_word_fallback: bool = False
+    definition_context_first: bool = True
+    definition_candidates_limit: int = 5
+    review_queue_path: str = "output/review_queue.json"
+    quality_report_path: str = "output/quality_report.json"
 
 
 class ProgressState(BaseModel):
@@ -149,6 +154,10 @@ class LogRecord(BaseModel):
     stage_timings: dict[str, int] = Field(default_factory=dict)
     event_counts: dict[str, int] = Field(default_factory=dict)
     validations: list[str] = Field(default_factory=list)
+    review_notes: list[str] = Field(default_factory=list)
+    candidate_preview: dict[str, list[str]] = Field(default_factory=dict)
+    quality_scores: dict[str, float] = Field(default_factory=dict)
+    selection_reasons: dict[str, str] = Field(default_factory=dict)
     status: str
     discard_reason: str | None = None
     error: str | None = None
