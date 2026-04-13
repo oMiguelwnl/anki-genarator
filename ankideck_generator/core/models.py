@@ -119,14 +119,12 @@ class RunConfig(BaseModel):
     provider_timeout_overrides: dict[str, int] = Field(default_factory=dict)
     provider_retry_overrides: dict[str, int] = Field(default_factory=dict)
     lexicon_zipf_fallback_min: float = 0.0
-    max_minutes_per_level: float = 0.0
     sentence_ai_attempts: int = 2
     definition_context_fallback: bool = True
     low_yield_min_attempts: int = 0
     low_yield_min_acceptance_rate: float = 0.0
     low_yield_max_accepted: int = 0
     low_yield_start_level: int = 1
-    sentence_template_fallback: bool = False
     definition_word_fallback: bool = False
     definition_context_first: bool = True
     definition_candidates_limit: int = 5

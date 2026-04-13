@@ -163,8 +163,6 @@ runtime:
   audio_concurrency: 1
   test_audio_concurrency: 2
   full_audio_concurrency: 2
-  max_minutes_per_level_test: 0
-  max_minutes_per_level_full: 20
   sentence_ai_attempts: 2
   sentence_ai_attempts_full: 1
   definition_context_fallback: true
@@ -173,7 +171,6 @@ runtime:
   low_yield_min_attempts_full: 1500
   low_yield_min_acceptance_rate_full: 0.002
   low_yield_max_accepted_full: 6
-  sentence_template_fallback_full: true
   definition_word_fallback_full: true
   definition_context_first: true
   definition_candidates_limit: 5

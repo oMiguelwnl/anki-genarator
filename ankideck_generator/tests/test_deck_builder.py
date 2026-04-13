@@ -112,7 +112,9 @@ def test_build_continues_until_level_target_is_met(monkeypatch, tmp_path: Path) 
     assert [card.focus for card in cards] == ["dos", "tres", "seis", "siete", "diez", "once"]
 
 
-def test_prepare_levels_uses_seeded_selection_within_level_bands(monkeypatch, tmp_path: Path) -> None:
+def test_prepare_levels_uses_strict_frequency_order_within_level_bands(
+    monkeypatch, tmp_path: Path
+) -> None:
     _ = tmp_path
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     frequency_words = [f"mot{i}" for i in range(1, 121)]
@@ -125,19 +127,17 @@ def test_prepare_levels_uses_seeded_selection_within_level_bands(monkeypatch, tm
     )
 
     levels = builder._prepare_levels("fr", level_size=2, seed=1, pool_multiplier=2)
-    levels_again = builder._prepare_levels("fr", level_size=2, seed=1, pool_multiplier=2)
     levels_other_seed = builder._prepare_levels("fr", level_size=2, seed=2, pool_multiplier=2)
 
-    assert levels == levels_again
-    assert levels != levels_other_seed
-    assert all(word in frequency_words[:24] for word in levels[1])
-    assert all(word in frequency_words[24:48] for word in levels[2])
-    assert all(word in frequency_words[48:72] for word in levels[3])
+    assert levels == levels_other_seed
+    assert levels[1] == ["mot1", "mot2", "mot3", "mot4"]
+    assert levels[2] == ["mot25", "mot26", "mot27", "mot28"]
+    assert levels[3] == ["mot49", "mot50", "mot51", "mot52"]
 
 
 def test_sentence_length_bounds_follow_level_defaults() -> None:
-    assert _sentence_length_bounds({1: (2, 7), 2: (4, 10), 3: (6, 15)}, 1) == (2, 7)
-    assert _sentence_length_bounds({1: (2, 7), 2: (4, 10), 3: (6, 15)}, 2) == (4, 10)
+    assert _sentence_length_bounds({1: (2, 7), 2: (4, 10), 3: (6, 15)}, 1) == (5, 7)
+    assert _sentence_length_bounds({1: (2, 7), 2: (4, 10), 3: (6, 15)}, 2) == (5, 10)
     assert _sentence_length_bounds({1: (2, 7), 2: (4, 10), 3: (6, 15)}, 3) == (6, 15)
 
 
@@ -165,10 +165,9 @@ def test_print_summary_includes_sentence_source_stats(tmp_path: Path, capsys) ->
                 "sentence_ai_rewrite_hit": 3,
                 "sentence_ai_generate_hit": 2,
                 "sentence_ai_skipped_good_tatoeba": 6,
-                "sentence_template_fallback_hit": 5,
             }
         ),
-        {1: Counter({"sentence_tatoeba_hit": 7, "sentence_template_fallback_hit": 5})},
+        {1: Counter({"sentence_tatoeba_hit": 7, "sentence_ai_generate_hit": 2})},
         Counter(),
         Counter(),
         {},
@@ -182,9 +181,9 @@ def test_print_summary_includes_sentence_source_stats(tmp_path: Path, capsys) ->
     assert "sentence_tatoeba_attempted: 12" in output
     assert "sentence_ai_rewrite_hit: 3" in output
     assert "sentence_ai_generate_hit: 2" in output
-    assert "sentence_template_fallback_hit: 5" in output
-    assert "source_mix: tatoeba=41.2%, rewrite=17.6%, ai=11.8%, template=29.4%" in output
-    assert "tatoeba_seeded_share: 64.7%" in output
+    assert "sentence_reject_rate: 0.0%" in output
+    assert "source_mix: tatoeba=58.3%, rewrite=25.0%, ai=16.7%" in output
+    assert "tatoeba_seeded_share: 91.7%" in output
 
 
 def test_process_word_uses_source_language_for_definition(tmp_path: Path) -> None:
@@ -1645,7 +1644,7 @@ def test_process_word_ignores_invalid_cached_translation_and_regenerates(tmp_pat
     sentence = "Ce dossier exclus reste prive."
     source_key = "exclus::fr::v4"
     definition_key = "exclus::en::v4"
-    sentence_key = "exclus::lvl1::2-7::sv2::v4"
+    sentence_key = "exclus::lvl1::5-7::sv2::v4"
     translation_key = f"{sentence}::fr->en::v4"
 
     class FakeCache:
@@ -1970,7 +1969,7 @@ def test_process_word_passes_sentence_bounds_to_sentence_providers(tmp_path: Pat
 
     assert card is not None
     assert providers.sentence_bounds
-    assert providers.sentence_bounds[0] == (2, 7)
+    assert providers.sentence_bounds[0] == (5, 7)
 
 
 def test_write_quality_outputs_persists_review_queue(tmp_path: Path) -> None:

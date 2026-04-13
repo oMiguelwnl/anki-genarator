@@ -106,7 +106,6 @@ def main() -> int:
     provider_timeout_overrides.update(dict(mode_profile.get("provider_timeout_overrides", {}) or {}))
     provider_retry_overrides = dict(runtime_cfg.get("provider_retry_overrides", {}) or {})
     provider_retry_overrides.update(dict(mode_profile.get("provider_retry_overrides", {}) or {}))
-    max_minutes_per_level = float(runtime_cfg.get("max_minutes_per_level_full", 0.0) or 0.0)
     sentence_ai_attempts = int(runtime_cfg.get("sentence_ai_attempts", 2) or 2)
     definition_context_fallback = bool(runtime_cfg.get("definition_context_fallback", True))
     low_yield_min_attempts = int(runtime_cfg.get("low_yield_min_attempts", 0) or 0)
@@ -115,7 +114,6 @@ def main() -> int:
     )
     low_yield_max_accepted = int(runtime_cfg.get("low_yield_max_accepted", 0) or 0)
     low_yield_start_level = int(runtime_cfg.get("low_yield_start_level", 1) or 1)
-    sentence_template_fallback = bool(runtime_cfg.get("sentence_template_fallback", False))
     definition_word_fallback = bool(runtime_cfg.get("definition_word_fallback", False))
     definition_context_first = bool(runtime_cfg.get("definition_context_first", True))
     definition_candidates_limit = int(runtime_cfg.get("definition_candidates_limit", 5) or 5)
@@ -128,9 +126,6 @@ def main() -> int:
         or "output/quality_report.json"
     )
     if mode == "test":
-        max_minutes_per_level = float(
-            runtime_cfg.get("max_minutes_per_level_test", max_minutes_per_level) or 0.0
-        )
         sentence_ai_attempts = int(
             runtime_cfg.get("sentence_ai_attempts_test", sentence_ai_attempts)
             or sentence_ai_attempts
@@ -157,11 +152,6 @@ def main() -> int:
         low_yield_start_level = int(
             runtime_cfg.get("low_yield_start_level_test", low_yield_start_level)
             or low_yield_start_level
-        )
-        sentence_template_fallback = bool(
-            runtime_cfg.get(
-                "sentence_template_fallback_test", sentence_template_fallback
-            )
         )
         definition_word_fallback = bool(
             runtime_cfg.get("definition_word_fallback_test", definition_word_fallback)
@@ -193,11 +183,6 @@ def main() -> int:
         low_yield_start_level = int(
             runtime_cfg.get("low_yield_start_level_full", low_yield_start_level)
             or low_yield_start_level
-        )
-        sentence_template_fallback = bool(
-            runtime_cfg.get(
-                "sentence_template_fallback_full", sentence_template_fallback
-            )
         )
         definition_word_fallback = bool(
             runtime_cfg.get("definition_word_fallback_full", definition_word_fallback)
@@ -250,14 +235,12 @@ def main() -> int:
             if value is not None
         },
         lexicon_zipf_fallback_min=max(0.0, float(lexicon_zipf_fallback_min)),
-        max_minutes_per_level=max(0.0, max_minutes_per_level),
         sentence_ai_attempts=max(0, int(sentence_ai_attempts)),
         definition_context_fallback=bool(definition_context_fallback),
         low_yield_min_attempts=max(0, int(low_yield_min_attempts)),
         low_yield_min_acceptance_rate=max(0.0, float(low_yield_min_acceptance_rate)),
         low_yield_max_accepted=max(0, int(low_yield_max_accepted)),
         low_yield_start_level=max(1, int(low_yield_start_level)),
-        sentence_template_fallback=bool(sentence_template_fallback),
         definition_word_fallback=bool(definition_word_fallback),
         definition_context_first=bool(definition_context_first),
         definition_candidates_limit=max(1, int(definition_candidates_limit)),

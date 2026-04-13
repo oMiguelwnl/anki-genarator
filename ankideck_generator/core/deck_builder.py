@@ -7,7 +7,6 @@ import random
 import re
 import shutil
 import threading
-import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -75,8 +74,8 @@ DEFAULT_VALIDATIONS = {
     "sentence_audio_required": False,
     "definition_not_literal_translation": True,
     "sentence_length": {
-        1: (2, 7),
-        2: (4, 10),
+        1: (5, 7),
+        2: (5, 10),
         3: (6, 15),
     },
     "sentence_profile": {
@@ -428,22 +427,12 @@ class DeckBuilder:
         provider_manager = self._make_provider_manager(run)
         accepted_in_level = 0
         level_target = run.level_size
-        level_deadline = (
-            time.time() + float(run.max_minutes_per_level) * 60.0
-            if float(run.max_minutes_per_level or 0.0) > 0.0
-            else 0.0
-        )
         attempt_cap = int(run.max_attempts_per_level or 0)
         if attempt_cap <= 0:
             attempt_cap = len(words)
         progress = tqdm(total=level_target, desc=f"Level {level}", unit="card")
         try:
             for index, word in enumerate(words):
-                if level_deadline and time.time() >= level_deadline:
-                    progress.write(
-                        f"Level {level}: stopping by time budget ({run.max_minutes_per_level:.1f} min)"
-                    )
-                    break
                 if self._is_low_yield_level(level, run, stats):
                     attempted = stats.attempted_by_level[level]
                     accepted = stats.accepted_by_level[level]
@@ -523,11 +512,6 @@ class DeckBuilder:
         progress_store: ProgressStore,
     ) -> None:
         level_target = run.level_size
-        level_deadline = (
-            time.time() + float(run.max_minutes_per_level) * 60.0
-            if float(run.max_minutes_per_level or 0.0) > 0.0
-            else 0.0
-        )
         attempt_cap = int(run.max_attempts_per_level or 0)
         if attempt_cap <= 0:
             attempt_cap = len(words)
@@ -549,11 +533,6 @@ class DeckBuilder:
         with ThreadPoolExecutor(max_workers=text_workers) as text_executor, ThreadPoolExecutor(max_workers=audio_workers) as audio_executor:
             try:
                 while True:
-                    if level_deadline and time.time() >= level_deadline:
-                        progress.write(
-                            f"Level {level}: stopping by time budget ({run.max_minutes_per_level:.1f} min)"
-                        )
-                        break
                     if self._is_low_yield_level(level, run, stats):
                         attempted = stats.attempted_by_level[level]
                         accepted = stats.accepted_by_level[level]
@@ -988,23 +967,13 @@ class DeckBuilder:
             min(len(filtered_top) // 3, max(pool_size * 4, level_size * 12)),
         )
 
-        def select_pool(words: list[str], *, selection_seed: int) -> list[str]:
+        def ordered_pool(words: list[str]) -> list[str]:
             unique_words = unique_keep_order(words)
-            if len(unique_words) <= pool_size:
-                return unique_words
-            chooser = random.Random(selection_seed)
-            selected_indexes = sorted(chooser.sample(range(len(unique_words)), pool_size))
-            return [unique_words[index] for index in selected_indexes]
+            return unique_words[:pool_size]
 
-        level1 = select_pool(filtered_top[:band_size], selection_seed=seed * 10 + 1)
-        level2 = select_pool(
-            filtered_top[band_size : band_size * 2],
-            selection_seed=seed * 10 + 2,
-        )
-        level3 = select_pool(
-            filtered_top[band_size * 2 : band_size * 3],
-            selection_seed=seed * 10 + 3,
-        )
+        level1 = ordered_pool(filtered_top[:band_size])
+        level2 = ordered_pool(filtered_top[band_size : band_size * 2])
+        level3 = ordered_pool(filtered_top[band_size * 2 : band_size * 3])
 
         return {
             1: level1,
@@ -1919,21 +1888,6 @@ class DeckBuilder:
             if selected_candidate is not None:
                 return finalize_selected_sentence(selected_candidate)
 
-            if not sentence and run.sentence_template_fallback:
-                templated = _sentence_template_fallback(word, run.language, level)
-                if templated:
-                    templated_candidate = evaluate_sentence_candidate(
-                        templated,
-                        provider_name="template",
-                        source_kind="template",
-                    )
-                    if not templated_candidate.validation_errors:
-                        sentence = templated_candidate.text
-                        last_sentence_issue = None
-                        count_event("sentence_template_fallback_hit")
-                        cache.set("sentences", sentence_cache_key, sentence)
-                    else:
-                        remember_invalid_sentence_candidate(templated_candidate)
             return sentence
 
         source_definition_candidates: dict[str, DefinitionSelectionCandidate] = {}
@@ -2804,7 +2758,6 @@ class DeckBuilder:
             "sentence_ai_generate_attempted",
             "sentence_ai_generate_hit",
             "sentence_ai_skipped_good_tatoeba",
-            "sentence_template_fallback_hit",
         ]
         sentence_events = [
             (name, event_counter.get(name, 0))
@@ -2820,17 +2773,18 @@ class DeckBuilder:
             tatoeba_seeded_hits = event_counter.get("sentence_tatoeba_seeded_hit", 0)
             rewrite_hits = event_counter.get("sentence_ai_rewrite_hit", 0)
             ai_hits = event_counter.get("sentence_ai_generate_hit", 0)
-            template_hits = event_counter.get("sentence_template_fallback_hit", 0)
-            total_hits = tatoeba_hits + rewrite_hits + ai_hits + template_hits
+            total_hits = tatoeba_hits + rewrite_hits + ai_hits
             if attempts:
                 print(f"  tatoeba_hit_rate: {tatoeba_hits / attempts * 100.0:.1f}%")
+                print(
+                    f"  sentence_reject_rate: {max(0, attempts - total_hits) / attempts * 100.0:.1f}%"
+                )
             if total_hits:
                 print(
                     "  source_mix: "
                     f"tatoeba={tatoeba_hits / total_hits * 100.0:.1f}%, "
                     f"rewrite={rewrite_hits / total_hits * 100.0:.1f}%, "
-                    f"ai={ai_hits / total_hits * 100.0:.1f}%, "
-                    f"template={template_hits / total_hits * 100.0:.1f}%"
+                    f"ai={ai_hits / total_hits * 100.0:.1f}%"
                 )
                 print(
                     "  tatoeba_seeded_share: "
@@ -2842,7 +2796,6 @@ class DeckBuilder:
                     level_events.get("sentence_tatoeba_hit", 0)
                     + level_events.get("sentence_ai_rewrite_hit", 0)
                     + level_events.get("sentence_ai_generate_hit", 0)
-                    + level_events.get("sentence_template_fallback_hit", 0)
                 )
                 if not level_total_hits:
                     continue
@@ -2850,8 +2803,7 @@ class DeckBuilder:
                     f"  level{level}_source_mix: "
                     f"tatoeba={level_events.get('sentence_tatoeba_hit', 0) / level_total_hits * 100.0:.1f}%, "
                     f"rewrite={level_events.get('sentence_ai_rewrite_hit', 0) / level_total_hits * 100.0:.1f}%, "
-                    f"ai={level_events.get('sentence_ai_generate_hit', 0) / level_total_hits * 100.0:.1f}%, "
-                    f"template={level_events.get('sentence_template_fallback_hit', 0) / level_total_hits * 100.0:.1f}%"
+                    f"ai={level_events.get('sentence_ai_generate_hit', 0) / level_total_hits * 100.0:.1f}%"
                 )
         top_providers = provider_counter.most_common(8)
         if top_providers:
@@ -3066,19 +3018,6 @@ def _sanitize_phonetic(value: str) -> str:
     return text
 
 
-def _sentence_template_fallback(word: str, language: str, level: int) -> str | None:
-    normalized_language = (language or "").strip().lower()
-    if normalized_language != "ru":
-        return None
-    templates = {
-        1: "\u042d\u0442\u043e \u0441\u043b\u043e\u0432\u043e {focus}.",
-        2: "\u042f \u0447\u0430\u0441\u0442\u043e \u0432\u0438\u0436\u0443 \u0441\u043b\u043e\u0432\u043e {focus} \u0434\u043e\u043c\u0430.",
-        3: "\u0412 \u044d\u0442\u043e\u043c \u043f\u0440\u0438\u043c\u0435\u0440\u0435 \u044f \u0435\u0441\u0442\u0435\u0441\u0442\u0432\u0435\u043d\u043d\u043e \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e \u0441\u043b\u043e\u0432\u043e {focus} \u0432 \u043a\u043e\u043d\u0442\u0435\u043a\u0441\u0442\u0435.",
-    }
-    template = templates.get(int(level or 1), templates[1])
-    return template.format(focus=word)
-
-
 def _definition_context_signature(sentence: str) -> str:
     normalized = re.sub(r"\s+", " ", (sentence or "").strip().lower())
     if not normalized:
@@ -3235,10 +3174,13 @@ def _sentence_length_bounds(
     if isinstance(length_config, dict):
         value = length_config.get(level)
         if isinstance(value, (list, tuple)) and len(value) == 2:
-            return int(value[0]), int(value[1])
+            min_len, max_len = int(value[0]), int(value[1])
+            return max(5, min_len), max(max_len, max(5, min_len))
     if isinstance(length_config, (list, tuple)) and len(length_config) == 2:
-        return int(length_config[0]), int(length_config[1])
-    return default
+        min_len, max_len = int(length_config[0]), int(length_config[1])
+        return max(5, min_len), max(max_len, max(5, min_len))
+    min_len, max_len = default
+    return max(5, min_len), max(max_len, max(5, min_len))
 
 
 def _validations_for_language(

@@ -17,6 +17,18 @@ from .models import CardData
 
 IPA_RE = re.compile(r"^/[^/]+/(?:\s*\([^()]+\))?$")
 CLAUSE_PUNCTUATION = {";", ":"}
+ARTIFICIAL_SENTENCE_PATTERNS = [
+    re.compile(r"\bthis\s+(?:sentence|word|example)\b", re.IGNORECASE),
+    re.compile(r"\bin\s+this\s+example\b", re.IGNORECASE),
+    re.compile(r"\besta\s+(?:frase|oracion|palabra|ejemplo)\b", re.IGNORECASE),
+    re.compile(r"\bcette\s+(?:phrase|exemple)\b", re.IGNORECASE),
+    re.compile(r"\bce\s+mot\b", re.IGNORECASE),
+    re.compile(r"\bquesta\s+(?:frase|parola|esempio)\b", re.IGNORECASE),
+    re.compile(r"\bdies(?:er|es)\s+(?:satz|wort|beispiel)\b", re.IGNORECASE),
+    re.compile(r"\bэто\s+слово\b", re.IGNORECASE),
+    re.compile(r"\bв\s+этом\s+примере\b", re.IGNORECASE),
+]
+NEAR_DUPLICATE_SENTENCE_THRESHOLD = 0.85
 
 
 @dataclass
@@ -85,6 +97,19 @@ def validate_card(
     if validations.get("no_duplicate_sentences"):
         if card.sentence.lower() in ctx.seen_sentence:
             errors.append("duplicate_sentence")
+        else:
+            candidate_sentence = _normalize_sentence_similarity(card.sentence)
+            for seen_sentence in ctx.seen_sentence:
+                if not seen_sentence:
+                    continue
+                ratio = SequenceMatcher(
+                    None,
+                    candidate_sentence,
+                    _normalize_sentence_similarity(seen_sentence),
+                ).ratio()
+                if ratio >= NEAR_DUPLICATE_SENTENCE_THRESHOLD:
+                    errors.append("duplicate_sentence")
+                    break
 
     if validations.get("focus_in_sentence"):
         if not text_contains_focus(card.sentence, card.focus):
@@ -218,4 +243,11 @@ def _sentence_profile_error(
     if forbid_clause_punctuation and any(mark in sentence for mark in CLAUSE_PUNCTUATION):
         return "sentence_profile_invalid"
 
+    if any(pattern.search(sentence) for pattern in ARTIFICIAL_SENTENCE_PATTERNS):
+        return "sentence_profile_invalid"
+
     return None
+
+
+def _normalize_sentence_similarity(sentence: str) -> str:
+    return re.sub(r"\s+", " ", (sentence or "").strip().lower())

@@ -1318,13 +1318,15 @@ class ProviderManager:
         min_words = int(min_words or 5)
         max_words = int(max_words or 25)
         system = (
-            "You generate natural, simple example sentences for language learners. "
-            "Return exactly one sentence, with no quotes, no notes, and no extra text."
+            "You write one natural flashcard example sentence. "
+            "Return exactly one sentence in the target language, with no quotes, no labels, and no extra text."
         )
         user = (
-            f"Target language: {language_name} ({language}). "
-            f"Create one natural everyday sentence in {language_name} with {min_words} to {max_words} words that includes the exact word '{word}'. "
-            "Do not use English or any other language. Avoid proper nouns, avoid idioms, avoid lists, and keep it clear and simple."
+            f"Language: {language_name} ({language}). Word: '{word}'. "
+            f"Write exactly one everyday sentence with {min_words} to {max_words} words that uses the exact word '{word}' in a real, natural context. "
+            "The sentence must sound like something a native speaker would actually say. "
+            "Do not write a teaching sentence, dictionary note, grammar explanation, placeholder, or meta phrase like 'this word' or 'in this example'. "
+            "Avoid proper nouns, lists, quotes, labels, and extra commentary. Return only the sentence."
         )
         text = self._ai_request(system, user)
         if not text:
@@ -1352,15 +1354,15 @@ class ProviderManager:
         min_words = int(min_words or 5)
         max_words = int(max_words or 25)
         system = (
-            "You rewrite example sentences for language learners. "
-            "Return exactly one sentence, with no quotes, no notes, and no extra text."
+            "You rewrite flashcard example sentences. "
+            "Return exactly one natural sentence in the target language, with no quotes, no labels, and no extra text."
         )
         user = (
-            f"Target language: {language_name} ({language}). "
-            f"Rewrite this sentence to fit learner level {level or 1} using {min_words} to {max_words} words: '{sentence}'. "
-            f"Keep the exact focus word '{word}' in the rewritten sentence. "
-            "Preserve the original meaning as much as possible. "
-            "Do not use English or any other language. Avoid proper nouns, avoid lists, and keep the sentence natural."
+            f"Language: {language_name} ({language}). Focus word: '{word}'. "
+            f"Rewrite this sentence for learner level {level or 1} using {min_words} to {max_words} words: '{sentence}'. "
+            f"Keep the exact focus word '{word}' in the rewrite. Preserve the meaning, but make the result sound natural and everyday. "
+            "Do not turn it into a teaching sentence, grammar explanation, placeholder, or meta phrase. "
+            "Avoid proper nouns, lists, quotes, labels, and extra commentary. Return only the rewritten sentence."
         )
         text = self._ai_request(system, user)
         if not text:
@@ -1379,19 +1381,21 @@ class ProviderManager:
     ) -> str | None:
         language_name = LANG_CODE_TO_NAME.get(language, language)
         system = (
-            "You provide concise dictionary-style definitions. "
-            "Return exactly one definition, no examples, no quotes, and no extra commentary."
+            "You write one concise, dictionary-style meaning for a flashcard. "
+            "Return exactly one definition, with no examples, no quotes, and no extra commentary."
         )
         semantic_rule = (
-            "Explain the meaning of the word itself, not grammar labels, not inflection notes, not etymology, and not whether the word exists. "
-            "If the word is an inflected verb form, keep the meaning semantic and add only a short tense or aspect note like 'past tense' or 'perfective'. "
-            "If the word is an inflected non-verb form, define only the base meaning and omit case, number, or gender notes."
+            "Explain the real meaning of the word itself, not grammar labels, inflection notes, etymology, spelling variants, or whether the word exists. "
+            "Never answer with patterns like 'alternative spelling of', 'plural of', 'past tense of', or similar meta definitions. "
+            "If the form is verbal, keep the meaning semantic and add only a short tense or aspect note when genuinely useful. "
+            "If the form is a non-verb inflection, give only the base meaning and omit case, number, and gender notes."
             if semantic_only
             else "Define the word directly."
         )
         user = (
             f"Target language: {language_name} ({language}). Define the word '{word}' only in {language_name}. "
             f"{semantic_rule} "
+            "Prefer the primary everyday meaning. If there are multiple common meanings, list up to 3 short core senses separated by ';'. "
             "Return 4 to 12 words. Always prefix exactly one POS label from this list: "
             "noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, article, determiner, numeral, auxiliary verb, proper noun, masculine noun, feminine noun, plural noun, expression. "
             "Use the POS label in English, even if the definition itself is in another language."
@@ -1408,17 +1412,19 @@ class ProviderManager:
         source_name = LANG_CODE_TO_NAME.get(source_language, source_language)
         target_name = LANG_CODE_TO_NAME.get(definition_language, definition_language)
         system = (
-            "You provide context-aware dictionary definitions for language learners. "
-            "Return exactly one definition, no examples, no quotes, and no extra text."
+            "You write one context-aware flashcard definition. "
+            "Return exactly one definition, with no examples, no quotes, and no extra text."
         )
         user = (
             f"Source language: {source_name} ({source_language}). "
             f"Definition language: {target_name} ({definition_language}). "
             f"Word: '{word}'. Sentence: '{sentence}'. "
             f"Define the word as used in this sentence, in {target_name}. "
-            "Do not describe grammar notes like 'third-person singular', 'plural of', or 'imperative of'. "
-            "For inflected verb forms, keep the definition semantic and add only a short tense or aspect note. "
+            "Give the primary meaning that fits this context. "
+            "Do not write grammar notes like 'third-person singular', 'plural of', 'imperative of', or spelling-variant definitions. "
+            "For inflected verb forms, keep the definition semantic and add only a short tense or aspect note when useful. "
             "For inflected non-verb forms, define only the base meaning and omit case, number, and gender notes. "
+            "If there are multiple common senses in this context, list up to 3 short core senses separated by ';'. "
             "Always prefix exactly one POS label from this list: "
             "noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, article, determiner, numeral, auxiliary verb, proper noun, masculine noun, feminine noun, plural noun, expression. "
             "Use the POS label in English, even if the definition itself is in another language. "

@@ -334,3 +334,57 @@ def test_validate_card_profile_hard_zipf_soft_skips_level2_and_level3_zipf_error
     assert "sentence_too_easy_for_level3" not in level3_errors
 
 
+def test_validate_card_rejects_artificial_meta_sentence() -> None:
+    card = CardData(
+        focus="дом",
+        sentence="Это слово дом часто встречается в этом примере.",
+        level=1,
+        language="ru",
+    )
+    ctx = ValidationContext()
+    errors = validate_card(card, ctx, {
+        "definition_required": False,
+        "ipa_required": False,
+        "translation_required": False,
+        "focus_in_sentence": True,
+        "sentence_matches_language": False,
+        "no_duplicate_focus": False,
+        "no_duplicate_sentences": False,
+        "valid_characters": True,
+        "ipa_format": False,
+        "audio_generated": False,
+        "definition_not_literal_translation": False,
+        "sentence_length": {1: (5, 12)},
+        "sentence_profile": {1: {"max_commas": 0, "forbid_clause_punctuation": True}},
+        "sentence_difficulty_matches_level": False,
+    })
+    assert "sentence_profile_invalid" in errors
+
+
+def test_validate_card_rejects_near_duplicate_sentence() -> None:
+    card = CardData(
+        focus="house",
+        sentence="I see the bright old house today!",
+        level=1,
+        language="en",
+    )
+    ctx = ValidationContext(seen_sentence={"i see the bright old house today."})
+    errors = validate_card(card, ctx, {
+        "definition_required": False,
+        "ipa_required": False,
+        "translation_required": False,
+        "focus_in_sentence": True,
+        "sentence_matches_language": False,
+        "no_duplicate_focus": False,
+        "no_duplicate_sentences": True,
+        "valid_characters": True,
+        "ipa_format": False,
+        "audio_generated": False,
+        "definition_not_literal_translation": False,
+        "sentence_length": {1: (5, 12)},
+        "sentence_profile": {1: {"max_commas": 0, "forbid_clause_punctuation": True}},
+        "sentence_difficulty_matches_level": False,
+    })
+    assert "duplicate_sentence" in errors
+
+

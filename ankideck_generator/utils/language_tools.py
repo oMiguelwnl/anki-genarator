@@ -27,51 +27,13 @@ LANG_CODE_TO_NAME = {
     "ru": "Russian",
 }
 
-SENTENCE_TEMPLATES = {
-    "en": [
-        "I saw the {focus} today at the market.",
-        "The {focus} is important for my daily routine.",
-        "We talked about the {focus} in class this morning.",
-        "She uses the {focus} every day at work.",
-    ],
-    "es": [
-        "Vi la {focus} hoy en el mercado de la ciudad.",
-        "La {focus} es importante para mi rutina diaria.",
-        "Hablamos de la {focus} en clase esta manana.",
-        "Ella usa la {focus} cada dia en el trabajo.",
-    ],
-    "fr": [
-        "J'ai vu le {focus} aujourd'hui au marche.",
-        "Le {focus} est important pour ma routine quotidienne.",
-        "Nous avons parle du {focus} en classe ce matin.",
-        "Elle utilise le {focus} chaque jour au travail.",
-    ],
-    "it": [
-        "Ho visto il {focus} oggi al mercato.",
-        "Il {focus} e importante per la mia routine quotidiana.",
-        "Abbiamo parlato del {focus} in classe questa mattina.",
-        "Lei usa il {focus} ogni giorno al lavoro.",
-    ],
-    "de": [
-        "Ich habe das {focus} heute auf dem Markt gesehen.",
-        "Das {focus} ist wichtig fur meine tagliche Routine.",
-        "Wir haben uber das {focus} im Kurs heute Morgen gesprochen.",
-        "Sie benutzt das {focus} jeden Tag bei der Arbeit.",
-    ],
-    "ru": [
-        "Ya videl {focus} segodnya na rynke.",
-        "{focus} vazhno dlya moei ezhednevnoi rutiny.",
-        "My govorili o {focus} na uroke segodnya utrom.",
-        "Ona ispolzuet {focus} kazhdyi den na rabote.",
-    ],
-}
-
 WORD_RE = re.compile(r"[\w'-]+", re.UNICODE)
 META_DEFINITION_PATTERNS = [
     re.compile(
         r"\b(?:inflection|form|imperative|participle|plural|singular)\s+of\b",
         re.IGNORECASE,
     ),
+    re.compile(r"\balternative\s+(?:spelling|form)\s+of\b", re.IGNORECASE),
     re.compile(
         r"\b(?:simple past|past participle|present participle)\s+of\b",
         re.IGNORECASE,
@@ -84,6 +46,18 @@ META_DEFINITION_PATTERNS = [
     re.compile(r"\bused as a greeting or farewell\b", re.IGNORECASE),
     re.compile(r"\bdialects?\s+of\b", re.IGNORECASE),
     re.compile(r"\bdepending on the context\b", re.IGNORECASE),
+]
+
+ARTIFICIAL_SENTENCE_PATTERNS = [
+    re.compile(r"\bthis\s+(?:sentence|word|example)\b", re.IGNORECASE),
+    re.compile(r"\bin\s+this\s+example\b", re.IGNORECASE),
+    re.compile(r"\besta\s+(?:frase|oracion|palabra|ejemplo)\b", re.IGNORECASE),
+    re.compile(r"\bcette\s+(?:phrase|exemple)\b", re.IGNORECASE),
+    re.compile(r"\bce\s+mot\b", re.IGNORECASE),
+    re.compile(r"\bquesta\s+(?:frase|parola|esempio)\b", re.IGNORECASE),
+    re.compile(r"\bdies(?:er|es)\s+(?:satz|wort|beispiel)\b", re.IGNORECASE),
+    re.compile(r"\bэто\s+слово\b", re.IGNORECASE),
+    re.compile(r"\bв\s+этом\s+примере\b", re.IGNORECASE),
 ]
 
 STOPWORDS = {
@@ -266,12 +240,6 @@ def valid_sentence_characters(text: str) -> bool:
     return True
 
 
-def sentence_from_templates(focus: str, language: str) -> str:
-    templates = SENTENCE_TEMPLATES.get(language) or SENTENCE_TEMPLATES["en"]
-    template = templates[hash(focus) % len(templates)]
-    return template.format(focus=focus)
-
-
 def sentence_is_acceptable(sentence: str, focus: str, min_len: int, max_len: int) -> bool:
     word_count = len(sentence.split())
     if not (min_len <= word_count <= max_len):
@@ -344,6 +312,8 @@ def score_sentence(
         return 0.0
     if not text_contains_focus(sentence, focus):
         return 0.0
+    if any(pattern.search(sentence) for pattern in ARTIFICIAL_SENTENCE_PATTERNS):
+        return 0.0
     score = 1.0
     score += 1.0 - abs(12 - word_count) / 12
     diff = difficulty(sentence, language)
@@ -407,8 +377,11 @@ def semantic_definition_reason(text: str, focus: str = "") -> str | None:
     if extract_meta_definition(cleaned) is not None:
         return "definition_nonsemantic"
 
+    body = cleaned.split(":", 1)[1].strip() if ":" in cleaned else cleaned
     alpha_tokens = [token for token in tokenize(cleaned) if token.isalpha()]
-    if len(alpha_tokens) < 3:
+    body_alpha_tokens = [token for token in tokenize(body) if token.isalpha()]
+    minimum_tokens = 1 if ":" in cleaned else 3
+    if len(body_alpha_tokens if ":" in cleaned else alpha_tokens) < minimum_tokens:
         return "definition_too_short"
 
     for pattern in META_DEFINITION_PATTERNS:
