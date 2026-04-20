@@ -1374,29 +1374,6 @@ class DeckBuilder:
         if not card:
             return None, log_record
 
-        card, log_record, generated_media = self._attach_audio_to_card(
-            card=card,
-            log_record=log_record,
-            run=run,
-            cache=cache,
-            providers=providers,
-        )
-        for path in generated_media:
-            if path and path not in media_files:
-                media_files.append(path)
-
-        final_errors = unique_keep_order(
-            log_record.validations + self._audio_validation_errors(card, run)
-        )
-        if self._should_reject_errors(final_errors, run):
-            log_record.validations = final_errors
-            log_record.status = "discarded"
-            log_record.lifecycle_state = "rejected"
-            log_record.discard_reason = _infer_discard_reason(
-                final_errors, log_record.provider_errors
-            )
-            return None, log_record
-
         if run.interactive:
             try:
                 before_edit = self._review_snapshot(card)
@@ -1432,6 +1409,29 @@ class DeckBuilder:
                 )
                 if not card:
                     return None, log_record
+
+        card, log_record, generated_media = self._attach_audio_to_card(
+            card=card,
+            log_record=log_record,
+            run=run,
+            cache=cache,
+            providers=providers,
+        )
+        for path in generated_media:
+            if path and path not in media_files:
+                media_files.append(path)
+
+        final_errors = unique_keep_order(
+            log_record.validations + self._audio_validation_errors(card, run)
+        )
+        if self._should_reject_errors(final_errors, run):
+            log_record.validations = final_errors
+            log_record.status = "discarded"
+            log_record.lifecycle_state = "rejected"
+            log_record.discard_reason = _infer_discard_reason(
+                final_errors, log_record.provider_errors
+            )
+            return None, log_record
 
         ctx.seen_focus.add(card.focus.lower())
         ctx.seen_sentence.add(card.sentence.lower())
