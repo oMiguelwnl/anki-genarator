@@ -484,11 +484,13 @@ def test_process_word_lexical_review_reject_never_uses_human_review_state(
 
 
 def test_process_word_revalidation_rejects_invalid_lexical_review_correction(
+    monkeypatch,
     tmp_path: Path,
 ) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
     run = _run_config(tmp_path)
+    run.mode = "full"
     ctx = ValidationContext()
 
     class FakeCache:
@@ -498,79 +500,46 @@ def test_process_word_revalidation_rejects_invalid_lexical_review_correction(
         def set(self, *_args, **_kwargs):
             return None
 
-    class Result:
-        def __init__(self, value: str, provider_name: str = "ai"):
-            self.value = value
-            self.provider_name = provider_name
-            self.elapsed_ms = 1
-            self.error = None
+    corrected_card = CardData(
+        focus="banco",
+        index=1,
+        ipa="/ˈbaŋ.ko/ (BAN-ko)",
+        source_definition="noun: banco de parque.",
+        definition="park bench",
+        sentence="Me sente en el banco del parque.",
+        translation="I sat on the bench in the park.",
+        translation_language="en",
+        level=1,
+        language="es",
+        lifecycle_state="generated",
+    )
+    corrected_log = LogRecord(
+        focus="banco",
+        level=1,
+        lifecycle_state="generated",
+        status="candidate",
+        review_notes=["lexical_review_corrected"],
+        reason_codes=["definition_sentence_mismatch"],
+        before={
+            "definition": "noun: bench in a park or public place.",
+            "translation": "I sat on the bench in the park.",
+        },
+        after={
+            "definition": "park bench",
+            "translation": "I sat on the bench in the park.",
+        },
+    )
 
-    class ReviewTransport:
-        def __init__(self, review: LexicalReviewResult):
-            self.review = review
-            self.provider_name = "ai"
-            self.elapsed_ms = 1
-            self.error = None
-
-    class FakeProviders:
-        def definition(self, word, language, allow_ai=True, definition_language=None):
-            _ = (word, language, allow_ai, definition_language)
-            return Result("noun: banco de parque")
-
-        def ipa(self, word, language, allow_ai=True):
-            _ = (word, language, allow_ai)
-            return Result("/ˈbaŋ.ko/")
-
-        def phonetic_spelling(self, ipa, language, allow_ai=True):
-            _ = (ipa, language, allow_ai)
-            return Result("BAN-ko")
-
-        def sentence_web(self, word, language, level=None, **kwargs):
-            _ = (word, language, level, kwargs)
-            return Result("Me sente en el banco del parque.", provider_name="tatoeba")
-
-        def sentence_ai(self, word, language, level=None, **kwargs):
-            _ = (word, language, level, kwargs)
-            return Result("Me sente en el banco del parque.")
-
-        def translation_web(self, text, src, dest):
-            _ = (src, dest)
-            if text.startswith("noun:"):
-                return Result("noun: park bench", provider_name="googletrans")
-            return Result("I sat on the bench in the park.", provider_name="googletrans")
-
-        def translation_ai(self, text, src, dest):
-            _ = (text, src, dest)
-            return Result("I sat on the bench in the park.")
-
-        def lexical_review(self, request, **kwargs):
-            _ = kwargs
-            return ReviewTransport(
-                LexicalReviewResult.model_validate(
-                    {
-                        "verdict": "correct",
-                        "focus_word": request.focus_word,
-                        "language": request.language,
-                        "target_translation_language": request.target_translation_language,
-                        "accepted_sentence": request.accepted_sentence,
-                        "current_definition": request.current_definition,
-                        "current_translation": request.current_translation,
-                        "source_definition": request.source_definition,
-                        "candidate_senses": list(request.candidate_senses),
-                        "corrected_definition": "park bench",
-                        "corrected_translation": request.current_translation,
-                        "reason_codes": ["definition_sentence_mismatch"],
-                        "before": {
-                            "definition": request.current_definition,
-                            "translation": request.current_translation,
-                        },
-                        "after": {
-                            "definition": "park bench",
-                            "translation": request.current_translation,
-                        },
-                    }
-                )
-            )
+    monkeypatch.setattr(
+        builder,
+        "_process_word_textual",
+        lambda **_kwargs: (corrected_card.model_copy(deep=True), corrected_log.model_copy(deep=True)),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_attach_audio_to_card",
+        lambda **_kwargs: (_kwargs["card"], _kwargs["log_record"], []),
+    )
 
     card, log = builder._process_word(
         word="banco",
@@ -578,7 +547,7 @@ def test_process_word_revalidation_rejects_invalid_lexical_review_correction(
         index=1,
         run=run,
         cache=FakeCache(),
-        providers=FakeProviders(),
+        providers=object(),
         ctx=ctx,
         media_files=[],
     )
@@ -587,7 +556,7 @@ def test_process_word_revalidation_rejects_invalid_lexical_review_correction(
     assert log.lifecycle_state == "rejected"
     assert "definition_sentence_mismatch" in log.reason_codes
     assert "definition_missing_pos" in log.validations
-    assert log.before["definition"] == "noun: park bench"
+    assert log.before["definition"] == "noun: bench in a park or public place."
     assert log.after["definition"] == "park bench"
 
 
@@ -597,6 +566,7 @@ def test_interactive_edit_reruns_validation_before_acceptance(
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
     run = _run_config(tmp_path)
+    run.mode = "full"
     run.interactive = True
     ctx = ValidationContext()
 
@@ -607,73 +577,41 @@ def test_interactive_edit_reruns_validation_before_acceptance(
         def set(self, *_args, **_kwargs):
             return None
 
-    class Result:
-        def __init__(self, value: str, provider_name: str = "ai"):
-            self.value = value
-            self.provider_name = provider_name
-            self.elapsed_ms = 1
-            self.error = None
+    base_card = CardData(
+        focus="banco",
+        index=1,
+        ipa="/ˈbaŋ.ko/ (BAN-ko)",
+        source_definition="noun: banco de parque.",
+        definition="noun: bench in a park or public place.",
+        sentence="Me sente en el banco del parque.",
+        translation="I sat on the bench in the park.",
+        translation_language="en",
+        level=1,
+        language="es",
+        lifecycle_state="generated",
+    )
+    base_log = LogRecord(
+        focus="banco",
+        level=1,
+        lifecycle_state="generated",
+        status="candidate",
+    )
 
-    class ReviewTransport:
-        def __init__(self, review: LexicalReviewResult):
-            self.review = review
-            self.provider_name = "ai"
-            self.elapsed_ms = 1
-            self.error = None
-
-    class FakeProviders:
-        def definition(self, word, language, allow_ai=True, definition_language=None):
-            _ = (word, language, allow_ai, definition_language)
-            return Result("noun: banco de parque")
-
-        def ipa(self, word, language, allow_ai=True):
-            _ = (word, language, allow_ai)
-            return Result("/ˈbaŋ.ko/")
-
-        def phonetic_spelling(self, ipa, language, allow_ai=True):
-            _ = (ipa, language, allow_ai)
-            return Result("BAN-ko")
-
-        def sentence_web(self, word, language, level=None, **kwargs):
-            _ = (word, language, level, kwargs)
-            return Result("Me sente en el banco del parque.", provider_name="tatoeba")
-
-        def sentence_ai(self, word, language, level=None, **kwargs):
-            _ = (word, language, level, kwargs)
-            return Result("Me sente en el banco del parque.")
-
-        def translation_web(self, text, src, dest):
-            _ = (src, dest)
-            if text.startswith("noun:"):
-                return Result("noun: bench in a park or public place", provider_name="googletrans")
-            return Result("I sat on the bench in the park.", provider_name="googletrans")
-
-        def translation_ai(self, text, src, dest):
-            _ = (text, src, dest)
-            return Result("I sat on the bench in the park.")
-
-        def lexical_review(self, request, **kwargs):
-            _ = kwargs
-            return ReviewTransport(
-                LexicalReviewResult.model_validate(
-                    {
-                        "verdict": "accept",
-                        "focus_word": request.focus_word,
-                        "language": request.language,
-                        "target_translation_language": request.target_translation_language,
-                        "accepted_sentence": request.accepted_sentence,
-                        "current_definition": request.current_definition,
-                        "current_translation": request.current_translation,
-                        "source_definition": request.source_definition,
-                        "candidate_senses": list(request.candidate_senses),
-                        "winning_sense": request.current_definition,
-                        "reason_codes": [],
-                    }
-                )
-            )
-
-    inputs = iter(["e", "definition", "bench", "a"])
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+    monkeypatch.setattr(
+        builder,
+        "_process_word_textual",
+        lambda **_kwargs: (base_card.model_copy(deep=True), base_log.model_copy(deep=True)),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_attach_audio_to_card",
+        lambda **_kwargs: (_kwargs["card"], _kwargs["log_record"], []),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_interactive_edit",
+        lambda card, _log_record: card.model_copy(update={"definition": "bench"}),
+    )
 
     card, log = builder._process_word(
         word="banco",
@@ -681,7 +619,7 @@ def test_interactive_edit_reruns_validation_before_acceptance(
         index=1,
         run=run,
         cache=FakeCache(),
-        providers=FakeProviders(),
+        providers=object(),
         ctx=ctx,
         media_files=[],
     )

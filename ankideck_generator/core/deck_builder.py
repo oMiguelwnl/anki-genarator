@@ -1365,17 +1365,14 @@ class DeckBuilder:
         if not card:
             return None, log_record
 
-        text_errors = unique_keep_order(
-            log_record.validations + self._validate_text_candidate(card, ctx, run)
+        card, log_record = self._revalidate_card_before_acceptance(
+            card=card,
+            log_record=log_record,
+            ctx=ctx,
+            run=run,
         )
-        if self._should_reject_errors(text_errors, run):
-            log_record.validations = text_errors
-            log_record.status = "discarded"
-            log_record.discard_reason = _infer_discard_reason(
-                text_errors, log_record.provider_errors
-            )
+        if not card:
             return None, log_record
-        log_record.validations = text_errors
 
         card, log_record, generated_media = self._attach_audio_to_card(
             card=card,
@@ -1402,6 +1399,7 @@ class DeckBuilder:
 
         if run.interactive:
             try:
+                before_edit = self._review_snapshot(card)
                 card = self._interactive_edit(card, log_record)
             except ValueError:
                 return None, LogRecord(
@@ -1419,6 +1417,21 @@ class DeckBuilder:
                     selection_reasons=log_record.selection_reasons,
                     status="skipped",
                 )
+            after_edit = self._review_snapshot(card)
+            if after_edit != before_edit:
+                self._merge_review_evidence(
+                    log_record,
+                    before=before_edit,
+                    after=after_edit,
+                )
+                card, log_record = self._revalidate_card_before_acceptance(
+                    card=card,
+                    log_record=log_record,
+                    ctx=ctx,
+                    run=run,
+                )
+                if not card:
+                    return None, log_record
 
         ctx.seen_focus.add(card.focus.lower())
         ctx.seen_sentence.add(card.sentence.lower())
@@ -1487,6 +1500,67 @@ class DeckBuilder:
             log_record=log_record,
             media_files=media_files,
         )
+
+    def _review_snapshot(self, card: CardData) -> dict[str, object]:
+        return {
+            "focus": card.focus,
+            "definition": card.definition,
+            "sentence": card.sentence,
+            "translation": card.translation,
+            "ipa": card.ipa,
+            "source_definition": card.source_definition,
+        }
+
+    def _merge_review_evidence(
+        self,
+        log_record: LogRecord,
+        *,
+        before: dict[str, object],
+        after: dict[str, object],
+    ) -> None:
+        merged_before = dict(log_record.before or {})
+        merged_after = dict(log_record.after or {})
+        for field_name, before_value in before.items():
+            after_value = after.get(field_name)
+            if before_value == after_value:
+                continue
+            merged_before.setdefault(field_name, before_value)
+            merged_after[field_name] = after_value
+        log_record.before = merged_before
+        log_record.after = merged_after
+
+    def _revalidate_card_before_acceptance(
+        self,
+        *,
+        card: CardData,
+        log_record: LogRecord,
+        ctx: ValidationContext,
+        run: RunConfig,
+        reserved_focus: set[str] | None = None,
+        reserved_sentences: set[str] | None = None,
+    ) -> tuple[CardData | None, LogRecord]:
+        text_errors = unique_keep_order(
+            log_record.validations
+            + self._validate_text_candidate(
+                card,
+                ctx,
+                run,
+                reserved_focus,
+                reserved_sentences,
+            )
+        )
+        log_record.validations = text_errors
+        if self._should_reject_errors(text_errors, run):
+            log_record.status = "discarded"
+            log_record.lifecycle_state = "rejected"
+            log_record.discard_reason = _infer_discard_reason(
+                text_errors, log_record.provider_errors
+            )
+            for reason_code in text_errors:
+                if reason_code not in log_record.reason_codes:
+                    log_record.reason_codes.append(reason_code)
+            return None, log_record
+        return card, log_record
 
     def _process_word_textual(
         self,
