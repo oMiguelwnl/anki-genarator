@@ -26,7 +26,7 @@ Requirements for the current milestone. Each requirement maps to a roadmap phase
 - [x] **LEX-01**: Translation is generated or reviewed with the accepted sentence context, target word, and intended sense together.
 - [x] **LEX-02**: Definition or gloss is concise, learner-facing, and validated against the exact usage in the accepted sentence.
 - [x] **LEX-03**: A review stage can accept, correct, reject, or route a card to human review with machine-readable reasons.
-- [ ] **LEX-04**: Deterministic validators rerun after any AI or human correction before a card can be accepted.
+- [x] **LEX-04**: Deterministic validators rerun after any AI or human correction before a card can be accepted.
 
 ### Quality, Duplicates, and Reporting
 
@@ -40,7 +40,7 @@ Requirements for the current milestone. Each requirement maps to a roadmap phase
 - [ ] **COMP-01**: The existing CLI entrypoint remains usable from the repo root for configured languages.
 - [ ] **COMP-02**: `wordfreq` and frequency-level selection remain the front door for vocabulary intake.
 - [ ] **COMP-03**: `.apkg` export plus `output/metadata.json`, `output/quality_report.json`, and `output/review_queue.json` continue to be produced.
-- [ ] **COMP-04**: Audio or TTS generation remains post-acceptance and continues to integrate with deck export.
+- [x] **COMP-04**: Audio or TTS generation remains post-acceptance and continues to integrate with deck export.
 - [ ] **COMP-05**: Existing provider fallback behavior for non-AI fields remains compatible unless a later phase explicitly replaces it.
 
 ### Evaluation and Operations
@@ -96,8 +96,8 @@ Which phases cover which requirements.
 | LEX-01 | Phase 3 | Complete |
 | LEX-02 | Phase 3 | Complete |
 | LEX-03 | Phase 3 | Complete |
-| LEX-04 | Phase 3 | Pending |
-| COMP-04 | Phase 3 | Pending |
+| LEX-04 | Phase 3 | Complete |
+| COMP-04 | Phase 3 | Complete |
 | QUAL-01 | Phase 4 | Pending |
 | QUAL-02 | Phase 4 | Pending |
 | QUAL-03 | Phase 4 | Pending |

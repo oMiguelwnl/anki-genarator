@@ -62,7 +62,7 @@ Plans:
 Plans:
 - [x] 03-01-PLAN.md — Define contextual lexical-review contracts, typed verdicts, and AI transport.
 - [x] 03-02-PLAN.md — Integrate sentence-anchored lexical review, audit evidence, and reject-queue routing.
-- [ ] 03-03-PLAN.md — Revalidate all corrections before acceptance and keep audio post-acceptance.
+- [x] 03-03-PLAN.md — Revalidate all corrections before acceptance and keep audio post-acceptance.
 
 ### Phase 4: Duplicate Guard and Review Workflow
 **Goal**: Replace flat duplicate checks with indexed guardrails, preserve audit-ready review artifacts, and make accepted-card quality visible in structured outputs.
