@@ -562,7 +562,6 @@ def _clean_body(text: str, policy: dict[str, Any]) -> str:
     cleaned = str(text or "").strip()
     cleaned = _lstrip_to_first_letter(cleaned)
     cleaned = re.sub(r"^[^\W\d_][^:]{0,40}:\s*", "", cleaned, count=1, flags=re.UNICODE)
-    cleaned = re.sub(r"\([^()]+\)\s*[-\u2013\u2014:]*\s*", "", cleaned)
     cleaned = re.sub(r"\[[^\]]+\]", " ", cleaned)
     cleaned = re.sub(r"\[[^\]]*$", " ", cleaned)
     cleaned = strip_definition_usage_notes(cleaned)

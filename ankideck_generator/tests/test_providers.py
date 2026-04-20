@@ -1,6 +1,8 @@
 import requests
+import time
 from urllib.parse import quote
 
+import ankideck_generator.core.providers as providers_module
 from ankideck_generator.core.providers import ProviderManager
 
 
@@ -80,6 +82,77 @@ def test_translation_prefers_web_then_ai(monkeypatch):
     result = provider.translation("hola", "es", "en", allow_ai=True)
     assert result.value == "ok"
     assert calls == ["googletrans"]
+
+
+def test_provider_manager_initializes_googletrans_with_timeout(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeTranslator:
+        def __init__(self, *args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+
+    monkeypatch.setattr(providers_module, "Translator", FakeTranslator)
+
+    ProviderManager({"providers": {}}, timeout_sec=9, retries=0)
+    assert captured["timeout"] == 9
+
+
+def test_audio_gtts_passes_timeout(monkeypatch, tmp_path):
+    provider = ProviderManager(
+        {"providers": {}},
+        timeout_sec=9,
+        retries=0,
+        timeout_overrides={"gtts": 7},
+    )
+    captured: dict[str, object] = {}
+
+    class FakeGTTS:
+        def __init__(self, *args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+
+        def save(self, target):
+            captured["target"] = target
+            tmp_path.joinpath("ok.mp3").write_bytes(b"audio")
+
+    monkeypatch.setattr(providers_module, "gTTS", FakeGTTS)
+
+    provider._audio_gtts("hola", "es", tmp_path, "sample")
+    assert captured["timeout"] == 7
+
+
+def test_audio_pyttsx3_times_out(monkeypatch, tmp_path):
+    provider = ProviderManager(
+        {"providers": {}},
+        timeout_sec=1,
+        retries=0,
+        timeout_overrides={"pyttsx3": 1},
+    )
+
+    class SlowEngine:
+        def save_to_file(self, text, path):
+            _ = (text, path)
+
+        def runAndWait(self):
+            time.sleep(1.2)
+
+        def stop(self):
+            return None
+
+    class FakePyttsx3:
+        @staticmethod
+        def init():
+            return SlowEngine()
+
+    monkeypatch.setattr(providers_module, "pyttsx3", FakePyttsx3)
+
+    start = time.time()
+    try:
+        provider._audio_pyttsx3("hola", tmp_path, "sample")
+    except Exception as exc:
+        assert "timed out" in str(exc)
+    else:
+        raise AssertionError("pyttsx3 timeout should abort blocked synthesis")
+    assert time.time() - start < 1.2
 
 
 def test_definition_prefers_wiktionary_before_ai(monkeypatch):
@@ -243,7 +316,7 @@ def test_wiktionary_meta_definition_uses_formof_lemma_for_nouns(monkeypatch):
     assert result.value == "noun: control, administration"
 
 
-def test_definition_candidates_collect_multiple_sources(monkeypatch):
+def test_definition_candidates_skips_ai_when_lexicon_candidates_exist(monkeypatch):
     provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
 
     monkeypatch.setattr(
@@ -257,7 +330,41 @@ def test_definition_candidates_collect_multiple_sources(monkeypatch):
     monkeypatch.setattr(
         provider,
         "_definition_ai",
-        lambda *args, **kwargs: "adjective: suitable for the current situation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("definition AI should stay as fallback")
+        ),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_definition_from_context_ai",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("context definition AI should stay as fallback")
+        ),
+    )
+
+    result = provider.definition_candidates(
+        "bien",
+        "es",
+        allow_ai=True,
+        definition_language="es",
+        sentence="Hoy me siento bien en casa.",
+    )
+
+    values = [candidate.text for candidate in result.candidates]
+    assert "adjective: in good condition or quality" in values
+    assert "adverb: well, satisfactorily" in values
+
+
+def test_definition_candidates_uses_context_ai_when_lexicon_is_empty(monkeypatch):
+    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
+
+    monkeypatch.setattr(provider, "_wiktionary_definitions", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        provider,
+        "_definition_ai",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("direct definition AI should not run after context AI succeeds")
+        ),
     )
     monkeypatch.setattr(
         provider,
@@ -274,9 +381,7 @@ def test_definition_candidates_collect_multiple_sources(monkeypatch):
     )
 
     values = [candidate.text for candidate in result.candidates]
-    assert "adjective: in good condition or quality" in values
-    assert "adverb: well, satisfactorily" in values
-    assert "adjective: fitting the example sentence context" in values
+    assert values == ["adjective: fitting the example sentence context"]
 
 
 def test_wrap_does_not_retry_deterministic_empty_result() -> None:
@@ -290,6 +395,21 @@ def test_wrap_does_not_retry_deterministic_empty_result() -> None:
     result = provider._wrap("tatoeba", returns_empty)
     assert result.value is None
     assert calls["count"] == 1
+
+
+def test_wrap_retries_ai_empty_result() -> None:
+    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=2)
+    calls = {"count": 0}
+
+    def returns_empty_then_value():
+        calls["count"] += 1
+        if calls["count"] < 3:
+            return ""
+        return "ok"
+
+    result = provider._wrap("ai", returns_empty_then_value)
+    assert result.value == "ok"
+    assert calls["count"] == 3
 
 
 def test_wrap_disables_provider_after_repeated_timeouts() -> None:
@@ -410,9 +530,42 @@ def test_sentence_tatoeba_relaxes_query_when_exact_is_not_strong(monkeypatch) ->
     monkeypatch.setattr(provider._session, "get", fake_get)
     result = provider.sentence_web_candidates("cat", "en", min_words=3, max_words=6)
 
-    assert [candidate.text for candidate in result.candidates] == ["The cat sleeps here."]
+    assert [candidate.text for candidate in result.candidates] == [
+        "The cat sleeps here.",
+        "The cat.",
+    ]
     assert result.candidates[0].query_mode == "relaxed"
     assert seen_queries == ["=cat", "cat"]
+
+
+def test_sentence_tatoeba_keeps_short_candidate_for_rewrite(monkeypatch) -> None:
+    config = {
+        "providers": {
+            "tatoeba": {
+                "endpoint": "https://tatoeba.test/api_v0/search",
+                "exact_match": True,
+                "max_pages": 1,
+                "page_size": 10,
+            }
+        }
+    }
+    provider = ProviderManager(config, timeout_sec=1, retries=0)
+
+    def fake_get(url, params=None, timeout=None):
+        _ = (url, params, timeout)
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"results": [{"text": "Когда праздник?"}]}
+
+        return FakeResponse()
+
+    monkeypatch.setattr(provider._session, "get", fake_get)
+    result = provider.sentence_web_candidates("когда", "ru", min_words=5, max_words=7)
+
+    assert [candidate.text for candidate in result.candidates] == ["Когда праздник?"]
 
 
 def test_fallback_reports_provider_disabled_when_all_candidates_are_disabled() -> None:

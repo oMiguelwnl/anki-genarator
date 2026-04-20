@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import os
 import re
+import threading
 import time
 from html import unescape
 from pathlib import Path
@@ -72,7 +73,7 @@ TATOEBA_STEMMING_LANGUAGES = {
     "ru",
 }
 
-TATOEBA_MAX_CANDIDATES = 5
+TATOEBA_MAX_CANDIDATES = 8
 TATOEBA_STRONG_SENTENCE_SCORE = 1.6
 
 
@@ -140,7 +141,9 @@ class ProviderManager:
                 "Accept": "application/json",
             }
         )
-        self._translator = Translator() if Translator else None
+        self._translator = (
+            Translator(timeout=self._timeout_for("googletrans")) if Translator else None
+        )
         self._elevenlabs_voice_cache: dict[str, str] = {}
         self._elevenlabs_voices: list[dict] | None = None
         self._lexicon_cache: dict[tuple[str, str], ProviderResult] = {}
@@ -201,10 +204,11 @@ class ProviderManager:
                 last_exc = exc
                 message = str(exc)
                 self._register_provider_failure(provider_name, message, exc)
-                if self._is_deterministic_error(message):
+                if self._is_deterministic_error(message, provider_name=provider_name):
                     break
                 if attempt >= retries:
                     break
+                time.sleep(self._retry_delay(provider_name, attempt))
         elapsed = int((time.time() - start) * 1000)
         return ProviderResult(value=None, provider_name=provider_name, elapsed_ms=elapsed, error=str(last_exc))
 
@@ -239,10 +243,11 @@ class ProviderManager:
                 last_exc = exc
                 message = str(exc)
                 self._register_provider_failure(provider_name, message, exc)
-                if self._is_deterministic_error(message):
+                if self._is_deterministic_error(message, provider_name=provider_name):
                     break
                 if attempt >= retries:
                     break
+                time.sleep(self._retry_delay(provider_name, attempt))
         elapsed = int((time.time() - start) * 1000)
         return SentenceCandidatesResult(
             candidates=[],
@@ -256,6 +261,30 @@ class ProviderManager:
 
     def _retries_for(self, provider_name: str) -> int:
         return int(self.retry_overrides.get(provider_name, self.retries))
+
+    def _run_local_with_timeout(
+        self,
+        provider_name: str,
+        fn: Callable[[], str | None],
+    ) -> str | None:
+        timeout = max(1, int(self._timeout_for(provider_name)))
+        result: dict[str, str | None] = {}
+        error: dict[str, Exception] = {}
+
+        def target() -> None:
+            try:
+                result["value"] = fn()
+            except Exception as exc:  # pragma: no cover - delegated provider failures
+                error["value"] = exc
+
+        worker = threading.Thread(target=target, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            raise ProviderError(f"{provider_name} timed out after {timeout}s")
+        if "value" in error:
+            raise error["value"]
+        return result.get("value")
 
     def _register_provider_success(self, provider_name: str) -> None:
         self._provider_failure_streak[provider_name] = 0
@@ -295,16 +324,24 @@ class ProviderManager:
             return True
         return any(code in text for code in ("http 401", "http 403"))
 
-    def _is_deterministic_error(self, message: str) -> bool:
+    def _retry_delay(self, provider_name: str, attempt: int) -> float:
+        base = 0.25 if provider_name == "ai" else 0.1
+        return min(1.5, base * (2**max(0, int(attempt))))
+
+    def _is_deterministic_error(self, message: str, *, provider_name: str = "") -> bool:
         text = (message or "").strip().lower()
         if not text:
             return False
-        if "empty result" in text:
+        if "provider_disabled" in text:
             return True
         if "missing api_key" in text or "voice_id not found" in text:
             return True
         if "organization has been restricted" in text:
             return True
+        if provider_name != "ai" and "empty result" in text:
+            return True
+        if any(code in text for code in ("http 429", "http 500", "http 502", "http 503", "http 504")):
+            return False
         return any(code in text for code in ("http 400", "http 401", "http 403", "http 404"))
 
     def definition(
@@ -390,6 +427,27 @@ class ProviderManager:
             if result.error:
                 errors[provider_name] = result.error
 
+        def call_ai_fallback() -> None:
+            if not allow_ai or candidates:
+                return
+            if sentence:
+                call(
+                    "ai",
+                    lambda: self._definition_from_context_ai(
+                        word,
+                        sentence,
+                        language,
+                        target_language,
+                    ),
+                    "context",
+                )
+            if not candidates:
+                call(
+                    "ai",
+                    lambda: self._definition_ai(word, target_language, semantic_only=True),
+                    "ai",
+                )
+
         if target_language == language:
             for definition in self._wiktionary_definitions(word, language):
                 push(definition, "wiktionary", "lexicon")
@@ -399,41 +457,9 @@ class ProviderManager:
                 lambda: self._definition_dictionaryapi(word, language),
                 "lexicon",
             )
-            if sentence and allow_ai:
-                call(
-                    "ai",
-                    lambda: self._definition_from_context_ai(
-                        word,
-                        sentence,
-                        language,
-                        target_language,
-                    ),
-                    "context",
-                )
-            if allow_ai:
-                call(
-                    "ai",
-                    lambda: self._definition_ai(word, target_language, semantic_only=True),
-                    "ai",
-                )
+            call_ai_fallback()
         else:
-            if sentence and allow_ai:
-                call(
-                    "ai",
-                    lambda: self._definition_from_context_ai(
-                        word,
-                        sentence,
-                        language,
-                        target_language,
-                    ),
-                    "context",
-                )
-            if allow_ai:
-                call(
-                    "ai",
-                    lambda: self._definition_ai(word, target_language, semantic_only=True),
-                    "ai",
-                )
+            call_ai_fallback()
 
         return DefinitionCandidatesResult(
             candidates=candidates,
@@ -987,13 +1013,22 @@ class ProviderManager:
                     sentence = _extract_tatoeba_sentence(item)
                     if not sentence or not text_contains_focus(sentence, word):
                         continue
-                    score = score_sentence(
+                    strict_score = score_sentence(
                         sentence,
                         word,
                         language,
                         min_words=resolved_min_words,
                         max_words=resolved_max_words,
                     )
+                    score = strict_score
+                    if score <= 0:
+                        score = _score_tatoeba_candidate(
+                            sentence,
+                            word,
+                            language,
+                            min_words=resolved_min_words,
+                            max_words=resolved_max_words,
+                        )
                     if score <= 0:
                         continue
                     score -= min(0.15, float(page - 1) * 0.03)
@@ -1011,7 +1046,7 @@ class ProviderManager:
                         candidates_by_text[sentence] = candidate
                     if (
                         query_mode == "exact"
-                        and candidate.score >= TATOEBA_STRONG_SENTENCE_SCORE
+                        and strict_score >= TATOEBA_STRONG_SENTENCE_SCORE
                     ):
                         strong_exact_candidate = True
                 if len(results) < page_size:
@@ -1035,7 +1070,7 @@ class ProviderManager:
         ensure_dir(output_dir)
         safe_name = _safe_filename(filename_hint)
         path = Path(output_dir) / f"{safe_name}.mp3"
-        tts = gTTS(text=text, lang=language)
+        tts = gTTS(text=text, lang=language, timeout=self._timeout_for("gtts"))
         tts.save(str(path))
         return str(path)
 
@@ -1069,10 +1104,20 @@ class ProviderManager:
         ensure_dir(output_dir)
         safe_name = _safe_filename(filename_hint)
         path = Path(output_dir) / f"{safe_name}.wav"
-        engine = pyttsx3.init()
-        engine.save_to_file(text, str(path))
-        engine.runAndWait()
-        return str(path)
+
+        def synthesize() -> str | None:
+            engine = pyttsx3.init()
+            try:
+                engine.save_to_file(text, str(path))
+                engine.runAndWait()
+            finally:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+            return str(path)
+
+        return self._run_local_with_timeout("pyttsx3", synthesize)
 
     def _audio_azure_tts(
         self,
@@ -1536,6 +1581,28 @@ def _tatoeba_query(word: str, language: str, exact_match: bool) -> str:
     if exact_match and language_code in TATOEBA_STEMMING_LANGUAGES and not query.startswith("="):
         return f"={query}"
     return query
+
+
+def _score_tatoeba_candidate(
+    sentence: str,
+    focus: str,
+    language: str,
+    *,
+    min_words: int,
+    max_words: int,
+) -> float:
+    relaxed_min = max(2, int(min_words or 5) - 3)
+    relaxed_max = max(relaxed_min, int(max_words or 25) + 10)
+    relaxed_score = score_sentence(
+        sentence,
+        focus,
+        language,
+        min_words=relaxed_min,
+        max_words=relaxed_max,
+    )
+    if relaxed_score <= 0:
+        return 0.0
+    return relaxed_score * 0.92
 
 
 def _wiktionary_pos_label(value: str) -> str:

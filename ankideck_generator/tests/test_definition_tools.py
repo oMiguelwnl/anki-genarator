@@ -73,6 +73,16 @@ def test_normalize_definition_normalizes_list_spacing() -> None:
     assert value == "adverb: maybe, perhaps, possibly."
 
 
+def test_normalize_definition_keeps_semantic_parenthetical_gloss() -> None:
+    value = normalize_definition(
+        "noun: tool (mechanical device intended to make a task easier)",
+        "en",
+        min_words=1,
+        max_words=12,
+    )
+    assert value == "noun: tool (mechanical device intended to make a task easier)."
+
+
 def test_extract_meta_definition_builds_compact_verb_note() -> None:
     meta = extract_meta_definition(
         "verb: masculine singular past indicative imperfective of говори́ть"
