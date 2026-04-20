@@ -6,15 +6,15 @@ current_phase: 03
 current_phase_name: contextual-lexical-review
 current_plan: 2
 status: executing
-stopped_at: Completed 03-01-PLAN.md
-last_updated: "2026-04-20T20:13:34.385Z"
+stopped_at: Completed 03-02-PLAN.md
+last_updated: "2026-04-20T20:35:26.999Z"
 last_activity: 2026-04-20
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 10
-  completed_plans: 8
-  percent: 80
+  completed_plans: 9
+  percent: 90
 ---
 
 # Project State
@@ -34,7 +34,7 @@ See: `.planning/PROJECT.md` (updated 2026-04-15)
 **Current Plan:** 2
 **Total Plans in Phase:** 3
 **Status:** Ready to execute
-**Progress:** [████████░░] 80%
+**Progress:** [█████████░] 90%
 **Last Activity:** 2026-04-20
 **Last Activity Description:** Phase 03 execution started
 
@@ -65,6 +65,12 @@ Progress: [░░░░░░░░░░] 0%
 - [Phase 03]: ProviderManager validates lexical review JSON into a typed transport result before domain policy consumes it. — The provider boundary is the trust boundary for untrusted LLM output, so malformed payloads must fail before orchestration sees them.
 - [Phase 03]: LexicalReviewService resolves an explainable winning sense locally and rejects unresolved ambiguity instead of inventing a runtime human-review state. — This preserves autonomous runs while keeping ambiguity evidence and reject routing machine-readable.
 
+| Phase 03 P02 | 4 min | 2 tasks | 3 files |
+
+- [Phase 03]: DeckBuilder now runs lexical review after sentence selection so the accepted sentence remains the review anchor. — This keeps correction scoped to lexical fields and prevents review from retaking sentence-generation ownership.
+- [Phase 03]: Correct lexical-review verdicts patch only the provided lexical fields and preserve before/after audit snapshots. — Minimal patching satisfies the plan decision to avoid rebuilding both lexical fields when only one is wrong.
+- [Phase 03]: Reject lexical-review verdicts reuse the rejected queue artifact flow instead of introducing a human-review runtime state. — Autonomous runs continue cleanly while unresolved ambiguity remains traceable in review_queue.json and quality outputs.
+
 ## Pending Todos
 
 None yet.
@@ -79,8 +85,8 @@ None yet.
 |----------|------|--------|-------------|
 | *(none)* | | | |
 
-## Session
+## Session Continuity
 
-Last Date: 2026-04-20T20:13:34.377Z
-Stopped At: Completed 03-01-PLAN.md
-Resume File: None
+Last session: 2026-04-20T20:35:04.084Z
+Stopped at: Completed 03-02-PLAN.md
+Resume file: None

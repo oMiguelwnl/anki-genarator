@@ -61,7 +61,7 @@ Plans:
 
 Plans:
 - [x] 03-01-PLAN.md — Define contextual lexical-review contracts, typed verdicts, and AI transport.
-- [ ] 03-02-PLAN.md — Integrate sentence-anchored lexical review, audit evidence, and reject-queue routing.
+- [x] 03-02-PLAN.md — Integrate sentence-anchored lexical review, audit evidence, and reject-queue routing.
 - [ ] 03-03-PLAN.md — Revalidate all corrections before acceptance and keep audio post-acceptance.
 
 ### Phase 4: Duplicate Guard and Review Workflow
@@ -103,6 +103,6 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 |-------|----------------|--------|-----------|
 | 1. Run State Foundation | 0/3 | Not started | - |
 | 2. AI Sentence Generation | 0/4 | Not started | - |
-| 3. Contextual Lexical Review | 0/3 | Not started | - |
+| 3. Contextual Lexical Review | 2/3 | In Progress | - |
 | 4. Duplicate Guard and Review Workflow | 0/3 | Not started | - |
 | 5. Evaluation and Runtime Controls | 0/3 | Not started | - |
