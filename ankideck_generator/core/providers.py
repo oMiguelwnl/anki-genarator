@@ -33,6 +33,10 @@ from ..utils.language_tools import (
     text_contains_focus,
 )
 from .models import (
+    LEXICAL_REVIEW_PROMPT_VERSION,
+    LEXICAL_REVIEW_SCHEMA_VERSION,
+    LexicalReviewRequest,
+    LexicalReviewResult,
     ProviderResult,
     STRUCTURED_SENTENCE_PROMPT_VERSION,
     STRUCTURED_SENTENCE_SCHEMA_VERSION,
@@ -104,6 +108,15 @@ class SentenceCandidatesResult:
 @dataclass
 class StructuredSentenceBatchResult:
     batch: StructuredSentenceBatch | None
+    provider_name: str
+    elapsed_ms: int
+    error: str | None = None
+    fallback_errors: dict[str, str] | None = None
+
+
+@dataclass
+class LexicalReviewTransportResult:
+    review: LexicalReviewResult | None
     provider_name: str
     elapsed_ms: int
     error: str | None = None
@@ -664,6 +677,38 @@ class ProviderManager:
                 max_words=max_words,
             ),
         )
+
+    def lexical_review(
+        self,
+        request: LexicalReviewRequest,
+        *,
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+    ) -> LexicalReviewTransportResult:
+        start = time.time()
+        try:
+            review = self._lexical_review_ai(
+                request,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+            self._register_provider_success("ai")
+            elapsed = int((time.time() - start) * 1000)
+            return LexicalReviewTransportResult(
+                review=review,
+                provider_name="ai",
+                elapsed_ms=elapsed,
+            )
+        except Exception as exc:  # pragma: no cover - network errors
+            message = str(exc)
+            self._register_provider_failure("ai", message, exc)
+            elapsed = int((time.time() - start) * 1000)
+            return LexicalReviewTransportResult(
+                review=None,
+                provider_name="ai",
+                elapsed_ms=elapsed,
+                error=message,
+            )
 
     def sentence_web(
         self,
@@ -1554,6 +1599,32 @@ class ProviderManager:
             min_words=min_words,
             max_words=max_words,
         )
+
+    def _lexical_review_ai(
+        self,
+        request: LexicalReviewRequest,
+        *,
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+    ) -> LexicalReviewResult:
+        resolved_system_prompt = system_prompt or (
+            "You review flashcard lexical fields as strict JSON. "
+            "Return only valid JSON with no markdown, code fences, or commentary."
+        )
+        resolved_user_prompt = user_prompt or (
+            "Review the translation and definition for a flashcard against the accepted sentence context. "
+            f"Return one JSON object using prompt_version '{LEXICAL_REVIEW_PROMPT_VERSION}' and schema_version '{LEXICAL_REVIEW_SCHEMA_VERSION}'. "
+            "The object must include: verdict, focus_word, language, target_translation_language, accepted_sentence, current_definition, current_translation, source_definition, candidate_senses, winning_sense, losing_sense_candidates, corrected_definition, corrected_translation, reason_codes, confidence, before, after, selection_reasons. "
+            "Verdict must be exactly one of: accept, correct, reject. Never emit human_review. "
+            f"Focus word: {request.focus_word!r}. Language: {request.language!r}. Target translation language: {request.target_translation_language!r}. "
+            f"Accepted sentence: {request.accepted_sentence!r}. Current definition: {request.current_definition!r}. Current translation: {request.current_translation!r}. "
+            f"Source definition: {request.source_definition!r}. Candidate senses: {request.candidate_senses!r}."
+        )
+        payload = self._ai_request_json(resolved_system_prompt, resolved_user_prompt)
+        try:
+            return LexicalReviewResult.model_validate(payload)
+        except ValidationError as exc:
+            raise ProviderError(f"lexical_review_validation_error: {exc}") from exc
 
     def _definition_ai(
         self, word: str, language: str, semantic_only: bool = True
