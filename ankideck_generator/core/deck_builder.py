@@ -42,12 +42,18 @@ from .cache_manager import CacheManager
 from .models import (
     ANKI_FIELD_ORDER_DEFAULT,
     CardData,
+    CompatibilityFingerprint,
     LogRecord,
     ProgressState,
     ProviderResult,
     RunConfig,
 )
 from .providers import ProviderManager
+from .run_state import (
+    build_compatibility_fingerprint,
+    fingerprints_match,
+    quarantine_name,
+)
 from .validators import ValidationContext, validate_card
 
 try:
@@ -132,7 +138,8 @@ DEFAULT_SOFT_VALIDATION_ERRORS = {
 SENTENCE_CACHE_SELECTION_VERSION = 2
 STRONG_TATOEBA_SELECTION_SCORE = 1.6
 TATOEBA_SELECTION_MARGIN = 0.20
-MAX_TATOEBA_REWRITE_CANDIDATES = 2
+MAX_TATOEBA_REWRITE_CANDIDATES = 4
+PROGRESS_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -176,6 +183,8 @@ class BuildStats:
     attempted_by_level: Counter[int] = field(default_factory=Counter)
     validation_counter: Counter[str] = field(default_factory=Counter)
     provider_counter: Counter[str] = field(default_factory=Counter)
+    provider_success_counter: Counter[str] = field(default_factory=Counter)
+    provider_error_counter: Counter[str] = field(default_factory=Counter)
     definition_source_counter: Counter[str] = field(default_factory=Counter)
     ambiguous_focus_counter: Counter[str] = field(default_factory=Counter)
     event_counter: Counter[str] = field(default_factory=Counter)
@@ -196,6 +205,22 @@ class BuildStats:
     )
     definition_score_total: float = 0.0
     definition_score_samples: int = 0
+    corrected_accepted_count: int = 0
+    checkpoint_level: int = 1
+    checkpoint_index: int = -1
+
+
+@dataclass
+class DecisionCursor:
+    contiguous_index: int = -1
+    finalized_indexes: set[int] = field(default_factory=set)
+
+    def mark_finalized(self, index: int) -> int:
+        self.finalized_indexes.add(index)
+        while self.contiguous_index + 1 in self.finalized_indexes:
+            self.finalized_indexes.remove(self.contiguous_index + 1)
+            self.contiguous_index += 1
+        return self.contiguous_index
 
 
 @dataclass
@@ -319,6 +344,87 @@ class DeckBuilder:
         )
         return providers.validate_ai_ready()
 
+    def _build_compatibility_fingerprint(
+        self, run: RunConfig
+    ) -> CompatibilityFingerprint:
+        runtime_cfg = self.config.get("runtime", {}) if isinstance(self.config, dict) else {}
+        return build_compatibility_fingerprint(
+            model={
+                "language": run.language,
+                "mode": run.mode,
+                "providers": self.config.get("providers", {}) if isinstance(self.config, dict) else {},
+            },
+            prompt={
+                "definition_policy": self.definition_policy,
+                "sentence_cache_selection_version": SENTENCE_CACHE_SELECTION_VERSION,
+            },
+            schema={
+                "card_data": CardData.model_json_schema(),
+                "progress_state": ProgressState.model_json_schema(),
+            },
+            validator={
+                "default_validations": DEFAULT_VALIDATIONS,
+                "hard_validation_errors": sorted(DEFAULT_HARD_VALIDATION_ERRORS),
+                "soft_validation_errors": sorted(DEFAULT_SOFT_VALIDATION_ERRORS),
+                "error_policy": runtime_cfg.get("error_policy", {}),
+                "cache_validation_version": run.cache_validation_version,
+                "enforce_translation_language": run.enforce_translation_language,
+                "level_validation_mode": run.level_validation_mode,
+                "strict_quality": run.strict_quality,
+                "target_translation": run.target_translation,
+            },
+        )
+
+    def _coerce_random_state(self, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(self._coerce_random_state(item) for item in value)
+        return value
+
+    def _quarantine_progress_file(self, progress_path: Path, reason: str) -> None:
+        if not progress_path.exists():
+            return
+        progress_path.replace(quarantine_name(progress_path, reason))
+
+    def _load_resume_state(
+        self,
+        progress_store: ProgressStore,
+        run: RunConfig,
+        compatibility_fingerprint: CompatibilityFingerprint,
+    ) -> ProgressState | None:
+        progress_path = progress_store.path_for(run.language, run.mode)
+        if not progress_path.exists():
+            return None
+        try:
+            data = read_json(progress_path, default={})
+            if not isinstance(data, dict):
+                raise ValueError("progress state must be a JSON object")
+            state = ProgressState(**data)
+        except Exception:
+            self._quarantine_progress_file(progress_path, "corrupt")
+            return None
+        if state.schema_version != PROGRESS_SCHEMA_VERSION or not fingerprints_match(
+            compatibility_fingerprint, state.compatibility_fingerprint
+        ):
+            self._quarantine_progress_file(progress_path, "incompatible")
+            return None
+        if state.rng_state is not None:
+            try:
+                random.setstate(self._coerce_random_state(state.rng_state))
+            except Exception:
+                self._quarantine_progress_file(progress_path, "corrupt")
+                return None
+        return state
+
+    def _restored_accepted_count(
+        self,
+        words: list[str],
+        processed_focus: set[str],
+        *,
+        stop_index: int,
+    ) -> int:
+        processed_focus_lower = {focus.lower() for focus in processed_focus}
+        return sum(1 for word in words[:stop_index] if word.lower() in processed_focus_lower)
+
     def build(self, run: RunConfig) -> tuple[list[CardData], list[str]]:
         cache_manager = CacheManager(run.cache_path, run.language, run.autosave_every)
         progress_store = ProgressStore("ankideck_generator/data/progress")
@@ -326,6 +432,8 @@ class DeckBuilder:
         self._last_run_log_path = log_path
         logger = JsonLogger(log_path)
         ctx = ValidationContext()
+        compatibility_fingerprint = self._build_compatibility_fingerprint(run)
+        random.seed(run.seed)
 
         level_size = run.level_size
         wordfreq_lang = run.wordfreq_language or run.language
@@ -341,11 +449,17 @@ class DeckBuilder:
 
         state = None
         if run.resume:
-            state = progress_store.load(run.language, run.mode)
+            state = self._load_resume_state(
+                progress_store,
+                run,
+                compatibility_fingerprint,
+            )
         processed_focus = set(state.processed_focus) if state else set()
         processed_sentences = set(state.processed_sentences) if state else set()
         stats = BuildStats(
-            next_sort_index=(state.created_cards + 1) if state and state.created_cards else 1
+            next_sort_index=(state.created_cards + 1) if state and state.created_cards else 1,
+            checkpoint_level=state.level if state else 1,
+            checkpoint_index=state.index if state else -1,
         )
         ctx.seen_focus.update(focus.lower() for focus in processed_focus)
         ctx.seen_sentence.update(sentence.lower() for sentence in processed_sentences)
@@ -356,10 +470,31 @@ class DeckBuilder:
         )
 
         for level, words in level_sets.items():
+            if state and level < state.level:
+                stats.accepted_by_level[level] = self._restored_accepted_count(
+                    words,
+                    processed_focus,
+                    stop_index=len(words),
+                )
+                continue
+            start_index = 0
+            if state and level == state.level:
+                start_index = max(0, int(state.index) + 1)
+            stats.accepted_by_level[level] = self._restored_accepted_count(
+                words,
+                processed_focus,
+                stop_index=min(len(words), start_index),
+            )
+            decision_cursor = DecisionCursor(contiguous_index=start_index - 1)
+            if start_index >= len(words):
+                stats.checkpoint_level = level
+                stats.checkpoint_index = max(stats.checkpoint_index, start_index - 1)
+                continue
             if parallel_enabled:
                 self._build_level_parallel(
                     level=level,
                     words=words,
+                    start_index=start_index,
                     run=run,
                     cache=cache_manager,
                     ctx=ctx,
@@ -368,11 +503,14 @@ class DeckBuilder:
                     stats=stats,
                     logger=logger,
                     progress_store=progress_store,
+                    decision_cursor=decision_cursor,
+                    compatibility_fingerprint=compatibility_fingerprint,
                 )
             else:
                 self._build_level_serial(
                     level=level,
                     words=words,
+                    start_index=start_index,
                     run=run,
                     cache=cache_manager,
                     ctx=ctx,
@@ -381,14 +519,17 @@ class DeckBuilder:
                     stats=stats,
                     logger=logger,
                     progress_store=progress_store,
+                    decision_cursor=decision_cursor,
+                    compatibility_fingerprint=compatibility_fingerprint,
                 )
 
         cache_manager.save_all()
         self._save_progress(
             progress_store,
             run,
-            level=3,
-            index=level_size,
+            compatibility_fingerprint=compatibility_fingerprint,
+            level=stats.checkpoint_level,
+            index=stats.checkpoint_index,
             processed_focus=processed_focus,
             processed_sentences=processed_sentences,
             next_sort_index=stats.next_sort_index,
@@ -415,6 +556,7 @@ class DeckBuilder:
         *,
         level: int,
         words: list[str],
+        start_index: int,
         run: RunConfig,
         cache: CacheManager,
         ctx: ValidationContext,
@@ -423,16 +565,21 @@ class DeckBuilder:
         stats: BuildStats,
         logger: JsonLogger,
         progress_store: ProgressStore,
+        decision_cursor: DecisionCursor,
+        compatibility_fingerprint: CompatibilityFingerprint,
     ) -> None:
         provider_manager = self._make_provider_manager(run)
-        accepted_in_level = 0
+        accepted_in_level = stats.accepted_by_level[level]
         level_target = run.level_size
         attempt_cap = int(run.max_attempts_per_level or 0)
         if attempt_cap <= 0:
             attempt_cap = len(words)
+        initial_attempt_cap = max(1, attempt_cap)
         progress = tqdm(total=level_target, desc=f"Level {level}", unit="card")
+        if accepted_in_level:
+            progress.update(min(level_target, accepted_in_level))
         try:
-            for index, word in enumerate(words):
+            for index, word in enumerate(words[start_index:], start=start_index):
                 if self._is_low_yield_level(level, run, stats):
                     attempted = stats.attempted_by_level[level]
                     accepted = stats.accepted_by_level[level]
@@ -443,7 +590,16 @@ class DeckBuilder:
                 if accepted_in_level >= level_target:
                     break
                 if stats.attempted_by_level[level] >= attempt_cap:
-                    break
+                    expanded_cap = self._expanded_attempt_cap(
+                        current_cap=attempt_cap,
+                        initial_cap=initial_attempt_cap,
+                        accepted=stats.accepted_by_level[level],
+                        target=level_target,
+                        words_available=len(words),
+                    )
+                    if expanded_cap <= attempt_cap:
+                        break
+                    attempt_cap = expanded_cap
                 if word in processed_focus:
                     continue
                 blocked_reason = cache.get("invalid_focus", self._invalid_focus_key(word, run))
@@ -465,6 +621,7 @@ class DeckBuilder:
                     log_record = LogRecord(
                         focus=word,
                         level=level,
+                        lifecycle_state="rejected",
                         providers={},
                         provider_errors={},
                         validations=[],
@@ -473,27 +630,23 @@ class DeckBuilder:
                     )
                     card = None
 
-                self._record_log(logger, stats, log_record)
-                if card:
-                    card.index = stats.next_sort_index
-                    stats.next_sort_index += 1
-                    stats.cards.append(card)
-                    processed_focus.add(card.focus)
-                    processed_sentences.add(card.sentence)
-                    accepted_in_level += 1
-                    stats.accepted_by_level[level] += 1
-                    progress.update(1)
-
-                self._maybe_checkpoint(
+                if self._finalize_card_decision(
+                    logger=logger,
                     stats=stats,
-                    run=run,
-                    cache=cache,
-                    progress_store=progress_store,
+                    log_record=log_record,
+                    card=card,
                     level=level,
-                    index=index,
+                    word_index=index,
+                    progress=progress,
+                    cache=cache,
+                    run=run,
+                    progress_store=progress_store,
                     processed_focus=processed_focus,
                     processed_sentences=processed_sentences,
-                )
+                    decision_cursor=decision_cursor,
+                    compatibility_fingerprint=compatibility_fingerprint,
+                ):
+                    accepted_in_level += 1
         finally:
             progress.close()
 
@@ -502,6 +655,7 @@ class DeckBuilder:
         *,
         level: int,
         words: list[str],
+        start_index: int,
         run: RunConfig,
         cache: CacheManager,
         ctx: ValidationContext,
@@ -510,25 +664,30 @@ class DeckBuilder:
         stats: BuildStats,
         logger: JsonLogger,
         progress_store: ProgressStore,
+        decision_cursor: DecisionCursor,
+        compatibility_fingerprint: CompatibilityFingerprint,
     ) -> None:
         level_target = run.level_size
         attempt_cap = int(run.max_attempts_per_level or 0)
         if attempt_cap <= 0:
             attempt_cap = len(words)
+        initial_attempt_cap = max(1, attempt_cap)
         text_workers = max(1, int(run.concurrency))
         audio_workers = max(1, int(run.audio_concurrency))
         reserved_focus: set[str] = set()
         reserved_sentences: set[str] = set()
-        word_cursor = 0
-        submit_index = 0
-        next_consume = 0
+        word_cursor = start_index
+        submit_index = start_index
+        next_consume = start_index
         accepted_index = 0
         next_audio_commit = 0
         text_futures: dict[object, int] = {}
         ready_text: dict[int, TextTaskResult] = {}
-        audio_futures: dict[object, int] = {}
-        ready_audio: dict[int, AudioTaskResult] = {}
+        audio_futures: dict[object, tuple[int, int]] = {}
+        ready_audio: dict[int, tuple[AudioTaskResult, int]] = {}
         progress = tqdm(total=level_target, desc=f"Level {level}", unit="card")
+        if stats.accepted_by_level[level]:
+            progress.update(min(level_target, stats.accepted_by_level[level]))
 
         with ThreadPoolExecutor(max_workers=text_workers) as text_executor, ThreadPoolExecutor(max_workers=audio_workers) as audio_executor:
             try:
@@ -540,6 +699,14 @@ class DeckBuilder:
                             f"Level {level}: stopping by low yield ({accepted}/{attempted})"
                         )
                         break
+                    if stats.attempted_by_level[level] >= attempt_cap:
+                        attempt_cap = self._expanded_attempt_cap(
+                            current_cap=attempt_cap,
+                            initial_cap=initial_attempt_cap,
+                            accepted=stats.accepted_by_level[level],
+                            target=level_target,
+                            words_available=len(words),
+                        )
                     pending_text_attempts = len(text_futures) + len(ready_text)
                     while (
                         word_cursor < len(words)
@@ -592,12 +759,14 @@ class DeckBuilder:
                             if future in text_futures:
                                 ready_text[text_futures.pop(future)] = future.result()
                             elif future in audio_futures:
-                                ready_audio[audio_futures.pop(future)] = future.result()
+                                accepted_order, candidate_index = audio_futures.pop(future)
+                                ready_audio[accepted_order] = (future.result(), candidate_index)
                     else:
                         for future in [f for f in list(text_futures.keys()) if f.done()]:
                             ready_text[text_futures.pop(future)] = future.result()
                         for future in [f for f in list(audio_futures.keys()) if f.done()]:
-                            ready_audio[audio_futures.pop(future)] = future.result()
+                            accepted_order, candidate_index = audio_futures.pop(future)
+                            ready_audio[accepted_order] = (future.result(), candidate_index)
 
                     progressed = False
 
@@ -610,16 +779,21 @@ class DeckBuilder:
                         card = text_result.card
                         log_record = text_result.log_record
                         if not card:
-                            self._record_log(logger, stats, log_record)
-                            self._maybe_checkpoint(
+                            self._finalize_card_decision(
+                                logger=logger,
                                 stats=stats,
-                                run=run,
-                                cache=cache,
-                                progress_store=progress_store,
+                                log_record=log_record,
+                                card=None,
                                 level=level,
-                                index=next_consume,
+                                word_index=text_result.candidate_index,
+                                progress=progress,
+                                cache=cache,
+                                run=run,
+                                progress_store=progress_store,
                                 processed_focus=processed_focus,
                                 processed_sentences=processed_sentences,
+                                decision_cursor=decision_cursor,
+                                compatibility_fingerprint=compatibility_fingerprint,
                             )
                             continue
 
@@ -639,20 +813,26 @@ class DeckBuilder:
                             log_record.discard_reason = _infer_discard_reason(
                                 text_errors, log_record.provider_errors
                             )
-                            self._record_log(logger, stats, log_record)
-                            self._maybe_checkpoint(
+                            self._finalize_card_decision(
+                                logger=logger,
                                 stats=stats,
-                                run=run,
-                                cache=cache,
-                                progress_store=progress_store,
+                                log_record=log_record,
+                                card=None,
                                 level=level,
-                                index=next_consume,
+                                word_index=text_result.candidate_index,
+                                progress=progress,
+                                cache=cache,
+                                run=run,
+                                progress_store=progress_store,
                                 processed_focus=processed_focus,
                                 processed_sentences=processed_sentences,
+                                decision_cursor=decision_cursor,
+                                compatibility_fingerprint=compatibility_fingerprint,
                             )
                             continue
 
                         log_record.validations = text_errors
+                        log_record.lifecycle_state = "reviewed"
                         reserved_focus.add(card.focus.lower())
                         reserved_sentences.add(card.sentence.lower())
                         future = audio_executor.submit(
@@ -663,12 +843,12 @@ class DeckBuilder:
                             run,
                             cache,
                         )
-                        audio_futures[future] = accepted_index
+                        audio_futures[future] = (accepted_index, text_result.candidate_index)
                         accepted_index += 1
 
                     while next_audio_commit in ready_audio:
                         progressed = True
-                        audio_result = ready_audio.pop(next_audio_commit)
+                        audio_result, candidate_index = ready_audio.pop(next_audio_commit)
                         next_audio_commit += 1
                         card = audio_result.card
                         log_record = audio_result.log_record
@@ -684,16 +864,21 @@ class DeckBuilder:
                             log_record.discard_reason = _infer_discard_reason(
                                 final_errors, log_record.provider_errors
                             )
-                            self._record_log(logger, stats, log_record)
-                            self._maybe_checkpoint(
+                            self._finalize_card_decision(
+                                logger=logger,
                                 stats=stats,
-                                run=run,
-                                cache=cache,
-                                progress_store=progress_store,
+                                log_record=log_record,
+                                card=None,
                                 level=level,
-                                index=next_consume,
+                                word_index=candidate_index,
+                                progress=progress,
+                                cache=cache,
+                                run=run,
+                                progress_store=progress_store,
                                 processed_focus=processed_focus,
                                 processed_sentences=processed_sentences,
+                                decision_cursor=decision_cursor,
+                                compatibility_fingerprint=compatibility_fingerprint,
                             )
                             continue
 
@@ -701,28 +886,25 @@ class DeckBuilder:
                             if path and path not in stats.media_files:
                                 stats.media_files.append(path)
 
-                        card.index = stats.next_sort_index
-                        stats.next_sort_index += 1
-                        stats.cards.append(card)
-                        processed_focus.add(card.focus)
-                        processed_sentences.add(card.sentence)
-                        ctx.seen_focus.add(card.focus.lower())
-                        ctx.seen_sentence.add(card.sentence.lower())
-                        stats.accepted_by_level[level] += 1
                         log_record.status = "accepted"
                         log_record.discard_reason = None
                         log_record.validations = final_errors if final_errors else []
-                        self._record_log(logger, stats, log_record)
-                        progress.update(1)
-                        self._maybe_checkpoint(
+                        self._finalize_card_decision(
+                            logger=logger,
                             stats=stats,
-                            run=run,
-                            cache=cache,
-                            progress_store=progress_store,
+                            log_record=log_record,
+                            card=card,
                             level=level,
-                            index=next_consume,
+                            word_index=candidate_index,
+                            progress=progress,
+                            cache=cache,
+                            run=run,
+                            progress_store=progress_store,
                             processed_focus=processed_focus,
                             processed_sentences=processed_sentences,
+                            decision_cursor=decision_cursor,
+                            compatibility_fingerprint=compatibility_fingerprint,
+                            ctx=ctx,
                         )
                         if stats.accepted_by_level[level] >= level_target:
                             break
@@ -736,11 +918,77 @@ class DeckBuilder:
                     future.cancel()
                 progress.close()
 
+    def _finalize_card_decision(
+        self,
+        *,
+        logger: JsonLogger,
+        stats: BuildStats,
+        log_record: LogRecord,
+        card: CardData | None,
+        level: int,
+        word_index: int,
+        progress: tqdm,
+        cache: CacheManager,
+        run: RunConfig,
+        progress_store: ProgressStore,
+        processed_focus: set[str],
+        processed_sentences: set[str],
+        decision_cursor: DecisionCursor,
+        compatibility_fingerprint: CompatibilityFingerprint,
+        ctx: ValidationContext | None = None,
+    ) -> bool:
+        accepted = card is not None and str(log_record.status) == "accepted"
+        if accepted:
+            card.lifecycle_state = "accepted"
+            card.index = stats.next_sort_index
+            stats.next_sort_index += 1
+            stats.cards.append(card)
+            processed_focus.add(card.focus)
+            processed_sentences.add(card.sentence)
+            if ctx is not None:
+                ctx.seen_focus.add(card.focus.lower())
+                ctx.seen_sentence.add(card.sentence.lower())
+            stats.accepted_by_level[level] += 1
+            log_record.lifecycle_state = "accepted"
+            log_record.after = log_record.after or card.model_dump()
+            progress.update(1)
+        else:
+            log_record.lifecycle_state = "rejected"
+
+        if log_record.discard_reason and log_record.discard_reason not in log_record.reason_codes:
+            log_record.reason_codes.append(log_record.discard_reason)
+        for validation_error in log_record.validations:
+            if validation_error not in log_record.reason_codes:
+                log_record.reason_codes.append(validation_error)
+
+        self._record_log(logger, stats, log_record)
+        checkpoint_index = decision_cursor.mark_finalized(word_index)
+        stats.checkpoint_level = level
+        stats.checkpoint_index = checkpoint_index
+        self._maybe_checkpoint(
+            stats=stats,
+            run=run,
+            cache=cache,
+            progress_store=progress_store,
+            compatibility_fingerprint=compatibility_fingerprint,
+            level=level,
+            index=checkpoint_index,
+            processed_focus=processed_focus,
+            processed_sentences=processed_sentences,
+        )
+        return accepted
+
     def _record_log(self, logger: JsonLogger, stats: BuildStats, log_record: LogRecord) -> None:
         logger.log(log_record.model_dump())
         level = int(log_record.level or 0)
         for field_name, provider_name in log_record.providers.items():
-            stats.provider_counter[f"{field_name}:{provider_name}"] += 1
+            key = f"{field_name}:{provider_name}"
+            stats.provider_counter[key] += 1
+            if provider_name and provider_name != "none" and not (log_record.provider_errors or {}).get(field_name):
+                stats.provider_success_counter[key] += 1
+        for field_name, error in (log_record.provider_errors or {}).items():
+            if error:
+                stats.provider_error_counter[field_name] += 1
         definition_reason = (log_record.selection_reasons or {}).get("definition", "")
         if definition_reason:
             source_kind = definition_reason.split(";", 1)[0].strip()
@@ -760,13 +1008,27 @@ class DeckBuilder:
         if isinstance(definition_score, (int, float)):
             stats.definition_score_total += float(definition_score)
             stats.definition_score_samples += 1
-        if log_record.review_notes or str(getattr(log_record, "status", "")) == "discarded":
+        if log_record.lifecycle_state == "accepted" and (
+            log_record.review_notes or log_record.before
+        ):
+            stats.corrected_accepted_count += 1
+        if log_record.lifecycle_state == "rejected":
             stats.needs_review_items.append(
                 {
                     "focus": log_record.focus,
                     "level": level,
                     "status": log_record.status,
+                    "lifecycle_state": log_record.lifecycle_state,
                     "discard_reason": log_record.discard_reason,
+                    "reason_codes": list(log_record.reason_codes or []),
+                    "before": dict(log_record.before or {}),
+                    "after": dict(log_record.after or {}),
+                    "provider": log_record.provider,
+                    "model": log_record.model,
+                    "providers": dict(log_record.providers or {}),
+                    "provider_errors": dict(log_record.provider_errors or {}),
+                    "event_counts": dict(log_record.event_counts or {}),
+                    "stage_timings": dict(log_record.stage_timings or {}),
                     "review_notes": list(log_record.review_notes or []),
                     "validations": list(log_record.validations or []),
                     "definition_candidates": list(
@@ -793,6 +1055,7 @@ class DeckBuilder:
         run: RunConfig,
         cache: CacheManager,
         progress_store: ProgressStore,
+        compatibility_fingerprint: CompatibilityFingerprint,
         level: int,
         index: int,
         processed_focus: set[str],
@@ -808,6 +1071,7 @@ class DeckBuilder:
         self._save_progress(
             progress_store,
             run,
+            compatibility_fingerprint=compatibility_fingerprint,
             level=level,
             index=index,
             processed_focus=processed_focus,
@@ -820,6 +1084,7 @@ class DeckBuilder:
         progress_store: ProgressStore,
         run: RunConfig,
         *,
+        compatibility_fingerprint: CompatibilityFingerprint,
         level: int,
         index: int,
         processed_focus: set[str],
@@ -830,6 +1095,8 @@ class DeckBuilder:
             ProgressState(
                 language=run.language,
                 mode=run.mode,
+                schema_version=PROGRESS_SCHEMA_VERSION,
+                compatibility_fingerprint=compatibility_fingerprint,
                 level=level,
                 index=index,
                 rng_state=random.getstate(),
@@ -903,7 +1170,8 @@ class DeckBuilder:
             deck_cfg.get("deck_id", default_deck_id),
             deck_cfg.get("name", "Anki Deck Generator"),
         )
-        for card in cards:
+        accepted_cards = [card for card in cards if card.lifecycle_state == "accepted"]
+        for card in accepted_cards:
             note = genanki.Note(
                 model=model,
                 fields=card.genanki_fields(field_order),
@@ -945,9 +1213,12 @@ class DeckBuilder:
         attempt_budget = max(0, int(attempt_budget))
         pool_size = max(level_size * pool_multiplier, level_size)
         if attempt_budget:
-            pool_size = max(pool_size, attempt_budget)
+            pool_size = max(
+                pool_size,
+                min(50000, max(level_size * pool_multiplier * 2, attempt_budget * 2)),
+            )
         required_total = pool_size * 3
-        target_total = max(required_total * 3, 6000)
+        target_total = max(required_total, 6000)
         filtered_top: list[str] = []
 
         while len(filtered_top) < required_total:
@@ -980,6 +1251,20 @@ class DeckBuilder:
             2: level2,
             3: level3,
         }
+
+    def _expanded_attempt_cap(
+        self,
+        *,
+        current_cap: int,
+        initial_cap: int,
+        accepted: int,
+        target: int,
+        words_available: int,
+    ) -> int:
+        if accepted >= target or current_cap >= words_available:
+            return current_cap
+        step = max(1, initial_cap, target)
+        return min(words_available, current_cap + step)
 
     def _deck_config_for_language(self, language: str) -> tuple[dict, list[str]]:
         deck_cfg = dict(self.config.get("deck", {}))
@@ -1088,6 +1373,7 @@ class DeckBuilder:
         if self._should_reject_errors(final_errors, run):
             log_record.validations = final_errors
             log_record.status = "discarded"
+            log_record.lifecycle_state = "rejected"
             log_record.discard_reason = _infer_discard_reason(
                 final_errors, log_record.provider_errors
             )
@@ -1100,6 +1386,7 @@ class DeckBuilder:
                 return None, LogRecord(
                     focus=word,
                     level=level,
+                    lifecycle_state="rejected",
                     providers=log_record.providers,
                     provider_errors=log_record.provider_errors,
                     stage_timings=log_record.stage_timings,
@@ -1114,7 +1401,9 @@ class DeckBuilder:
 
         ctx.seen_focus.add(card.focus.lower())
         ctx.seen_sentence.add(card.sentence.lower())
+        card.lifecycle_state = "accepted"
         log_record.status = "accepted"
+        log_record.lifecycle_state = "accepted"
         log_record.discard_reason = None
         log_record.validations = final_errors if final_errors else []
         return card, log_record
@@ -1142,6 +1431,7 @@ class DeckBuilder:
             log_record = LogRecord(
                 focus=word,
                 level=level,
+                lifecycle_state="rejected",
                 providers={},
                 provider_errors={},
                 validations=[],
@@ -1308,7 +1598,7 @@ class DeckBuilder:
                 text,
                 language,
                 pos_mode="auto",
-                min_words=2,
+                min_words=1,
                 max_words=12,
                 policy=self.definition_policy,
             )
@@ -1318,10 +1608,21 @@ class DeckBuilder:
                 return "definition_missing"
             if not definition_has_pos(text, policy=self.definition_policy):
                 return "definition_missing_pos"
-            if strict_quality and not text_matches_language(
-                text, expected_language, min_score=0.25, min_tokens=3
-            ):
-                return "definition_wrong_language"
+            if strict_quality:
+                _pos_label, body = split_definition(text, policy=self.definition_policy)
+                alpha_tokens = [
+                    token for token in tokenize(body or text) if any(char.isalpha() for char in token)
+                ]
+                if len(alpha_tokens) >= 2:
+                    if not text_matches_language(
+                        body or text,
+                        expected_language,
+                        min_score=0.25,
+                        min_tokens=min(2, len(alpha_tokens)),
+                    ):
+                        return "definition_wrong_language"
+                elif expected_language not in {run.target_translation, "en"}:
+                    return "definition_wrong_language"
             semantic_issue = semantic_definition_reason(text, word)
             if semantic_issue:
                 if semantic_issue == "definition_mentions_other_language":
@@ -1557,6 +1858,7 @@ class DeckBuilder:
             return None, LogRecord(
                 focus=word,
                 level=level,
+                lifecycle_state="rejected",
                 providers=providers_used,
                 provider_errors=provider_errors,
                 stage_timings=stage_timings,
@@ -2177,22 +2479,6 @@ class DeckBuilder:
                         if translated_candidate is not None:
                             remember_final_definition_candidate(translated_candidate)
 
-            if not final_definition_candidates and allow_ai("definition"):
-                direct_ai = request_definition_ai("en")
-                trace_result(
-                    "definition",
-                    direct_ai,
-                    ai_field="definition",
-                    stage_key="definition_context_ms",
-                )
-                direct_candidate = make_definition_candidate(
-                    direct_ai.value or "",
-                    "en",
-                    provider_name=direct_ai.provider_name,
-                    source_kind="ai",
-                )
-                if direct_candidate is not None:
-                    remember_final_definition_candidate(direct_candidate)
             if (
                 sentence
                 and allow_ai("definition")
@@ -2214,6 +2500,22 @@ class DeckBuilder:
                 )
                 if context_candidate is not None:
                     remember_final_definition_candidate(context_candidate)
+            if not final_definition_candidates and allow_ai("definition"):
+                direct_ai = request_definition_ai("en")
+                trace_result(
+                    "definition",
+                    direct_ai,
+                    ai_field="definition",
+                    stage_key="definition_context_ms",
+                )
+                direct_candidate = make_definition_candidate(
+                    direct_ai.value or "",
+                    "en",
+                    provider_name=direct_ai.provider_name,
+                    source_kind="ai",
+                )
+                if direct_candidate is not None:
+                    remember_final_definition_candidate(direct_candidate)
 
         if not final_definition_candidates and sentence and run.language == "en" and allow_ai("definition"):
             context_ai = request_definition_from_context("en", sentence)
@@ -2268,6 +2570,15 @@ class DeckBuilder:
                 result = providers.translation_web(word, run.language, "en")
                 trace_result("word_translation", result, stage_key="word_translation_ms")
                 fallback_translation = (result.value or "").strip()
+                if not fallback_translation and allow_ai("translation"):
+                    result = providers.translation_ai(word, run.language, "en")
+                    trace_result(
+                        "word_translation",
+                        result,
+                        ai_field="translation",
+                        stage_key="word_translation_ms",
+                    )
+                    fallback_translation = (result.value or "").strip()
                 if fallback_translation:
                     cache.set(
                         "word_translations", fallback_translation_key, fallback_translation
@@ -2442,11 +2753,13 @@ class DeckBuilder:
             sentence_audio="",
             level=level,
             language=run.language,
+            lifecycle_state="generated",
         )
 
         return card, LogRecord(
             focus=word,
             level=level,
+            lifecycle_state="generated",
             providers=providers_used,
             provider_errors=provider_errors,
             stage_timings=stage_timings,
@@ -2777,6 +3090,10 @@ class DeckBuilder:
             if attempts:
                 print(f"  tatoeba_hit_rate: {tatoeba_hits / attempts * 100.0:.1f}%")
                 print(
+                    "  tatoeba_effective_rate: "
+                    f"{(tatoeba_hits + tatoeba_seeded_hits) / attempts * 100.0:.1f}%"
+                )
+                print(
                     f"  sentence_reject_rate: {max(0, attempts - total_hits) / attempts * 100.0:.1f}%"
                 )
             if total_hits:
@@ -2853,6 +3170,12 @@ class DeckBuilder:
             average_definition_score = (
                 stats.definition_score_total / stats.definition_score_samples
             )
+        sentence_attempts = stats.event_counter.get("sentence_tatoeba_attempted", 0)
+        sentence_tatoeba_hits = stats.event_counter.get("sentence_tatoeba_hit", 0)
+        sentence_tatoeba_seeded_hits = stats.event_counter.get("sentence_tatoeba_seeded_hit", 0)
+        sentence_rewrite_hits = stats.event_counter.get("sentence_ai_rewrite_hit", 0)
+        sentence_ai_hits = stats.event_counter.get("sentence_ai_generate_hit", 0)
+        sentence_total_hits = sentence_tatoeba_hits + sentence_rewrite_hits + sentence_ai_hits
         report = {
             "generated_at": datetime.utcnow().isoformat(),
             "language": run.language,
@@ -2865,12 +3188,45 @@ class DeckBuilder:
             "definition_sources": dict(stats.definition_source_counter),
             "ambiguous_focuses": dict(stats.ambiguous_focus_counter.most_common(20)),
             "needs_review": len(stats.needs_review_items),
+            "accepted_with_corrections": stats.corrected_accepted_count,
             "definition_score": {
                 "average": round(average_definition_score, 4),
                 "samples": stats.definition_score_samples,
             },
             "provider_counter": dict(stats.provider_counter),
+            "provider_success_counter": dict(stats.provider_success_counter),
+            "provider_error_counter": dict(stats.provider_error_counter),
             "event_counter": dict(stats.event_counter),
+            "sentence_source_stats": {
+                "attempted": sentence_attempts,
+                "tatoeba_hits": sentence_tatoeba_hits,
+                "tatoeba_seeded_hits": sentence_tatoeba_seeded_hits,
+                "rewrite_hits": sentence_rewrite_hits,
+                "ai_hits": sentence_ai_hits,
+                "tatoeba_hit_rate": round(
+                    sentence_tatoeba_hits / sentence_attempts, 4
+                )
+                if sentence_attempts
+                else 0.0,
+                "tatoeba_effective_rate": round(
+                    (sentence_tatoeba_hits + sentence_tatoeba_seeded_hits)
+                    / sentence_attempts,
+                    4,
+                )
+                if sentence_attempts
+                else 0.0,
+                "source_mix": {
+                    "tatoeba": round(sentence_tatoeba_hits / sentence_total_hits, 4)
+                    if sentence_total_hits
+                    else 0.0,
+                    "rewrite": round(sentence_rewrite_hits / sentence_total_hits, 4)
+                    if sentence_total_hits
+                    else 0.0,
+                    "ai": round(sentence_ai_hits / sentence_total_hits, 4)
+                    if sentence_total_hits
+                    else 0.0,
+                },
+            },
         }
         ensure_dir(Path(run.quality_report_path).parent)
         atomic_write_json(run.quality_report_path, report)

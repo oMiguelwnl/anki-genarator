@@ -19,6 +19,16 @@ def _read_model_from_apkg(apkg_path: Path, work_dir: Path) -> dict:
     return next(iter(models.values()))
 
 
+def _read_note_count_from_apkg(apkg_path: Path, work_dir: Path) -> int:
+    with zipfile.ZipFile(apkg_path, "r") as archive:
+        db_bytes = archive.read("collection.anki2")
+
+    db_path = work_dir / "collection.notes.extracted.anki2"
+    db_path.write_bytes(db_bytes)
+    with sqlite3.connect(str(db_path)) as conn:
+        return int(conn.execute("select count(*) from notes").fetchone()[0])
+
+
 def test_deck_export(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
@@ -125,6 +135,75 @@ def test_deck_export_russian_uses_default_model(tmp_path: Path, monkeypatch) -> 
     assert "{{Example Word}}" not in qfmt
     assert "{{FrontSide}}" in afmt
     assert "document.getElementById(\"translation\").style.display = \"block\";" in afmt
+
+
+def test_deck_export_uses_only_accepted_cards(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = RunConfig(
+        language="en",
+        mode="test",
+        interactive=False,
+        output_path=str(tmp_path / "deck-filtered.apkg"),
+        resume=False,
+        level_size=1,
+        target_translation="en",
+        wordfreq_language="en",
+        timeout_sec=1,
+        retries=0,
+        seed=1,
+        cache_path=str(tmp_path / "cache"),
+        autosave_every=1,
+    )
+    accepted_card = CardData(
+        focus="hello",
+        index=1,
+        ipa="",
+        definition="greeting",
+        sentence="hello there",
+        translation="hello there",
+        image="",
+        audio="",
+        level=1,
+        language="en",
+        lifecycle_state="accepted",
+    )
+    rejected_card = CardData(
+        focus="bye",
+        index=2,
+        ipa="",
+        definition="farewell",
+        sentence="bye now",
+        translation="bye now",
+        image="",
+        audio="",
+        level=1,
+        language="en",
+        lifecycle_state="rejected",
+    )
+    reviewed_card = CardData(
+        focus="wait",
+        index=3,
+        ipa="",
+        definition="pause",
+        sentence="wait here",
+        translation="wait here",
+        image="",
+        audio="",
+        level=1,
+        language="en",
+        lifecycle_state="reviewed",
+    )
+
+    builder.export_deck(run, [accepted_card, rejected_card, reviewed_card], [])
+
+    output_path = Path(run.output_path)
+    assert output_path.exists()
+    assert _read_note_count_from_apkg(output_path, tmp_path) == 1
+
+    model = _read_model_from_apkg(output_path, tmp_path)
+    field_names = [field["name"] for field in model["flds"]]
+    assert field_names == ANKI_FIELD_ORDER_DEFAULT
 
 
 def test_deck_export_cleans_generated_artifacts_after_export(

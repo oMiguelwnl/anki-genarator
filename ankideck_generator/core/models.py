@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -35,6 +35,8 @@ ANKI_FIELD_ORDER_RU = [
 # Backward-compatible alias used by existing tests/importers.
 ANKI_FIELD_ORDER = ANKI_FIELD_ORDER_DEFAULT
 
+CardLifecycleState = Literal["generated", "reviewed", "accepted", "rejected"]
+
 
 class CardData(BaseModel):
     focus: str = ""
@@ -55,6 +57,7 @@ class CardData(BaseModel):
     letter_audio: str = ""
     level: int = 1
     language: str = ""
+    lifecycle_state: CardLifecycleState = "accepted"
 
     def _field_values(self) -> dict[str, str]:
         return {
@@ -132,9 +135,19 @@ class RunConfig(BaseModel):
     quality_report_path: str = "output/quality_report.json"
 
 
+class CompatibilityFingerprint(BaseModel):
+    model: str
+    prompt: str
+    schema_digest: str
+    validator: str
+    digest: str
+
+
 class ProgressState(BaseModel):
     language: str
     mode: str
+    schema_version: int = 1
+    compatibility_fingerprint: CompatibilityFingerprint | None = None
     level: int = 1
     index: int = 0
     rng_state: Any | None = None
@@ -147,12 +160,18 @@ class ProgressState(BaseModel):
 class LogRecord(BaseModel):
     focus: str
     level: int
+    lifecycle_state: CardLifecycleState | None = None
     providers: dict[str, str] = Field(default_factory=dict)
     provider_errors: dict[str, str] = Field(default_factory=dict)
     stage_timings: dict[str, int] = Field(default_factory=dict)
     event_counts: dict[str, int] = Field(default_factory=dict)
     validations: list[str] = Field(default_factory=list)
     review_notes: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+    before: dict[str, Any] = Field(default_factory=dict)
+    after: dict[str, Any] = Field(default_factory=dict)
+    provider: str | None = None
+    model: str | None = None
     candidate_preview: dict[str, list[str]] = Field(default_factory=dict)
     quality_scores: dict[str, float] = Field(default_factory=dict)
     selection_reasons: dict[str, str] = Field(default_factory=dict)

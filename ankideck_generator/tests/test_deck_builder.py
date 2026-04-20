@@ -1,6 +1,7 @@
 import json
 from collections import Counter
 from pathlib import Path
+import random
 import time
 
 import ankideck_generator.core.deck_builder as deck_builder_module
@@ -12,7 +13,7 @@ from ankideck_generator.core.deck_builder import (
     _infer_discard_reason,
     _sentence_length_bounds,
 )
-from ankideck_generator.core.models import CardData, LogRecord, RunConfig
+from ankideck_generator.core.models import CardData, LogRecord, ProgressState, RunConfig
 from ankideck_generator.core.validators import ValidationContext
 
 
@@ -110,6 +111,56 @@ def test_build_continues_until_level_target_is_met(monkeypatch, tmp_path: Path) 
     cards, _ = builder.build(run)
     assert len(cards) == 6
     assert [card.focus for card in cards] == ["dos", "tres", "seis", "siete", "diez", "once"]
+
+
+def test_build_soft_expands_attempt_cap_when_more_words_are_available(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.level_size = 1
+    run.max_attempts_per_level = 1
+
+    monkeypatch.setattr(
+        builder,
+        "_prepare_levels",
+        lambda *args, **kwargs: {
+            1: ["uno", "dos"],
+            2: ["tres", "cuatro"],
+            3: ["cinco", "seis"],
+        },
+    )
+
+    def fake_process_word(*args, **kwargs):
+        word = kwargs["word"]
+        level = kwargs["level"]
+        if word in {"uno", "tres", "cinco"}:
+            return None, LogRecord(
+                focus=word,
+                level=level,
+                validations=["definition_missing"],
+                status="discarded",
+                discard_reason="definition_generation_failed",
+            )
+        return (
+            CardData(
+                focus=word,
+                index=0,
+                ipa=f"/{word}/",
+                definition="noun: useful sample definition for this card.",
+                sentence=f"Esta frase usa {word} con contexto claro.",
+                translation=f"This sentence uses {word} with clear context.",
+                level=level,
+                language="es",
+            ),
+            LogRecord(focus=word, level=level, status="accepted"),
+        )
+
+    monkeypatch.setattr(builder, "_process_word", fake_process_word)
+
+    cards, _ = builder.build(run)
+    assert [card.focus for card in cards] == ["dos", "cuatro", "seis"]
 
 
 def test_prepare_levels_uses_strict_frequency_order_within_level_bands(
@@ -1888,6 +1939,78 @@ def test_process_word_uses_english_gloss_as_final_definition(tmp_path: Path) -> 
     assert providers.translation_web_calls == 1
 
 
+def test_process_word_accepts_single_word_english_gloss_for_russian(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path, language="ru")
+    ctx = ValidationContext()
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "wiktionary"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        def word_exists(self, word, language):
+            _ = (word, language)
+            return Result(word, provider_name="wiktionary")
+
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("noun: time", provider_name="wiktionary")
+
+        def definition_ai(self, *args, **kwargs):
+            raise AssertionError("definition_ai should not run when gloss is usable")
+
+        def definition_from_context(self, *args, **kwargs):
+            raise AssertionError("definition_from_context should not run when gloss is usable")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result("Время идет быстро сегодня утром.", provider_name="tatoeba")
+
+        def sentence_ai(self, *args, **kwargs):
+            raise AssertionError("sentence_ai should not run on valid sentence")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("Time passes quickly this morning.", provider_name="googletrans")
+
+        def translation_ai(self, *args, **kwargs):
+            raise AssertionError("translation_ai should not run")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/vrʲemʲə/", provider_name="ai")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("VRYE-mya", provider_name="ai")
+
+    card, _log = builder._process_word(
+        word="время",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=FakeProviders(),
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert card.definition == "noun: time."
+
+
 def test_process_word_passes_sentence_bounds_to_sentence_providers(tmp_path: Path) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
@@ -1972,13 +2095,233 @@ def test_process_word_passes_sentence_bounds_to_sentence_providers(tmp_path: Pat
     assert providers.sentence_bounds[0] == (5, 7)
 
 
-def test_write_quality_outputs_persists_review_queue(tmp_path: Path) -> None:
+def test_build_resume_restores_rng_state_when_fingerprint_matches(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.resume = True
+    fingerprint = builder._build_compatibility_fingerprint(run)
+    saved_rng_state = random.Random(7).getstate()
+    progress_path = tmp_path / "ankideck_generator" / "data" / "progress" / "es_test.json"
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_state = ProgressState(
+        language=run.language,
+        mode=run.mode,
+        schema_version=1,
+        compatibility_fingerprint=fingerprint,
+        level=2,
+        index=-1,
+        rng_state=saved_rng_state,
+        processed_focus=["uno"],
+        processed_sentences=["Frase para uno."],
+        created_cards=1,
+    )
+    progress_path.write_text(
+        json.dumps(progress_state.model_dump(), indent=2),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        builder,
+        "_prepare_levels",
+        lambda *args, **kwargs: {1: ["uno"], 2: ["dos"], 3: ["tres"]},
+    )
+
+    processed_words: list[str] = []
+
+    def fake_process_word(*args, **kwargs):
+        word = kwargs["word"]
+        level = kwargs["level"]
+        processed_words.append(word)
+        return (
+            CardData(
+                focus=word,
+                index=0,
+                ipa=f"/{word}/",
+                definition="noun: useful sample definition for this card.",
+                sentence=f"Esta frase usa {word} con contexto claro.",
+                translation=f"This sentence uses {word} with clear context.",
+                level=level,
+                language="es",
+            ),
+            LogRecord(
+                focus=word,
+                level=level,
+                status="accepted",
+                lifecycle_state="accepted",
+            ),
+        )
+
+    restored_rng_state: dict[str, object] = {}
+
+    monkeypatch.setattr(builder, "_process_word", fake_process_word)
+    monkeypatch.setattr(
+        deck_builder_module.random,
+        "setstate",
+        lambda state: restored_rng_state.setdefault("value", state),
+    )
+
+    cards, _ = builder.build(run)
+
+    assert restored_rng_state["value"] == saved_rng_state
+    assert processed_words == ["dos", "tres"]
+    assert [card.index for card in cards] == [2, 3]
+
+
+def test_build_quarantines_incompatible_progress_and_starts_clean(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.resume = True
+    incompatible_fingerprint = builder._build_compatibility_fingerprint(run).model_copy(
+        update={"digest": "stale"}
+    )
+    progress_path = tmp_path / "ankideck_generator" / "data" / "progress" / "es_test.json"
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_state = ProgressState(
+        language=run.language,
+        mode=run.mode,
+        schema_version=1,
+        compatibility_fingerprint=incompatible_fingerprint,
+        level=2,
+        index=0,
+        rng_state=random.Random(3).getstate(),
+        processed_focus=["uno"],
+        processed_sentences=["Frase para uno."],
+        created_cards=1,
+    )
+    progress_path.write_text(
+        json.dumps(progress_state.model_dump(), indent=2),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        builder,
+        "_prepare_levels",
+        lambda *args, **kwargs: {1: ["uno"], 2: ["dos"], 3: ["tres"]},
+    )
+
+    processed_words: list[str] = []
+
+    def fake_process_word(*args, **kwargs):
+        word = kwargs["word"]
+        level = kwargs["level"]
+        processed_words.append(word)
+        return (
+            CardData(
+                focus=word,
+                index=0,
+                ipa=f"/{word}/",
+                definition="noun: useful sample definition for this card.",
+                sentence=f"Esta frase usa {word} con contexto claro.",
+                translation=f"This sentence uses {word} with clear context.",
+                level=level,
+                language="es",
+            ),
+            LogRecord(focus=word, level=level, status="accepted"),
+        )
+
+    monkeypatch.setattr(builder, "_process_word", fake_process_word)
+
+    builder.build(run)
+
+    assert processed_words == ["uno", "dos", "tres"]
+    quarantined_files = list(progress_path.parent.glob("es_test.incompatible.*.json.quarantine"))
+    assert len(quarantined_files) == 1
+
+
+def test_build_checkpoints_wait_for_final_decisions(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.level_size = 1
+    run.concurrency = 2
+    run.audio_concurrency = 2
+    run.autosave_every = 1
+
+    monkeypatch.setattr(
+        builder,
+        "_prepare_levels",
+        lambda *args, **kwargs: {1: ["uno", "dos"], 2: [], 3: []},
+    )
+
+    captured_saves: list[ProgressState] = []
+
+    def fake_save(self, state):
+        captured_saves.append(state.model_copy(deep=True))
+
+    def fake_text_task(word, level, index, run, cache):
+        _ = (index, run, cache)
+        if word == "dos":
+            return TextTaskResult(
+                candidate_index=1,
+                card=None,
+                log_record=LogRecord(
+                    focus=word,
+                    level=level,
+                    status="discarded",
+                    lifecycle_state="rejected",
+                    discard_reason="definition_missing",
+                    validations=["definition_missing"],
+                ),
+            )
+        return TextTaskResult(
+            candidate_index=0,
+            card=CardData(
+                focus=word,
+                index=0,
+                ipa=f"/{word}/",
+                definition="noun: useful sample definition for this card.",
+                sentence=f"Esta frase usa {word} con contexto claro.",
+                translation=f"This sentence uses {word} with clear context.",
+                level=level,
+                language="es",
+                lifecycle_state="generated",
+            ),
+            log_record=LogRecord(
+                focus=word,
+                level=level,
+                status="candidate",
+                lifecycle_state="generated",
+            ),
+        )
+
+    def fake_audio_task(accepted_index, card, log_record, run, cache):
+        _ = (accepted_index, run, cache)
+        time.sleep(0.05)
+        card.word_audio = f"[sound:{card.focus}.mp3]"
+        card.sentence_audio = f"[sound:{card.focus}_sentence.mp3]"
+        card.audio = card.word_audio
+        return AudioTaskResult(
+            accepted_index=accepted_index,
+            card=card,
+            log_record=log_record,
+            media_files=[f"media/{card.focus}.mp3"],
+        )
+
+    monkeypatch.setattr(deck_builder_module.ProgressStore, "save", fake_save)
+    monkeypatch.setattr(builder, "_process_word_textual_task", fake_text_task)
+    monkeypatch.setattr(builder, "_attach_audio_task", fake_audio_task)
+
+    builder.build(run)
+
+    assert captured_saves[0].index == -1
+    assert captured_saves[0].created_cards == 0
+    assert any(state.created_cards == 1 for state in captured_saves[1:])
+
+
+def test_write_quality_outputs_only_rejected_cards_enter_review_queue(tmp_path: Path) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     run = _run_config(tmp_path)
     run.review_queue_path = str(tmp_path / "output" / "review_queue.json")
     run.quality_report_path = str(tmp_path / "output" / "quality_report.json")
 
     stats = BuildStats()
+    logger = deck_builder_module.JsonLogger(tmp_path / "run.jsonl")
     stats.cards.append(
         CardData(
             focus="bien",
@@ -1996,13 +2339,34 @@ def test_write_quality_outputs_persists_review_queue(tmp_path: Path) -> None:
     stats.ambiguous_focus_counter["bien"] = 1
     stats.definition_score_total = 1.6
     stats.definition_score_samples = 2
-    stats.needs_review_items.append(
-        {
-            "focus": "bien",
-            "level": 1,
-            "status": "candidate",
-            "review_notes": ["definition_polysemy_detected"],
-        }
+
+    builder._record_log(
+        logger,
+        stats,
+        LogRecord(
+            focus="bien",
+            level=1,
+            status="accepted",
+            lifecycle_state="accepted",
+            review_notes=["definition_corrected"],
+            before={"definition": "old gloss"},
+            after={"definition": "new gloss"},
+        ),
+    )
+    builder._record_log(
+        logger,
+        stats,
+        LogRecord(
+            focus="mal",
+            level=1,
+            status="discarded",
+            lifecycle_state="rejected",
+            discard_reason="definition_missing",
+            reason_codes=["definition_missing"],
+            review_notes=["definition_polysemy_detected"],
+            provider="groq",
+            model="llama-3.1-8b-instant",
+        ),
     )
 
     builder._write_quality_outputs(run, stats)
@@ -2011,6 +2375,10 @@ def test_write_quality_outputs_persists_review_queue(tmp_path: Path) -> None:
     review_queue = json.loads(Path(run.review_queue_path).read_text(encoding="utf-8"))
 
     assert report["needs_review"] == 1
+    assert report["accepted_with_corrections"] == 1
     assert report["definition_sources"]["translated_source"] == 1
     assert report["definition_score"]["average"] == 0.8
-    assert review_queue[0]["focus"] == "bien"
+    assert "provider_success_counter" in report
+    assert "provider_error_counter" in report
+    assert [item["focus"] for item in review_queue] == ["mal"]
+    assert review_queue[0]["reason_codes"] == ["definition_missing"]
