@@ -37,8 +37,11 @@ ANKI_FIELD_ORDER = ANKI_FIELD_ORDER_DEFAULT
 
 STRUCTURED_SENTENCE_PROMPT_VERSION = "sentence-batch-v1"
 STRUCTURED_SENTENCE_SCHEMA_VERSION = "sentence-batch-schema-v1"
+LEXICAL_REVIEW_PROMPT_VERSION = "lexical-review-v1"
+LEXICAL_REVIEW_SCHEMA_VERSION = "lexical-review-schema-v1"
 
 CardLifecycleState = Literal["generated", "reviewed", "accepted", "rejected"]
+LexicalReviewVerdict = Literal["accept", "correct", "reject"]
 
 
 class CardData(BaseModel):
@@ -112,6 +115,61 @@ class StructuredSentenceBatch(BaseModel):
     requested_sense: str
     target_level: int
     candidates: list[StructuredSentenceCandidate] = Field(min_length=3, max_length=3)
+
+
+class LexicalReviewRequest(BaseModel):
+    prompt_version: str = LEXICAL_REVIEW_PROMPT_VERSION
+    schema_version: str = LEXICAL_REVIEW_SCHEMA_VERSION
+    focus_word: str
+    language: str
+    target_translation_language: str
+    accepted_sentence: str
+    current_definition: str = ""
+    current_translation: str = ""
+    source_definition: str = ""
+    candidate_senses: list[str] = Field(default_factory=list)
+    winning_sense: str | None = None
+    losing_sense_candidates: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    before: dict[str, Any] = Field(default_factory=dict)
+    after: dict[str, Any] = Field(default_factory=dict)
+    selection_reasons: dict[str, str] = Field(default_factory=dict)
+
+
+class LexicalReviewCorrection(BaseModel):
+    corrected_definition: str | None = None
+    corrected_translation: str | None = None
+    winning_sense: str | None = None
+    losing_sense_candidates: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    before: dict[str, Any] = Field(default_factory=dict)
+    after: dict[str, Any] = Field(default_factory=dict)
+    selection_reasons: dict[str, str] = Field(default_factory=dict)
+
+
+class LexicalReviewResult(BaseModel):
+    prompt_version: str = LEXICAL_REVIEW_PROMPT_VERSION
+    schema_version: str = LEXICAL_REVIEW_SCHEMA_VERSION
+    verdict: LexicalReviewVerdict
+    focus_word: str
+    language: str
+    target_translation_language: str
+    accepted_sentence: str
+    current_definition: str = ""
+    current_translation: str = ""
+    source_definition: str = ""
+    candidate_senses: list[str] = Field(default_factory=list)
+    winning_sense: str | None = None
+    losing_sense_candidates: list[str] = Field(default_factory=list)
+    corrected_definition: str | None = None
+    corrected_translation: str | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    before: dict[str, Any] = Field(default_factory=dict)
+    after: dict[str, Any] = Field(default_factory=dict)
+    selection_reasons: dict[str, str] = Field(default_factory=dict)
 
 
 class RunConfig(BaseModel):
