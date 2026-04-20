@@ -23,9 +23,9 @@ Requirements for the current milestone. Each requirement maps to a roadmap phase
 
 ### Lexical Resolution and Review
 
-- [ ] **LEX-01**: Translation is generated or reviewed with the accepted sentence context, target word, and intended sense together.
-- [ ] **LEX-02**: Definition or gloss is concise, learner-facing, and validated against the exact usage in the accepted sentence.
-- [ ] **LEX-03**: A review stage can accept, correct, reject, or route a card to human review with machine-readable reasons.
+- [x] **LEX-01**: Translation is generated or reviewed with the accepted sentence context, target word, and intended sense together.
+- [x] **LEX-02**: Definition or gloss is concise, learner-facing, and validated against the exact usage in the accepted sentence.
+- [x] **LEX-03**: A review stage can accept, correct, reject, or route a card to human review with machine-readable reasons.
 - [ ] **LEX-04**: Deterministic validators rerun after any AI or human correction before a card can be accepted.
 
 ### Quality, Duplicates, and Reporting
@@ -93,9 +93,9 @@ Which phases cover which requirements.
 | AIG-02 | Phase 2 | Pending |
 | AIG-03 | Phase 2 | Pending |
 | AIG-04 | Phase 2 | Pending |
-| LEX-01 | Phase 3 | Pending |
-| LEX-02 | Phase 3 | Pending |
-| LEX-03 | Phase 3 | Pending |
+| LEX-01 | Phase 3 | Complete |
+| LEX-02 | Phase 3 | Complete |
+| LEX-03 | Phase 3 | Complete |
 | LEX-04 | Phase 3 | Pending |
 | COMP-04 | Phase 3 | Pending |
 | QUAL-01 | Phase 4 | Pending |
