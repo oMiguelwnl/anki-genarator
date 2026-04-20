@@ -270,6 +270,217 @@ class TestDeckBuilderLexicalReviewSentenceAnchor:
         assert log.after == {}
 
 
+def test_process_word_rejects_low_confidence_ambiguity_to_review_queue(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path)
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "ai"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class ReviewTransport:
+        def __init__(self, review: LexicalReviewResult):
+            self.review = review
+            self.provider_name = "ai"
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("noun: banco")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/ˈbaŋ.ko/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("BAN-ko")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result("Vi el banco cerca del rio.", provider_name="tatoeba")
+
+        def sentence_ai(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result("Vi el banco cerca del rio.")
+
+        def translation_web(self, text, src, dest):
+            _ = (src, dest)
+            if text.startswith("noun:"):
+                return Result("noun: bank", provider_name="googletrans")
+            return Result("I saw the bank near the river.", provider_name="googletrans")
+
+        def translation_ai(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("I saw the bank near the river.")
+
+        def lexical_review(self, request, **kwargs):
+            _ = kwargs
+            return ReviewTransport(
+                LexicalReviewResult.model_validate(
+                    {
+                        "verdict": "reject",
+                        "focus_word": request.focus_word,
+                        "language": request.language,
+                        "target_translation_language": request.target_translation_language,
+                        "accepted_sentence": request.accepted_sentence,
+                        "current_definition": request.current_definition,
+                        "current_translation": request.current_translation,
+                        "source_definition": request.source_definition,
+                        "candidate_senses": [
+                            "noun: financial institution",
+                            "noun: land alongside a river",
+                        ],
+                        "winning_sense": None,
+                        "losing_sense_candidates": [
+                            "noun: financial institution",
+                            "noun: land alongside a river",
+                        ],
+                        "reason_codes": ["lexical_review_unresolved_ambiguity"],
+                        "before": {
+                            "definition": request.current_definition,
+                            "translation": request.current_translation,
+                        },
+                        "after": {},
+                        "selection_reasons": {
+                            "winning_sense": "sentence context did not disambiguate river-vs-finance sense"
+                        },
+                    }
+                )
+            )
+
+    card, log = builder._process_word_textual(
+        word="banco",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=FakeProviders(),
+    )
+
+    assert card is None
+    assert log.lifecycle_state == "rejected"
+    assert "lexical_review_unresolved_ambiguity" in log.reason_codes
+
+    stats = BuildStats()
+    logger = JsonLogger(str(tmp_path / "run.jsonl"))
+    builder._record_log(logger, stats, log)
+
+    assert len(stats.needs_review_items) == 1
+    item = stats.needs_review_items[0]
+    assert item["lifecycle_state"] == "rejected"
+    assert item["reason_codes"] == ["lexical_review_unresolved_ambiguity"]
+    assert item["before"]["definition"] == "noun: bank"
+    assert item["selection_reasons"]["winning_sense"].startswith("sentence context")
+
+
+def test_process_word_lexical_review_reject_never_uses_human_review_state(
+    tmp_path: Path,
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path)
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "ai"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class ReviewTransport:
+        def __init__(self, review: LexicalReviewResult):
+            self.review = review
+            self.provider_name = "ai"
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("noun: banco")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/ˈbaŋ.ko/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("BAN-ko")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result("Vi el banco cerca del rio.", provider_name="tatoeba")
+
+        def sentence_ai(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result("Vi el banco cerca del rio.")
+
+        def translation_web(self, text, src, dest):
+            _ = (src, dest)
+            if text.startswith("noun:"):
+                return Result("noun: bank", provider_name="googletrans")
+            return Result("I saw the bank near the river.", provider_name="googletrans")
+
+        def translation_ai(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("I saw the bank near the river.")
+
+        def lexical_review(self, request, **kwargs):
+            _ = kwargs
+            return ReviewTransport(
+                LexicalReviewResult.model_validate(
+                    {
+                        "verdict": "reject",
+                        "focus_word": request.focus_word,
+                        "language": request.language,
+                        "target_translation_language": request.target_translation_language,
+                        "accepted_sentence": request.accepted_sentence,
+                        "current_definition": request.current_definition,
+                        "current_translation": request.current_translation,
+                        "source_definition": request.source_definition,
+                        "candidate_senses": ["noun: financial institution", "noun: land alongside a river"],
+                        "reason_codes": ["lexical_review_unresolved_ambiguity"],
+                    }
+                )
+            )
+
+    card, log = builder._process_word(
+        word="banco",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=FakeProviders(),
+        ctx=ValidationContext(),
+        media_files=[],
+    )
+
+    assert card is None
+    assert log.lifecycle_state == "rejected"
+    assert log.lifecycle_state != "human-review"
+
+
 def test_build_assigns_sequential_sortindex(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
