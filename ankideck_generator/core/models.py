@@ -35,6 +35,9 @@ ANKI_FIELD_ORDER_RU = [
 # Backward-compatible alias used by existing tests/importers.
 ANKI_FIELD_ORDER = ANKI_FIELD_ORDER_DEFAULT
 
+STRUCTURED_SENTENCE_PROMPT_VERSION = "sentence-batch-v1"
+STRUCTURED_SENTENCE_SCHEMA_VERSION = "sentence-batch-schema-v1"
+
 CardLifecycleState = Literal["generated", "reviewed", "accepted", "rejected"]
 
 
@@ -89,6 +92,26 @@ class ProviderResult(BaseModel):
     elapsed_ms: int
     error: str | None = None
     fallback_errors: dict[str, str] | None = None
+
+
+class StructuredSentenceCandidate(BaseModel):
+    sentence: str
+    target_form: str
+    requested_pos: str
+    requested_sense: str
+    validation_signals: list[str] = Field(default_factory=list)
+    rationale: str
+
+
+class StructuredSentenceBatch(BaseModel):
+    prompt_version: str = STRUCTURED_SENTENCE_PROMPT_VERSION
+    schema_version: str = STRUCTURED_SENTENCE_SCHEMA_VERSION
+    focus_word: str
+    language: str
+    requested_pos: str
+    requested_sense: str
+    target_level: int
+    candidates: list[StructuredSentenceCandidate] = Field(min_length=3, max_length=3)
 
 
 class RunConfig(BaseModel):

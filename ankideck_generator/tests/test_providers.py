@@ -1,9 +1,24 @@
+import json
+from pathlib import Path
 import requests
 import time
 from urllib.parse import quote
 
+import pytest
+
 import ankideck_generator.core.providers as providers_module
+from ankideck_generator.core.models import StructuredSentenceBatch
 from ankideck_generator.core.providers import ProviderManager
+
+
+def _fixture_text(name: str) -> str:
+    path = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "ai_sentence_candidates"
+        / name
+    )
+    return path.read_text(encoding="utf-8")
 
 
 def test_definition_fallback_dictionaryapi(monkeypatch):
@@ -68,6 +83,62 @@ def test_sentence_prefers_web_then_ai(monkeypatch):
     result = provider.sentence("hola", "es", allow_ai=True)
     assert result.value == "ok"
     assert calls[:1] == ["tatoeba"]
+
+
+def test_structured_sentence_batch_requires_exactly_three_candidates() -> None:
+    payload = json.loads(_fixture_text("valid_batch.json"))
+    StructuredSentenceBatch.model_validate(payload)
+
+    payload["candidates"] = payload["candidates"][:2]
+    with pytest.raises(Exception):
+        StructuredSentenceBatch.model_validate(payload)
+
+
+def test_sentence_ai_candidates_parses_fenced_json_fixture(monkeypatch) -> None:
+    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
+    payload = _fixture_text("valid_batch.json")
+
+    monkeypatch.setattr(
+        provider,
+        "_ai_request",
+        lambda *args, **kwargs: f"```json\n{payload}\n```",
+    )
+
+    result = provider.sentence_ai_candidates(
+        "bien",
+        "es",
+        requested_pos="adjective",
+        requested_sense="in good condition or quality",
+        target_level=1,
+    )
+
+    assert result.error is None
+    assert result.batch is not None
+    assert len(result.batch.candidates) == 3
+    assert result.batch.focus_word == "bien"
+
+
+def test_sentence_ai_candidates_rejects_malformed_payload(monkeypatch) -> None:
+    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
+    payload = _fixture_text("malformed_batch.json")
+
+    monkeypatch.setattr(
+        provider,
+        "_ai_request",
+        lambda *args, **kwargs: payload,
+    )
+
+    result = provider.sentence_ai_candidates(
+        "bien",
+        "es",
+        requested_pos="adjective",
+        requested_sense="in good condition or quality",
+        target_level=1,
+    )
+
+    assert result.batch is None
+    assert result.error is not None
+    assert "structured_sentence_validation_error" in result.error
 
 
 def test_translation_prefers_web_then_ai(monkeypatch):

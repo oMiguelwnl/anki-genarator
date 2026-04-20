@@ -14,6 +14,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 import requests
 from gtts import gTTS
+from pydantic import ValidationError
 
 from ..utils.definition_tools import (
     MetaDefinition,
@@ -31,7 +32,12 @@ from ..utils.language_tools import (
     semantic_definition_reason,
     text_contains_focus,
 )
-from .models import ProviderResult
+from .models import (
+    ProviderResult,
+    STRUCTURED_SENTENCE_PROMPT_VERSION,
+    STRUCTURED_SENTENCE_SCHEMA_VERSION,
+    StructuredSentenceBatch,
+)
 
 try:
     import pyttsx3
@@ -89,6 +95,15 @@ class SentenceCandidate:
 @dataclass
 class SentenceCandidatesResult:
     candidates: list[SentenceCandidate]
+    provider_name: str
+    elapsed_ms: int
+    error: str | None = None
+    fallback_errors: dict[str, str] | None = None
+
+
+@dataclass
+class StructuredSentenceBatchResult:
+    batch: StructuredSentenceBatch | None
     provider_name: str
     elapsed_ms: int
     error: str | None = None
@@ -251,6 +266,50 @@ class ProviderManager:
         elapsed = int((time.time() - start) * 1000)
         return SentenceCandidatesResult(
             candidates=[],
+            provider_name=provider_name,
+            elapsed_ms=elapsed,
+            error=str(last_exc),
+        )
+
+    def _wrap_structured_sentence_batch(
+        self,
+        provider_name: str,
+        fn: Callable[[], StructuredSentenceBatch | None],
+    ) -> StructuredSentenceBatchResult:
+        if provider_name in self._disabled_providers:
+            return StructuredSentenceBatchResult(
+                batch=None,
+                provider_name=provider_name,
+                elapsed_ms=0,
+                error="provider_disabled",
+            )
+        start = time.time()
+        last_exc: Exception | None = None
+        retries = self._retries_for(provider_name)
+        for attempt in range(retries + 1):
+            try:
+                batch = fn()
+                if batch is None:
+                    raise ProviderError("empty result")
+                self._register_provider_success(provider_name)
+                elapsed = int((time.time() - start) * 1000)
+                return StructuredSentenceBatchResult(
+                    batch=batch,
+                    provider_name=provider_name,
+                    elapsed_ms=elapsed,
+                )
+            except Exception as exc:  # pragma: no cover - network errors
+                last_exc = exc
+                message = str(exc)
+                self._register_provider_failure(provider_name, message, exc)
+                if self._is_deterministic_error(message, provider_name=provider_name):
+                    break
+                if attempt >= retries:
+                    break
+                time.sleep(self._retry_delay(provider_name, attempt))
+        elapsed = int((time.time() - start) * 1000)
+        return StructuredSentenceBatchResult(
+            batch=None,
             provider_name=provider_name,
             elapsed_ms=elapsed,
             error=str(last_exc),
@@ -549,6 +608,38 @@ class ProviderManager:
             "ai",
             lambda: self._sentence_ai(
                 word, language, min_words=min_words, max_words=max_words
+            ),
+        )
+
+    def sentence_ai_candidates(
+        self,
+        word: str,
+        language: str,
+        *,
+        requested_pos: str = "",
+        requested_sense: str = "",
+        target_level: int = 1,
+        min_words: int | None = None,
+        max_words: int | None = None,
+        prompt_version: str = STRUCTURED_SENTENCE_PROMPT_VERSION,
+        schema_version: str = STRUCTURED_SENTENCE_SCHEMA_VERSION,
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+    ) -> StructuredSentenceBatchResult:
+        return self._wrap_structured_sentence_batch(
+            "ai",
+            lambda: self._sentence_ai_candidates(
+                word,
+                language,
+                requested_pos=requested_pos,
+                requested_sense=requested_sense,
+                target_level=target_level,
+                min_words=min_words,
+                max_words=max_words,
+                prompt_version=prompt_version,
+                schema_version=schema_version,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
             ),
         )
 
@@ -1326,6 +1417,13 @@ class ProviderManager:
             raise ProviderError(last_error)
         return None
 
+    def _ai_request_json(self, system_prompt: str, user_prompt: str) -> Any:
+        text = self._ai_request(system_prompt, user_prompt, first_line_only=False)
+        payload = _extract_json_payload(text or "")
+        if payload is None:
+            raise ProviderError("structured_sentence_malformed_json")
+        return payload
+
     def _resolve_api_keys(self, profile: dict) -> list[str]:
         keys: list[str] = []
         profile_keys = profile.get("api_keys")
@@ -1384,6 +1482,42 @@ class ProviderManager:
             min_words=min_words,
             max_words=max_words,
         )
+
+    def _sentence_ai_candidates(
+        self,
+        word: str,
+        language: str,
+        *,
+        requested_pos: str = "",
+        requested_sense: str = "",
+        target_level: int = 1,
+        min_words: int | None = None,
+        max_words: int | None = None,
+        prompt_version: str = STRUCTURED_SENTENCE_PROMPT_VERSION,
+        schema_version: str = STRUCTURED_SENTENCE_SCHEMA_VERSION,
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+    ) -> StructuredSentenceBatch:
+        language_name = LANG_CODE_TO_NAME.get(language, language)
+        min_words = int(min_words or 5)
+        max_words = int(max_words or 25)
+        resolved_system_prompt = system_prompt or (
+            "You generate flashcard sentence candidates as strict JSON. "
+            "Return only valid JSON with exactly three candidates and no markdown commentary."
+        )
+        resolved_user_prompt = user_prompt or (
+            f"Generate exactly 3 candidate sentences in {language_name} ({language}) for the focus word '{word}'. "
+            f"Requested POS: '{requested_pos}'. Requested sense: '{requested_sense}'. Target level: {target_level}. "
+            f"Each sentence must use {min_words} to {max_words} words, include the exact focus word '{word}', and sound natural in everyday speech. "
+            "Return a JSON object with keys: prompt_version, schema_version, focus_word, language, requested_pos, requested_sense, target_level, candidates. "
+            "Each candidate must include: sentence, target_form, requested_pos, requested_sense, validation_signals, rationale. "
+            f"Use prompt_version '{prompt_version}' and schema_version '{schema_version}'."
+        )
+        payload = self._ai_request_json(resolved_system_prompt, resolved_user_prompt)
+        try:
+            return StructuredSentenceBatch.model_validate(payload)
+        except ValidationError as exc:
+            raise ProviderError(f"structured_sentence_validation_error: {exc}") from exc
 
     def _sentence_rewrite_ai(
         self,

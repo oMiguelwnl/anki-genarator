@@ -13,7 +13,14 @@ from ankideck_generator.core.deck_builder import (
     _infer_discard_reason,
     _sentence_length_bounds,
 )
-from ankideck_generator.core.models import CardData, LogRecord, ProgressState, RunConfig
+from ankideck_generator.core.models import (
+    CardData,
+    LogRecord,
+    ProgressState,
+    RunConfig,
+    StructuredSentenceBatch,
+)
+from ankideck_generator.core.providers import StructuredSentenceBatchResult
 from ankideck_generator.core.validators import ValidationContext
 
 
@@ -33,6 +40,16 @@ def _run_config(tmp_path: Path, language: str = "es") -> RunConfig:
         cache_path=str(tmp_path / "cache"),
         autosave_every=1,
     )
+
+
+def _ai_sentence_fixture_payload(name: str) -> dict[str, object]:
+    path = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "ai_sentence_candidates"
+        / name
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_build_assigns_sequential_sortindex(monkeypatch, tmp_path: Path) -> None:
@@ -437,7 +454,7 @@ def test_infer_discard_reason_prioritizes_definition_error() -> None:
     assert reason == "definition_generation_failed"
 
 
-def test_process_word_retries_sentence_web_before_ai(tmp_path: Path) -> None:
+def test_process_word_retries_ai_before_web_fallback(tmp_path: Path) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
     run = _run_config(tmp_path)
@@ -508,8 +525,8 @@ def test_process_word_retries_sentence_web_before_ai(tmp_path: Path) -> None:
     )
 
     assert card is not None
-    assert providers.sentence_web_calls == 1
     assert providers.sentence_ai_calls == 2
+    assert providers.sentence_web_calls == 0
 
 
 def test_process_word_generates_audio_fields_when_enabled(tmp_path: Path) -> None:
@@ -738,12 +755,18 @@ def test_process_word_uses_azure_first_for_russian_audio(tmp_path: Path) -> None
             _ = (ipa, language, allow_ai)
             return Result("MO-zhyet", provider_name="ai")
 
+        def sentence_ai_candidates(self, *args, **kwargs):
+            _ = (args, kwargs)
+            return StructuredSentenceBatchResult(
+                batch=None,
+                provider_name="ai",
+                elapsed_ms=1,
+                error="structured_sentence_validation_error: malformed batch",
+            )
+
         def sentence_web(self, word, language, level=None, **kwargs):
             _ = (word, language, level, kwargs)
             return Result(f"Он думает, что {word} это возможно.", provider_name="tatoeba")
-
-        def sentence_ai(self, *args, **kwargs):
-            raise AssertionError("sentence_ai should not run when web sentence is valid")
 
         def translation_web(self, text, src, dest):
             _ = (text, src, dest)
@@ -869,6 +892,7 @@ def test_process_word_rewrites_tatoeba_sentence_when_only_level_validation_fails
     builder.config["audio"]["enabled"] = False
     run = _run_config(tmp_path)
     run.level_size = 2
+    run.sentence_ai_attempts = 1
     ctx = ValidationContext()
 
     class FakeCache:
@@ -906,6 +930,15 @@ def test_process_word_rewrites_tatoeba_sentence_when_only_level_validation_fails
             _ = (ipa, language, allow_ai)
             return Result("byen")
 
+        def sentence_ai_candidates(self, *args, **kwargs):
+            _ = (args, kwargs)
+            return StructuredSentenceBatchResult(
+                batch=None,
+                provider_name="ai",
+                elapsed_ms=1,
+                error="structured_sentence_validation_error: malformed batch",
+            )
+
         def sentence_web(self, word, language, level=None, **kwargs):
             _ = (word, language, level, kwargs)
             self.sentence_web_calls += 1
@@ -926,9 +959,6 @@ def test_process_word_rewrites_tatoeba_sentence_when_only_level_validation_fails
             _ = (sentence, word, language, level, min_words, max_words)
             self.sentence_rewrite_calls += 1
             return Result("Hoy me siento bien en casa.", provider_name="ai")
-
-        def sentence_ai(self, *args, **kwargs):
-            raise AssertionError("sentence_ai should not run after a successful rewrite")
 
         def translation_web(self, text, src, dest):
             _ = (text, src, dest)
@@ -959,26 +989,21 @@ def test_process_word_rewrites_tatoeba_sentence_when_only_level_validation_fails
     assert card.sentence == "Hoy me siento bien en casa."
     assert providers.sentence_web_calls == 1
     assert providers.sentence_rewrite_calls == 1
+    assert log.event_counts["sentence_ai_malformed_batch"] == 1
     assert log.event_counts["sentence_tatoeba_attempted"] == 1
     assert log.event_counts["sentence_ai_rewrite_attempted"] == 1
     assert log.event_counts["sentence_ai_rewrite_hit"] == 1
-    assert "sentence_ai_generate_attempted" not in log.event_counts
+    assert log.event_counts["sentence_ai_low_yield_fallback"] == 1
 
 
-def test_process_word_skips_sentence_ai_when_tatoeba_is_strong_enough(
-    tmp_path: Path, monkeypatch
+def test_process_word_uses_valid_ai_batch_without_web_fallback(
+    tmp_path: Path,
 ) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
     run = _run_config(tmp_path)
     ctx = ValidationContext()
-    tatoeba_sentence = "Hoy me siento bien en casa."
-
-    monkeypatch.setattr(
-        deck_builder_module,
-        "_sentence_selection_score",
-        lambda text, *_args, **_kwargs: 1.72 if text == tatoeba_sentence else 1.0,
-    )
+    payload = _ai_sentence_fixture_payload("valid_batch.json")
 
     class FakeCache:
         def get(self, *_args, **_kwargs):
@@ -991,20 +1016,6 @@ def test_process_word_skips_sentence_ai_when_tatoeba_is_strong_enough(
         def __init__(self, value: str, provider_name: str = "ai"):
             self.value = value
             self.provider_name = provider_name
-            self.elapsed_ms = 1
-            self.error = None
-
-    class Candidate:
-        def __init__(self, text: str, query_mode: str = "exact"):
-            self.text = text
-            self.provider_name = "tatoeba"
-            self.source = "tatoeba"
-            self.query_mode = query_mode
-
-    class CandidateResult:
-        def __init__(self, candidates):
-            self.candidates = candidates
-            self.provider_name = "tatoeba"
             self.elapsed_ms = 1
             self.error = None
 
@@ -1021,15 +1032,19 @@ def test_process_word_skips_sentence_ai_when_tatoeba_is_strong_enough(
             _ = (ipa, language, allow_ai)
             return Result("byen")
 
-        def sentence_web_candidates(self, word, language, **kwargs):
-            _ = (word, language, kwargs)
-            return CandidateResult([Candidate(tatoeba_sentence)])
+        def sentence_ai_candidates(self, *args, **kwargs):
+            _ = (args, kwargs)
+            return StructuredSentenceBatchResult(
+                batch=StructuredSentenceBatch.model_validate(payload),
+                provider_name="ai",
+                elapsed_ms=1,
+            )
+
+        def sentence_web_candidates(self, *args, **kwargs):
+            raise AssertionError("web fallback should not run when AI yields a valid batch")
 
         def sentence_rewrite(self, *args, **kwargs):
-            raise AssertionError("sentence_rewrite should not run for a strong Tatoeba hit")
-
-        def sentence_ai(self, *args, **kwargs):
-            raise AssertionError("sentence_ai should not run for a strong Tatoeba hit")
+            raise AssertionError("sentence_rewrite should not run when AI already succeeded")
 
         def translation_web(self, text, src, dest):
             _ = (text, src, dest)
@@ -1041,43 +1056,60 @@ def test_process_word_skips_sentence_ai_when_tatoeba_is_strong_enough(
             _ = (text, src, dest)
             return Result("I feel good at home today.", provider_name="ai")
 
+    providers = FakeProviders()
     card, log = builder._process_word(
         word="bien",
         level=1,
         index=1,
         run=run,
         cache=FakeCache(),
-        providers=FakeProviders(),
+        providers=providers,
         ctx=ctx,
         media_files=[],
     )
 
     assert card is not None
-    assert card.sentence == tatoeba_sentence
-    assert log.event_counts["sentence_tatoeba_hit"] == 1
-    assert log.event_counts["sentence_ai_skipped_good_tatoeba"] == 1
-    assert "sentence_ai_generate_attempted" not in log.event_counts
+    assert card.sentence in {item["sentence"] for item in payload["candidates"]}
+    assert log.event_counts["sentence_ai_generate_attempted"] == 1
+    assert log.event_counts["sentence_ai_generate_hit"] == 1
+    assert "sentence_tatoeba_attempted" not in log.event_counts
 
 
-def test_process_word_prefers_tatoeba_when_ai_margin_is_small(
-    tmp_path: Path, monkeypatch
+def test_process_word_uses_web_fallback_only_after_ai_low_yield(
+    tmp_path: Path,
 ) -> None:
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
     builder.config["audio"]["enabled"] = False
     run = _run_config(tmp_path)
+    run.sentence_ai_attempts = 1
     ctx = ValidationContext()
-    tatoeba_sentence = "Hoy me siento bien en casa."
-    ai_sentence = "Hoy bien parece normal en casa."
-    scores = {
-        tatoeba_sentence: 1.55,
-        ai_sentence: 1.70,
-    }
-
-    monkeypatch.setattr(
-        deck_builder_module,
-        "_sentence_selection_score",
-        lambda text, *_args, **_kwargs: scores.get(text, 0.0),
-    )
+    payload = _ai_sentence_fixture_payload("valid_batch.json")
+    payload["candidates"] = [
+        {
+            "sentence": "This word bien appears in this example.",
+            "target_form": "bien",
+            "requested_pos": "adjective",
+            "requested_sense": "in good condition or quality",
+            "validation_signals": ["meta_example"],
+            "rationale": "meta_example",
+        },
+        {
+            "sentence": "This sentence uses bien in English now.",
+            "target_form": "bien",
+            "requested_pos": "adjective",
+            "requested_sense": "in good condition or quality",
+            "validation_signals": ["wrong_language"],
+            "rationale": "wrong_language",
+        },
+        {
+            "sentence": "Today bien appears inside an English sentence.",
+            "target_form": "bien",
+            "requested_pos": "adjective",
+            "requested_sense": "in good condition or quality",
+            "validation_signals": ["wrong_language"],
+            "rationale": "wrong_language",
+        },
+    ]
 
     class FakeCache:
         def get(self, *_args, **_kwargs):
@@ -1093,21 +1125,9 @@ def test_process_word_prefers_tatoeba_when_ai_margin_is_small(
             self.elapsed_ms = 1
             self.error = None
 
-    class Candidate:
-        def __init__(self, text: str):
-            self.text = text
-            self.provider_name = "tatoeba"
-            self.source = "tatoeba"
-            self.query_mode = "exact"
-
-    class CandidateResult:
-        def __init__(self, candidates):
-            self.candidates = candidates
-            self.provider_name = "tatoeba"
-            self.elapsed_ms = 1
-            self.error = None
-
     class FakeProviders:
+        sentence_web_calls = 0
+
         def definition(self, word, language, allow_ai=True, definition_language=None):
             _ = (word, language, allow_ai, definition_language)
             return Result("adjective: en buen estado o calidad")
@@ -1120,13 +1140,18 @@ def test_process_word_prefers_tatoeba_when_ai_margin_is_small(
             _ = (ipa, language, allow_ai)
             return Result("byen")
 
-        def sentence_web_candidates(self, word, language, **kwargs):
-            _ = (word, language, kwargs)
-            return CandidateResult([Candidate(tatoeba_sentence)])
+        def sentence_ai_candidates(self, *args, **kwargs):
+            _ = (args, kwargs)
+            return StructuredSentenceBatchResult(
+                batch=StructuredSentenceBatch.model_validate(payload),
+                provider_name="ai",
+                elapsed_ms=1,
+            )
 
-        def sentence_ai(self, word, language, **kwargs):
-            _ = (word, language, kwargs)
-            return Result(ai_sentence, provider_name="ai")
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            self.sentence_web_calls += 1
+            return Result("Hoy me siento bien en casa.", provider_name="tatoeba")
 
         def translation_web(self, text, src, dest):
             _ = (text, src, dest)
@@ -1138,22 +1163,110 @@ def test_process_word_prefers_tatoeba_when_ai_margin_is_small(
             _ = (text, src, dest)
             return Result("I feel good at home today.", provider_name="ai")
 
+    providers = FakeProviders()
     card, log = builder._process_word(
         word="bien",
         level=1,
         index=1,
         run=run,
         cache=FakeCache(),
-        providers=FakeProviders(),
+        providers=providers,
         ctx=ctx,
         media_files=[],
     )
 
     assert card is not None
-    assert card.sentence == tatoeba_sentence
-    assert log.event_counts["sentence_tatoeba_hit"] == 1
+    assert card.sentence == "Hoy me siento bien en casa."
     assert log.event_counts["sentence_ai_generate_attempted"] == 1
-    assert "sentence_ai_generate_hit" not in log.event_counts
+    assert log.event_counts["sentence_ai_low_yield_fallback"] == 1
+    assert log.event_counts["sentence_tatoeba_hit"] == 1
+    assert providers.sentence_web_calls == 1
+
+
+def test_process_word_uses_web_fallback_only_after_malformed_ai_batch(
+    tmp_path: Path,
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path)
+    run.sentence_ai_attempts = 1
+    ctx = ValidationContext()
+    malformed_payload = _ai_sentence_fixture_payload("malformed_batch.json")
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "ai"):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = 1
+            self.error = None
+
+    class FakeProviders:
+        sentence_web_calls = 0
+
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("adjective: en buen estado o calidad")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/bjen/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("byen")
+
+        def sentence_ai_candidates(self, *args, **kwargs):
+            _ = (args, kwargs)
+            try:
+                StructuredSentenceBatch.model_validate(malformed_payload)
+            except Exception as exc:
+                return StructuredSentenceBatchResult(
+                    batch=None,
+                    provider_name="ai",
+                    elapsed_ms=1,
+                    error=f"structured_sentence_validation_error: {exc}",
+                )
+            raise AssertionError("malformed fixture should not validate")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            self.sentence_web_calls += 1
+            return Result("Hoy me siento bien en casa.", provider_name="tatoeba")
+
+        def translation_web(self, text, src, dest):
+            _ = (text, src, dest)
+            if text.startswith("adjective:"):
+                return Result("adjective: in good condition or quality", provider_name="googletrans")
+            return Result("I feel good at home today.", provider_name="googletrans")
+
+        def translation_ai(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("I feel good at home today.", provider_name="ai")
+
+    providers = FakeProviders()
+    card, log = builder._process_word(
+        word="bien",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=providers,
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert card.sentence == "Hoy me siento bien en casa."
+    assert log.event_counts["sentence_ai_malformed_batch"] == 1
+    assert log.event_counts["sentence_ai_low_yield_fallback"] == 1
+    assert providers.sentence_web_calls == 1
 
 
 def test_process_word_uses_ai_when_it_is_materially_better_than_tatoeba(
@@ -1645,13 +1758,19 @@ def test_process_word_ignores_legacy_sentence_cache_key(tmp_path: Path) -> None:
             _ = (word, language, allow_ai, definition_language)
             return Result("adjective: reserve a un usage interne.", provider_name="wiktionary")
 
+        def sentence_ai_candidates(self, *args, **kwargs):
+            _ = (args, kwargs)
+            return StructuredSentenceBatchResult(
+                batch=None,
+                provider_name="ai",
+                elapsed_ms=1,
+                error="structured_sentence_validation_error: malformed batch",
+            )
+
         def sentence_web(self, word, language, level=None, **kwargs):
             _ = (word, language, level, kwargs)
             self.sentence_web_calls += 1
             return Result("Ce dossier exclus reste prive.", provider_name="tatoeba")
-
-        def sentence_ai(self, *args, **kwargs):
-            raise AssertionError("sentence_ai should not run on a valid rebuilt sentence")
 
         def translation_web(self, text, src, dest):
             _ = (text, src, dest)
@@ -1816,13 +1935,19 @@ def test_process_word_refresh_text_cache_bypasses_cached_text(tmp_path: Path) ->
             self.definition_calls += 1
             return Result("adjective: reserve a un usage interne.")
 
+        def sentence_ai_candidates(self, *args, **kwargs):
+            _ = (args, kwargs)
+            return StructuredSentenceBatchResult(
+                batch=None,
+                provider_name="ai",
+                elapsed_ms=1,
+                error="structured_sentence_validation_error: malformed batch",
+            )
+
         def sentence_web(self, word, language, level=None, **kwargs):
             _ = (word, language, level, kwargs)
             self.sentence_calls += 1
             return Result("Ce dossier exclus reste prive.", provider_name="tatoeba")
-
-        def sentence_ai(self, *args, **kwargs):
-            raise AssertionError("sentence_ai should not be needed")
 
         def translation_web(self, text, src, dest):
             _ = (text, src, dest)
@@ -1891,6 +2016,15 @@ def test_process_word_uses_english_gloss_as_final_definition(tmp_path: Path) -> 
             _ = (word, language, allow_ai, definition_language)
             return Result("adverb: maybe, perhaps, possibly.", provider_name="wiktionary")
 
+        def sentence_ai_candidates(self, *args, **kwargs):
+            _ = (args, kwargs)
+            return StructuredSentenceBatchResult(
+                batch=None,
+                provider_name="ai",
+                elapsed_ms=1,
+                error="structured_sentence_validation_error: malformed batch",
+            )
+
         def definition_ai(self, *args, **kwargs):
             raise AssertionError("definition_ai should not run when gloss is already usable")
 
@@ -1900,9 +2034,6 @@ def test_process_word_uses_english_gloss_as_final_definition(tmp_path: Path) -> 
         def sentence_web(self, word, language, level=None, **kwargs):
             _ = (word, language, level, kwargs)
             return Result(f"Он говорит, что {word} все понимают.", provider_name="tatoeba")
-
-        def sentence_ai(self, *args, **kwargs):
-            raise AssertionError("sentence_ai should not run on valid sentence")
 
         def translation_web(self, text, src, dest):
             _ = (text, src, dest)
@@ -1968,6 +2099,15 @@ def test_process_word_accepts_single_word_english_gloss_for_russian(tmp_path: Pa
             _ = (word, language, allow_ai, definition_language)
             return Result("noun: time", provider_name="wiktionary")
 
+        def sentence_ai_candidates(self, *args, **kwargs):
+            _ = (args, kwargs)
+            return StructuredSentenceBatchResult(
+                batch=None,
+                provider_name="ai",
+                elapsed_ms=1,
+                error="structured_sentence_validation_error: malformed batch",
+            )
+
         def definition_ai(self, *args, **kwargs):
             raise AssertionError("definition_ai should not run when gloss is usable")
 
@@ -1977,9 +2117,6 @@ def test_process_word_accepts_single_word_english_gloss_for_russian(tmp_path: Pa
         def sentence_web(self, word, language, level=None, **kwargs):
             _ = (word, language, level, kwargs)
             return Result("Время идет быстро сегодня утром.", provider_name="tatoeba")
-
-        def sentence_ai(self, *args, **kwargs):
-            raise AssertionError("sentence_ai should not run on valid sentence")
 
         def translation_web(self, text, src, dest):
             _ = (text, src, dest)

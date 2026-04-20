@@ -1,0 +1,35 @@
+{
+  "prompt_version": "sentence-batch-v1",
+  "schema_version": "sentence-batch-schema-v1",
+  "focus_word": "bien",
+  "language": "es",
+  "requested_pos": "adjective",
+  "requested_sense": "in good condition or quality",
+  "target_level": 1,
+  "candidates": [
+    {
+      "sentence": "Hoy me siento bien en casa.",
+      "target_form": "bien",
+      "requested_pos": "adjective",
+      "requested_sense": "in good condition or quality",
+      "validation_signals": ["natural_everyday", "focus_present"],
+      "rationale": "natural_everyday"
+    },
+    {
+      "sentence": "Todo sigue bien por aqui hoy.",
+      "target_form": "bien",
+      "requested_pos": "adjective",
+      "requested_sense": "in good condition or quality",
+      "validation_signals": ["natural_everyday", "focus_present"],
+      "rationale": "simple_domestic_context"
+    },
+    {
+      "sentence": "El plan salio bien esta manana.",
+      "target_form": "bien",
+      "requested_pos": "adjective",
+      "requested_sense": "in good condition or quality",
+      "validation_signals": ["natural_everyday", "focus_present"],
+      "rationale": "common_daily_outcome"
+    }
+  ]
+}

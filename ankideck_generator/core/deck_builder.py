@@ -47,12 +47,19 @@ from .models import (
     ProgressState,
     ProviderResult,
     RunConfig,
+    STRUCTURED_SENTENCE_PROMPT_VERSION,
+    STRUCTURED_SENTENCE_SCHEMA_VERSION,
+    StructuredSentenceBatch,
 )
 from .providers import ProviderManager
 from .run_state import (
     build_compatibility_fingerprint,
     fingerprints_match,
     quarantine_name,
+)
+from .sentence_generation import (
+    SENTENCE_GENERATION_POLICY_VERSION,
+    SentenceGenerationService,
 )
 from .validators import ValidationContext, validate_card
 
@@ -357,10 +364,13 @@ class DeckBuilder:
             prompt={
                 "definition_policy": self.definition_policy,
                 "sentence_cache_selection_version": SENTENCE_CACHE_SELECTION_VERSION,
+                "structured_sentence_prompt_version": STRUCTURED_SENTENCE_PROMPT_VERSION,
             },
             schema={
                 "card_data": CardData.model_json_schema(),
                 "progress_state": ProgressState.model_json_schema(),
+                "structured_sentence_batch": StructuredSentenceBatch.model_json_schema(),
+                "structured_sentence_schema_version": STRUCTURED_SENTENCE_SCHEMA_VERSION,
             },
             validator={
                 "default_validations": DEFAULT_VALIDATIONS,
@@ -372,6 +382,7 @@ class DeckBuilder:
                 "level_validation_mode": run.level_validation_mode,
                 "strict_quality": run.strict_quality,
                 "target_translation": run.target_translation,
+                "sentence_generation_policy_version": SENTENCE_GENERATION_POLICY_VERSION,
             },
         )
 
@@ -1114,6 +1125,14 @@ class DeckBuilder:
             timeout_overrides=run.provider_timeout_overrides,
             retry_overrides=run.provider_retry_overrides,
         )
+
+    def _sentence_generation_service(
+        self,
+        providers: ProviderManager,
+        *,
+        strict_quality: bool,
+    ) -> SentenceGenerationService:
+        return SentenceGenerationService(providers, strict_quality=strict_quality)
 
     def _thread_provider_manager(
         self,
@@ -2027,6 +2046,19 @@ class DeckBuilder:
             cache.set("sentences", sentence_cache_key, sentence)
             return sentence
 
+        def is_hard_ai_sentence_error(error: str | None) -> bool:
+            text = str(error or "").lower()
+            return any(
+                token in text
+                for token in (
+                    "provider_disabled",
+                    "http 401",
+                    "http 403",
+                    "http 429",
+                    "missing api_key",
+                )
+            )
+
         def build_sentence() -> str:
             nonlocal sentence, last_sentence_issue
             if sentence:
@@ -2041,52 +2073,115 @@ class DeckBuilder:
                 return sentence
             last_sentence_issue = cached_errors[0] if cached_errors else None
 
-            count_event("sentence_tatoeba_attempted")
-            sentence_web_candidates = getattr(providers, "sentence_web_candidates", None)
-            if callable(sentence_web_candidates):
-                result = sentence_web_candidates(
-                    word,
-                    run.language,
+            sentence_service = self._sentence_generation_service(
+                providers,
+                strict_quality=strict_quality,
+            )
+            ai_status = "skipped"
+            ai_should_allow_web_fallback = False
+            max_sentence_ai_attempts = max(0, int(run.sentence_ai_attempts or 0))
+            sentence_attempts = 0
+            while sentence_attempts < max_sentence_ai_attempts and allow_ai("sentence"):
+                mark_ai("sentence")
+                count_event("sentence_ai_generate_attempted")
+                ai_result = sentence_service.generate_candidates(
+                    focus_word=word,
+                    language=run.language,
+                    level=level,
+                    requested_pos="",
+                    requested_sense="",
                     min_words=sentence_min_words,
                     max_words=sentence_max_words,
                 )
-                trace_result("sentence", result, stage_key="sentence_web_ms")
-                for web_candidate in list(getattr(result, "candidates", []) or []):
-                    source_kind = (
-                        "tatoeba"
-                        if getattr(web_candidate, "source", "") == "tatoeba"
-                        or web_candidate.provider_name == "tatoeba"
-                        else getattr(web_candidate, "source", web_candidate.provider_name)
-                    )
+                ai_status = ai_result.status
+                providers_used["sentence_ai_batch"] = ai_result.provider_name
+                if ai_result.error:
+                    provider_errors["sentence_ai_batch"] = ai_result.error
+                if ai_result.status == "malformed":
+                    count_event("sentence_ai_malformed_batch")
+                elif ai_result.status == "provider_error":
+                    count_event("sentence_ai_provider_error")
+
+                for rejected_candidate in ai_result.rejected:
+                    for reason_code in rejected_candidate.reason_codes:
+                        count_event(reason_code)
+
+                for generated_candidate in ai_result.candidates:
                     submit_sentence_candidate(
                         evaluate_sentence_candidate(
-                            web_candidate.text,
-                            provider_name=web_candidate.provider_name,
-                            source_kind=source_kind,
-                            query_mode=getattr(web_candidate, "query_mode", ""),
+                            generated_candidate.sentence,
+                            provider_name=ai_result.provider_name,
+                            source_kind="ai",
                         )
                     )
-            else:
-                result = providers.sentence_web(
-                    word,
-                    run.language,
-                    min_words=sentence_min_words,
-                    max_words=sentence_max_words,
-                )
-                trace_result("sentence", result, stage_key="sentence_web_ms")
-                if result.value:
-                    source_kind = (
-                        "tatoeba"
-                        if result.provider_name == "tatoeba"
-                        else result.provider_name
+
+                selected_candidate = choose_sentence_candidate()
+                if selected_candidate is not None:
+                    return finalize_selected_sentence(selected_candidate)
+
+                if ai_result.status == "provider_error" and is_hard_ai_sentence_error(
+                    ai_result.error
+                ):
+                    last_sentence_issue = "sentence_generation_failed"
+                    return sentence
+
+                if (
+                    ai_result.status in {"malformed", "low_yield"}
+                    or ai_result.candidates
+                    or ai_result.status == "provider_error"
+                ):
+                    ai_should_allow_web_fallback = True
+                sentence_attempts += 1
+
+            if ai_should_allow_web_fallback:
+                count_event("sentence_ai_low_yield_fallback")
+                count_event("sentence_web_salvage_attempted")
+                count_event("sentence_tatoeba_attempted")
+                sentence_web_candidates = getattr(providers, "sentence_web_candidates", None)
+                if callable(sentence_web_candidates):
+                    result = sentence_web_candidates(
+                        word,
+                        run.language,
+                        min_words=sentence_min_words,
+                        max_words=sentence_max_words,
                     )
-                    submit_sentence_candidate(
-                        evaluate_sentence_candidate(
-                            result.value or "",
-                            provider_name=result.provider_name,
-                            source_kind=source_kind,
+                    trace_result("sentence", result, stage_key="sentence_web_ms")
+                    for web_candidate in list(getattr(result, "candidates", []) or []):
+                        source_kind = (
+                            "tatoeba"
+                            if getattr(web_candidate, "source", "") == "tatoeba"
+                            or web_candidate.provider_name == "tatoeba"
+                            else getattr(web_candidate, "source", web_candidate.provider_name)
                         )
+                        submit_sentence_candidate(
+                            evaluate_sentence_candidate(
+                                web_candidate.text,
+                                provider_name=web_candidate.provider_name,
+                                source_kind=source_kind,
+                                query_mode=getattr(web_candidate, "query_mode", ""),
+                            )
+                        )
+                else:
+                    result = providers.sentence_web(
+                        word,
+                        run.language,
+                        min_words=sentence_min_words,
+                        max_words=sentence_max_words,
                     )
+                    trace_result("sentence", result, stage_key="sentence_web_ms")
+                    if result.value:
+                        source_kind = (
+                            "tatoeba"
+                            if result.provider_name == "tatoeba"
+                            else result.provider_name
+                        )
+                        submit_sentence_candidate(
+                            evaluate_sentence_candidate(
+                                result.value or "",
+                                provider_name=result.provider_name,
+                                source_kind=source_kind,
+                            )
+                        )
 
             sentence_rewrite = getattr(providers, "sentence_rewrite", None)
             best_tatoeba_candidate = next(
@@ -2189,6 +2284,9 @@ class DeckBuilder:
             )
             if selected_candidate is not None:
                 return finalize_selected_sentence(selected_candidate)
+
+            if ai_status in {"malformed", "low_yield"}:
+                last_sentence_issue = "sentence_generation_low_yield"
 
             return sentence
 
