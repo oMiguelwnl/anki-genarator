@@ -631,6 +631,161 @@ def test_interactive_edit_reruns_validation_before_acceptance(
     assert log.after["definition"] == "bench"
 
 
+def test_interactive_edit_revalidation_rejects_before_audio_generation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = True
+    run = _run_config(tmp_path)
+    run.mode = "full"
+    run.interactive = True
+    ctx = ValidationContext()
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    base_card = CardData(
+        focus="banco",
+        index=1,
+        ipa="/banco/",
+        source_definition="noun: banco de parque.",
+        definition="noun: bench in a park or public place.",
+        sentence="Me sente en el banco del parque.",
+        translation="I sat on the bench in the park.",
+        translation_language="en",
+        level=1,
+        language="es",
+        lifecycle_state="generated",
+    )
+    base_log = LogRecord(
+        focus="banco",
+        level=1,
+        lifecycle_state="generated",
+        status="candidate",
+        review_notes=["lexical_review_corrected"],
+    )
+    audio_calls: list[str] = []
+
+    monkeypatch.setattr(
+        builder,
+        "_process_word_textual",
+        lambda **_kwargs: (base_card.model_copy(deep=True), base_log.model_copy(deep=True)),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_interactive_edit",
+        lambda card, _log_record: card.model_copy(update={"definition": "bench"}),
+    )
+
+    def fake_attach_audio(**kwargs):
+        audio_calls.append(kwargs["card"].definition)
+        card = kwargs["card"].model_copy(deep=True)
+        card.word_audio = "[sound:banco.mp3]"
+        card.sentence_audio = "[sound:banco_sentence.mp3]"
+        card.audio = card.word_audio
+        return card, kwargs["log_record"], ["media/banco.mp3"]
+
+    monkeypatch.setattr(builder, "_attach_audio_to_card", fake_attach_audio)
+
+    card, log = builder._process_word(
+        word="banco",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=object(),
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is None
+    assert log.lifecycle_state == "rejected"
+    assert audio_calls == []
+
+
+def test_interactive_edit_valid_correction_generates_audio_after_acceptance(
+    monkeypatch, tmp_path: Path
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = True
+    run = _run_config(tmp_path)
+    run.mode = "full"
+    run.interactive = True
+    ctx = ValidationContext()
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    base_card = CardData(
+        focus="banco",
+        index=1,
+        ipa="/banco/",
+        source_definition="noun: banco de parque.",
+        definition="noun: bench in a park or public place.",
+        sentence="Me sente en el banco del parque.",
+        translation="I sat on the bench in the park.",
+        translation_language="en",
+        level=1,
+        language="es",
+        lifecycle_state="generated",
+    )
+    base_log = LogRecord(
+        focus="banco",
+        level=1,
+        lifecycle_state="generated",
+        status="candidate",
+        review_notes=["lexical_review_corrected"],
+    )
+    call_order: list[str] = []
+
+    monkeypatch.setattr(
+        builder,
+        "_process_word_textual",
+        lambda **_kwargs: (base_card.model_copy(deep=True), base_log.model_copy(deep=True)),
+    )
+
+    def fake_interactive_edit(card, _log_record):
+        call_order.append("interactive")
+        return card.model_copy(
+            update={"definition": "noun: public bench for sitting outdoors."}
+        )
+
+    def fake_attach_audio(**kwargs):
+        call_order.append("audio")
+        card = kwargs["card"].model_copy(deep=True)
+        card.word_audio = "[sound:banco.mp3]"
+        card.sentence_audio = "[sound:banco_sentence.mp3]"
+        card.audio = card.word_audio
+        return card, kwargs["log_record"], ["media/banco.mp3"]
+
+    monkeypatch.setattr(builder, "_interactive_edit", fake_interactive_edit)
+    monkeypatch.setattr(builder, "_attach_audio_to_card", fake_attach_audio)
+
+    card, log = builder._process_word(
+        word="banco",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=object(),
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert card is not None
+    assert log.lifecycle_state == "accepted"
+    assert card.word_audio == "[sound:banco.mp3]"
+    assert call_order == ["interactive", "audio"]
+
+
 def test_build_assigns_sequential_sortindex(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
