@@ -7,7 +7,7 @@ from urllib.parse import quote
 import pytest
 
 import ankideck_generator.core.providers as providers_module
-from ankideck_generator.core.models import StructuredSentenceBatch
+from ankideck_generator.core.models import LexicalReviewRequest, StructuredSentenceBatch
 from ankideck_generator.core.providers import ProviderManager
 
 
@@ -139,6 +139,35 @@ def test_sentence_ai_candidates_rejects_malformed_payload(monkeypatch) -> None:
     assert result.batch is None
     assert result.error is not None
     assert "structured_sentence_validation_error" in result.error
+
+
+def test_lexical_review_rejects_malformed_payload(monkeypatch) -> None:
+    provider = ProviderManager({"providers": {}}, timeout_sec=1, retries=0)
+    request = LexicalReviewRequest(
+        focus_word="banco",
+        language="es",
+        target_translation_language="en",
+        accepted_sentence="Me senté en el banco del parque.",
+        current_definition="financial institution",
+        current_translation="bank",
+        source_definition="bench in a park or public place",
+        candidate_senses=[
+            "financial institution",
+            "bench in a park or public place",
+        ],
+    )
+
+    monkeypatch.setattr(
+        provider,
+        "_ai_request",
+        lambda *args, **kwargs: '{"verdict":"human_review"}',
+    )
+
+    result = provider.lexical_review(request)
+
+    assert result.review is None
+    assert result.error is not None
+    assert "lexical_review_validation_error" in result.error
 
 
 def test_translation_prefers_web_then_ai(monkeypatch):
