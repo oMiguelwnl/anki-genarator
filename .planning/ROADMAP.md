@@ -44,10 +44,10 @@ Plans:
 **Plans**: 4 plans
 
 Plans:
-- [ ] 02-01: Add typed candidate schemas, prompt versioning, and AI sentence-generation contracts.
-- [ ] 02-02: Extract a sentence-generation service from `DeckBuilder`.
-- [ ] 02-03: Introduce AI-first routing with bounded fallback and retry policy.
-- [ ] 02-04: Add fixture-based tests for structured sentence generation and rejection paths.
+- [ ] 02-01-PLAN.md — Add typed candidate schemas, prompt versioning, and AI sentence-generation transport.
+- [ ] 02-02-PLAN.md — Extract a sentence-generation service and early-rejection seam from `DeckBuilder`.
+- [ ] 02-03-PLAN.md — Re-route sentence selection to AI-first with bounded fallback and contract fingerprinting.
+- [ ] 02-04-PLAN.md — Add fixture-based regressions for structured AI batches and salvage-only fallback.
 
 ### Phase 3: Contextual Lexical Review
 **Goal**: Build translation and definition around the accepted sentence context, add a review or correction stage, and force deterministic revalidation after any automated or human edit.
