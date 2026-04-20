@@ -16,6 +16,11 @@ class LexicalReviewService:
         reason_codes = list(dict.fromkeys((list(base.reason_codes) if base else []) + ([] if winning_sense else ["lexical_review_unresolved_ambiguity"])))
 
         if winning_sense is None:
+            selection_reasons = dict(request.selection_reasons)
+            if base:
+                selection_reasons.update(base.selection_reasons)
+            if reason:
+                selection_reasons.setdefault("winning_sense", reason)
             return LexicalReviewResult(
                 verdict="reject",
                 focus_word=request.focus_word,
@@ -32,7 +37,7 @@ class LexicalReviewService:
                 confidence=(base.confidence if base else request.confidence),
                 before=dict(request.before),
                 after=dict(request.after),
-                selection_reasons={**dict(request.selection_reasons), **({"winning_sense": reason} if reason else {})},
+                selection_reasons=selection_reasons,
             )
 
         losing = [sense for sense in request.candidate_senses if sense != winning_sense]

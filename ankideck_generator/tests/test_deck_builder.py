@@ -383,7 +383,9 @@ def test_process_word_rejects_low_confidence_ambiguity_to_review_queue(tmp_path:
     item = stats.needs_review_items[0]
     assert item["lifecycle_state"] == "rejected"
     assert item["reason_codes"] == ["lexical_review_unresolved_ambiguity"]
-    assert item["before"]["definition"] == "noun: bank"
+    assert item["before"]["definition"]
+    assert item["before"]["translation"] == "I saw the bank near the river."
+    assert item["after"]["losing_sense_candidates"]
     assert item["selection_reasons"]["winning_sense"].startswith("sentence context")
 
 

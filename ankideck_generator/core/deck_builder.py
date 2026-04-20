@@ -2843,6 +2843,44 @@ class DeckBuilder:
                 translation = corrected_translation
                 review_after.setdefault("translation", corrected_translation)
             review_notes.append("lexical_review_corrected")
+        elif lexical_review.verdict == "reject":
+            review_notes.append("lexical_review_rejected")
+            review_before = dict(lexical_review.before or {}) or {
+                "definition": definition,
+                "translation": translation,
+            }
+            review_after = dict(lexical_review.after or {})
+            if not review_after:
+                review_after = {
+                    "definition": definition,
+                    "translation": translation,
+                }
+            if lexical_review.winning_sense:
+                review_after.setdefault("winning_sense", lexical_review.winning_sense)
+            if lexical_review.losing_sense_candidates:
+                review_after.setdefault(
+                    "losing_sense_candidates",
+                    list(lexical_review.losing_sense_candidates),
+                )
+            return None, LogRecord(
+                focus=word,
+                level=level,
+                lifecycle_state="rejected",
+                providers=providers_used,
+                provider_errors=provider_errors,
+                stage_timings=stage_timings,
+                event_counts=dict(event_counts),
+                validations=[],
+                review_notes=review_notes,
+                reason_codes=review_reason_codes,
+                before=review_before,
+                after=review_after,
+                candidate_preview=candidate_preview,
+                quality_scores=quality_scores,
+                selection_reasons=selection_reasons,
+                status="discarded",
+                discard_reason="lexical_review_rejected",
+            )
         else:
             review_before = {}
             review_after = {}
