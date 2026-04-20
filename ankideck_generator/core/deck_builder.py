@@ -43,6 +43,7 @@ from .models import (
     ANKI_FIELD_ORDER_DEFAULT,
     CardData,
     CompatibilityFingerprint,
+    LexicalReviewRequest,
     LogRecord,
     ProgressState,
     ProviderResult,
@@ -51,6 +52,7 @@ from .models import (
     STRUCTURED_SENTENCE_SCHEMA_VERSION,
     StructuredSentenceBatch,
 )
+from .lexical_review import LexicalReviewService
 from .providers import ProviderManager
 from .run_state import (
     build_compatibility_fingerprint,
@@ -2792,6 +2794,59 @@ class DeckBuilder:
             remember_quality_error(translation_issue_name or "translation_missing")
             return discard_log(quality_errors)
 
+        candidate_senses = unique_keep_order(
+            [
+                source_definition,
+                definition,
+                *candidate_preview.get("source_definitions", []),
+                *candidate_preview.get("definitions", []),
+            ]
+        )
+        lexical_review = LexicalReviewService(providers).review(
+            LexicalReviewRequest(
+                focus_word=word,
+                language=run.language,
+                target_translation_language=run.target_translation,
+                accepted_sentence=sentence,
+                current_definition=definition,
+                current_translation=translation,
+                source_definition=source_definition,
+                candidate_senses=candidate_senses,
+                winning_sense=source_definition or None,
+                before={
+                    "definition": definition,
+                    "translation": translation,
+                },
+                selection_reasons=dict(selection_reasons),
+            )
+        )
+        review_reason_codes = unique_keep_order(list(lexical_review.reason_codes or []))
+        selection_reasons.update(dict(lexical_review.selection_reasons or {}))
+        if lexical_review.winning_sense and not selection_reasons.get("winning_sense"):
+            selection_reasons["winning_sense"] = lexical_review.winning_sense
+        set_candidate_preview(
+            "lexical_review_losing_senses",
+            list(lexical_review.losing_sense_candidates or []),
+        )
+        if lexical_review.verdict == "correct":
+            corrected_definition = (lexical_review.corrected_definition or "").strip()
+            corrected_translation = (lexical_review.corrected_translation or "").strip()
+            review_before = dict(lexical_review.before or {}) or {
+                "definition": definition,
+                "translation": translation,
+            }
+            review_after = dict(lexical_review.after or {})
+            if corrected_definition:
+                definition = corrected_definition
+                review_after.setdefault("definition", corrected_definition)
+            if corrected_translation:
+                translation = corrected_translation
+                review_after.setdefault("translation", corrected_translation)
+            review_notes.append("lexical_review_corrected")
+        else:
+            review_before = {}
+            review_after = {}
+
         definition_translation_alignment = definition_alignment_score(
             definition,
             definition_lang,
@@ -2864,6 +2919,9 @@ class DeckBuilder:
             event_counts=dict(event_counts),
             validations=quality_errors,
             review_notes=review_notes,
+            reason_codes=review_reason_codes,
+            before=review_before,
+            after=review_after,
             candidate_preview=candidate_preview,
             quality_scores=quality_scores,
             selection_reasons=selection_reasons,
