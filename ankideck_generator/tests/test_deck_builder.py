@@ -15,12 +15,14 @@ from ankideck_generator.core.deck_builder import (
 )
 from ankideck_generator.core.models import (
     CardData,
+    LexicalReviewResult,
     LogRecord,
     ProgressState,
     RunConfig,
     StructuredSentenceBatch,
 )
 from ankideck_generator.core.providers import StructuredSentenceBatchResult
+from ankideck_generator.utils.logger import JsonLogger
 from ankideck_generator.core.validators import ValidationContext
 
 
@@ -50,6 +52,222 @@ def _ai_sentence_fixture_payload(name: str) -> dict[str, object]:
         / name
     )
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+class TestDeckBuilderLexicalReviewSentenceAnchor:
+    def test_process_word_auto_corrects_definition_without_rewriting_sentence(
+        self, tmp_path: Path
+    ) -> None:
+        builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+        builder.config["audio"]["enabled"] = False
+        run = _run_config(tmp_path)
+
+        class FakeCache:
+            def get(self, *_args, **_kwargs):
+                return None
+
+            def set(self, *_args, **_kwargs):
+                return None
+
+        class Result:
+            def __init__(self, value: str, provider_name: str = "ai"):
+                self.value = value
+                self.provider_name = provider_name
+                self.elapsed_ms = 1
+                self.error = None
+
+        class ReviewTransport:
+            def __init__(self, review: LexicalReviewResult):
+                self.review = review
+                self.provider_name = "ai"
+                self.elapsed_ms = 1
+                self.error = None
+
+        class FakeProviders:
+            lexical_review_calls = 0
+
+            def definition(self, word, language, allow_ai=True, definition_language=None):
+                _ = (word, language, allow_ai, definition_language)
+                return Result("noun: banco de parque")
+
+            def ipa(self, word, language, allow_ai=True):
+                _ = (word, language, allow_ai)
+                return Result("/ˈbaŋ.ko/")
+
+            def phonetic_spelling(self, ipa, language, allow_ai=True):
+                _ = (ipa, language, allow_ai)
+                return Result("BAN-ko")
+
+            def sentence_web(self, word, language, level=None, **kwargs):
+                _ = (word, language, level, kwargs)
+                return Result("Me sente en el banco del parque.", provider_name="tatoeba")
+
+            def sentence_ai(self, word, language, level=None, **kwargs):
+                _ = (word, language, level, kwargs)
+                return Result("Me sente en el banco del parque.")
+
+            def translation_web(self, text, src, dest):
+                _ = (src, dest)
+                if text.startswith("noun:"):
+                    return Result("noun: financial institution", provider_name="googletrans")
+                return Result("I sat on the bench in the park.", provider_name="googletrans")
+
+            def translation_ai(self, text, src, dest):
+                _ = (text, src, dest)
+                return Result("I sat on the bench in the park.")
+
+            def lexical_review(self, request, **kwargs):
+                _ = kwargs
+                self.lexical_review_calls += 1
+                return ReviewTransport(
+                    LexicalReviewResult.model_validate(
+                        {
+                            "verdict": "correct",
+                            "focus_word": request.focus_word,
+                            "language": request.language,
+                            "target_translation_language": request.target_translation_language,
+                            "accepted_sentence": request.accepted_sentence,
+                            "current_definition": request.current_definition,
+                            "current_translation": request.current_translation,
+                            "source_definition": request.source_definition,
+                            "candidate_senses": list(request.candidate_senses),
+                            "winning_sense": "noun: bench in a park or public place.",
+                            "losing_sense_candidates": ["noun: financial institution"],
+                            "corrected_definition": "noun: bench in a park or public place.",
+                            "corrected_translation": None,
+                            "reason_codes": ["definition_sentence_mismatch"],
+                            "before": {
+                                "definition": request.current_definition,
+                                "translation": request.current_translation,
+                            },
+                            "after": {
+                                "definition": "noun: bench in a park or public place.",
+                                "translation": request.current_translation,
+                            },
+                            "selection_reasons": {
+                                "winning_sense": "park sentence context favors seating sense"
+                            },
+                        }
+                    )
+                )
+
+        card, log = builder._process_word_textual(
+            word="banco",
+            level=1,
+            index=1,
+            run=run,
+            cache=FakeCache(),
+            providers=FakeProviders(),
+        )
+
+        assert card is not None
+        assert card.definition == "noun: bench in a park or public place."
+        assert card.translation == "I sat on the bench in the park."
+        assert card.sentence == "Me sente en el banco del parque."
+        assert card.focus == "banco"
+        assert log.before["definition"] == "noun: financial institution"
+        assert log.after["definition"] == "noun: bench in a park or public place."
+
+    def test_process_word_sentence_anchor_lexical_review_accepts_aligned_fields(
+        self, tmp_path: Path
+    ) -> None:
+        builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+        builder.config["audio"]["enabled"] = False
+        run = _run_config(tmp_path)
+
+        class FakeCache:
+            def get(self, *_args, **_kwargs):
+                return None
+
+            def set(self, *_args, **_kwargs):
+                return None
+
+        class Result:
+            def __init__(self, value: str, provider_name: str = "ai"):
+                self.value = value
+                self.provider_name = provider_name
+                self.elapsed_ms = 1
+                self.error = None
+
+        class ReviewTransport:
+            def __init__(self, review: LexicalReviewResult):
+                self.review = review
+                self.provider_name = "ai"
+                self.elapsed_ms = 1
+                self.error = None
+
+        class FakeProviders:
+            lexical_review_calls = 0
+
+            def definition(self, word, language, allow_ai=True, definition_language=None):
+                _ = (word, language, allow_ai, definition_language)
+                return Result("noun: bench in a park or public place")
+
+            def ipa(self, word, language, allow_ai=True):
+                _ = (word, language, allow_ai)
+                return Result("/ˈbaŋ.ko/")
+
+            def phonetic_spelling(self, ipa, language, allow_ai=True):
+                _ = (ipa, language, allow_ai)
+                return Result("BAN-ko")
+
+            def sentence_web(self, word, language, level=None, **kwargs):
+                _ = (word, language, level, kwargs)
+                return Result("Me sente en el banco del parque.", provider_name="tatoeba")
+
+            def sentence_ai(self, word, language, level=None, **kwargs):
+                _ = (word, language, level, kwargs)
+                return Result("Me sente en el banco del parque.")
+
+            def translation_web(self, text, src, dest):
+                _ = (src, dest)
+                if text.startswith("noun:"):
+                    return Result("noun: bench in a park or public place", provider_name="googletrans")
+                return Result("I sat on the bench in the park.", provider_name="googletrans")
+
+            def translation_ai(self, text, src, dest):
+                _ = (text, src, dest)
+                raise AssertionError("translation_ai should not run for aligned fields")
+
+            def lexical_review(self, request, **kwargs):
+                _ = kwargs
+                self.lexical_review_calls += 1
+                return ReviewTransport(
+                    LexicalReviewResult.model_validate(
+                        {
+                            "verdict": "accept",
+                            "focus_word": request.focus_word,
+                            "language": request.language,
+                            "target_translation_language": request.target_translation_language,
+                            "accepted_sentence": request.accepted_sentence,
+                            "current_definition": request.current_definition,
+                            "current_translation": request.current_translation,
+                            "source_definition": request.source_definition,
+                            "candidate_senses": list(request.candidate_senses),
+                            "winning_sense": request.current_definition,
+                            "losing_sense_candidates": [],
+                            "reason_codes": [],
+                            "selection_reasons": {"winning_sense": "already_aligned"},
+                        }
+                    )
+                )
+
+        providers = FakeProviders()
+        card, log = builder._process_word_textual(
+            word="banco",
+            level=1,
+            index=1,
+            run=run,
+            cache=FakeCache(),
+            providers=providers,
+        )
+
+        assert card is not None
+        assert providers.lexical_review_calls == 1
+        assert card.definition == "noun: bench in a park or public place."
+        assert card.translation == "I sat on the bench in the park."
+        assert log.before == {}
+        assert log.after == {}
 
 
 def test_build_assigns_sequential_sortindex(monkeypatch, tmp_path: Path) -> None:
