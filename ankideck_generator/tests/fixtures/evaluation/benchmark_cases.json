@@ -1,0 +1,46 @@
+[
+  {
+    "case_id": "es-lexical-low-beginner",
+    "language": "es",
+    "focus": "banco",
+    "ambiguity_slice": "low",
+    "difficulty_slice": "beginner",
+    "quality_dimensions": ["lexical_accuracy", "sentence_quality", "acceptance"],
+    "expected_outcome": "accept",
+    "expected_reject_reason": null,
+    "notes": "Clear bench sense with learner-safe sentence."
+  },
+  {
+    "case_id": "es-duplicate-high-intermediate",
+    "language": "es",
+    "focus": "bien",
+    "ambiguity_slice": "high",
+    "difficulty_slice": "intermediate",
+    "quality_dimensions": ["sentence_quality", "duplicate_handling", "acceptance"],
+    "expected_outcome": "reject",
+    "expected_reject_reason": "duplicate_sentence_near",
+    "notes": "Near-duplicate sentence should be rejected."
+  },
+  {
+    "case_id": "fr-lexical-medium-advanced",
+    "language": "fr",
+    "focus": "livre",
+    "ambiguity_slice": "medium",
+    "difficulty_slice": "advanced",
+    "quality_dimensions": ["lexical_accuracy", "sentence_quality", "acceptance"],
+    "expected_outcome": "accept",
+    "expected_reject_reason": null,
+    "notes": "Book sense in a more advanced sentence."
+  },
+  {
+    "case_id": "fr-final-low-intermediate",
+    "language": "fr",
+    "focus": "clair",
+    "ambiguity_slice": "low",
+    "difficulty_slice": "intermediate",
+    "quality_dimensions": ["sentence_quality", "acceptance"],
+    "expected_outcome": "accept",
+    "expected_reject_reason": null,
+    "notes": "Control row for final acceptance aggregation."
+  }
+]
