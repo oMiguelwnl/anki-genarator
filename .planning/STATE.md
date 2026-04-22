@@ -4,17 +4,17 @@ milestone: v1.0
 milestone_name: milestone
 current_phase: 05
 current_phase_name: evaluation and runtime controls
-current_plan: Not started
-status: ready
-stopped_at: Completed 04-03-PLAN.md
-last_updated: "2026-04-22T17:52:35.552Z"
+current_plan: 2
+status: executing
+stopped_at: Completed 05-01-PLAN.md
+last_updated: "2026-04-22T19:04:21.950Z"
 last_activity: 2026-04-22
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 16
-  completed_plans: 13
-  percent: 81
+  completed_plans: 14
+  percent: 88
 ---
 
 # Project State
@@ -31,18 +31,18 @@ See: `.planning/PROJECT.md` (updated 2026-04-15)
 **Current Phase:** 05
 **Current Phase Name:** evaluation and runtime controls
 **Total Phases:** 5
-**Current Plan:** Not started
+**Current Plan:** 2
 **Total Plans in Phase:** 3
-**Status:** Ready to execute
-**Progress:** [░░░░░░░░░░] 0%
+**Status:** Executing Phase 05
+**Progress:** [█████████░] 88%
 **Last Activity:** 2026-04-22
-**Last Activity Description:** Phase 04 execution complete — 3 plan summaries recorded
+**Last Activity Description:** Completed 05-01-PLAN.md
 
-Phase: 05 (evaluation-and-runtime-controls) — READY
-Plan: 0 of 3
-Status: Ready to execute
-Last activity: 2026-04-22 -- Phase 04 execution complete
-Progress: [░░░░░░░░░░] 0%
+Phase: 05 (evaluation-and-runtime-controls) — EXECUTING
+Plan: 2 of 3
+Status: Executing Phase 05
+Last activity: 2026-04-22 -- Completed 05-01-PLAN.md
+Progress: [█████████░] 88%
 
 ## Performance Metrics
 
@@ -85,6 +85,12 @@ Progress: [░░░░░░░░░░] 0%
 - [Phase 04]: Rejected artifacts now preserve card snapshots, duplicate evidence, field providers, and decisive decision_source provenance.
 - [Phase 04]: quality_report.json now exposes acceptance, duplicate, and review diagnostics while preserving legacy counters and export compatibility.
 
+| Phase 05 P01 | 3 min | 2 tasks | 3 files |
+
+- [Phase 05]: Evaluation helpers stay in a standalone core/evaluation.py module — Keeping fixture loading and aggregation pure avoids provider dependencies and makes benchmark runs deterministic.
+- [Phase 05]: Experiment identity is derived from canonical JSON over experiment metadata and benchmark cases — Order-insensitive hashing makes repeated evaluation runs reproducible and auditable.
+- [Phase 05]: Slice summaries count language, ambiguity, difficulty, and quality-dimension coverage from one bundle contract — Downstream runtime and release-gate plans can reuse the same deterministic aggregation surface.
+
 ## Pending Todos
 
 None yet.
@@ -101,6 +107,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-22T17:52:35.545Z
-Stopped at: Completed 04-03-PLAN.md
+Last session: 2026-04-22T19:04:13.267Z
+Stopped at: Completed 05-01-PLAN.md
 Resume file: None
