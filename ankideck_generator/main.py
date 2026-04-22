@@ -16,6 +16,31 @@ from .core.models import RunConfig
 from .utils.config import load_config
 
 
+def _parse_stage_call_limits(*configs: object) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for config in configs:
+        if config is None:
+            continue
+        if not isinstance(config, dict):
+            raise ValueError("runtime.ai_stage_call_limits must be a mapping")
+        for key, value in config.items():
+            stage = str(key or "").strip()
+            if not stage:
+                raise ValueError("runtime.ai_stage_call_limits keys must be non-empty")
+            try:
+                limit = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"runtime.ai_stage_call_limits[{stage!r}] must be an integer"
+                ) from exc
+            if limit < 0:
+                raise ValueError(
+                    f"runtime.ai_stage_call_limits[{stage!r}] cannot be negative"
+                )
+            merged[stage] = limit
+    return merged
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Anki Deck Generator")
     parser.add_argument("--language", default="en", help="Language code (en, es, fr, it, de, ru)")
@@ -46,7 +71,11 @@ def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except ValueError as exc:
+        print(Fore.RED + str(exc))
+        return 1
     languages = config.get("languages", {})
 
     if args.language not in languages:
@@ -125,6 +154,17 @@ def main() -> int:
         runtime_cfg.get("quality_report_path", "output/quality_report.json")
         or "output/quality_report.json"
     )
+    preserve_evaluation_logs = bool(
+        runtime_cfg.get("preserve_evaluation_logs", False)
+    )
+    try:
+        ai_stage_call_limits = _parse_stage_call_limits(
+            runtime_cfg.get("ai_stage_call_limits"),
+            mode_profile.get("ai_stage_call_limits"),
+        )
+    except ValueError as exc:
+        print(Fore.RED + str(exc))
+        return 1
     if mode == "test":
         sentence_ai_attempts = int(
             runtime_cfg.get("sentence_ai_attempts_test", sentence_ai_attempts)
@@ -236,6 +276,7 @@ def main() -> int:
         },
         lexicon_zipf_fallback_min=max(0.0, float(lexicon_zipf_fallback_min)),
         sentence_ai_attempts=max(0, int(sentence_ai_attempts)),
+        ai_stage_call_limits=ai_stage_call_limits,
         definition_context_fallback=bool(definition_context_fallback),
         low_yield_min_attempts=max(0, int(low_yield_min_attempts)),
         low_yield_min_acceptance_rate=max(0.0, float(low_yield_min_acceptance_rate)),
@@ -244,6 +285,7 @@ def main() -> int:
         definition_word_fallback=bool(definition_word_fallback),
         definition_context_first=bool(definition_context_first),
         definition_candidates_limit=max(1, int(definition_candidates_limit)),
+        preserve_evaluation_logs=preserve_evaluation_logs,
         review_queue_path=review_queue_path,
         quality_report_path=quality_report_path,
     )

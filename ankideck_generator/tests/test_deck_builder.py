@@ -3782,6 +3782,7 @@ def test_write_quality_outputs_reports_runtime_guardrails_and_latency_per_accept
     }
     assert report["runtime_guardrails"] == {
         "stage_budget_exhausted": {"lexical_review": 1},
+        "preserve_evaluation_logs": False,
     }
     assert report["latency_per_accepted_card_ms"] == {
         "accepted_cards": 1,

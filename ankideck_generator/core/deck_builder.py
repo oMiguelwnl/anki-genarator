@@ -1638,6 +1638,8 @@ class DeckBuilder:
         event_counts: Counter[str] = Counter()
         ai_calls_total = 0
         ai_calls_by_field: dict[str, int] = {}
+        ai_calls_by_stage: dict[str, int] = {}
+        exhausted_ai_stages: set[str] = set()
         quality_errors: list[str] = []
         review_notes: list[str] = []
         candidate_preview: dict[str, list[str]] = {}
@@ -1666,23 +1668,34 @@ class DeckBuilder:
                 return None
             return cache.get(kind, key)
 
-        def allow_ai(field: str) -> bool:
+        def allow_ai(field: str, *, stage: str | None = None) -> bool:
             if ai_calls_total >= run.ai_max_calls_per_word:
                 return False
             if ai_calls_by_field.get(field, 0) >= run.ai_max_calls_per_field:
                 return False
+            if stage:
+                stage_limit = int((run.ai_stage_call_limits or {}).get(stage, -1))
+                if stage_limit >= 0 and ai_calls_by_stage.get(stage, 0) >= stage_limit:
+                    if stage not in exhausted_ai_stages:
+                        event_counts[f"ai_stage_budget_exhausted.{stage}"] += 1
+                        exhausted_ai_stages.add(stage)
+                    return False
             return True
 
-        def mark_ai(field: str) -> None:
+        def mark_ai(field: str, *, stage: str | None = None) -> None:
             nonlocal ai_calls_total
             ai_calls_total += 1
             ai_calls_by_field[field] = ai_calls_by_field.get(field, 0) + 1
+            if stage:
+                ai_calls_by_stage[stage] = ai_calls_by_stage.get(stage, 0) + 1
+                event_counts[f"ai_stage_usage.{stage}"] += 1
 
         def trace_result(
             field: str,
             result: ProviderResult,
             *,
             ai_field: str | None = None,
+            ai_stage: str | None = None,
             stage_key: str | None = None,
         ) -> None:
             providers_used[field] = result.provider_name
@@ -1694,7 +1707,7 @@ class DeckBuilder:
                     if error:
                         provider_errors[f"{field}:{name}"] = str(error)
             if ai_field and result.provider_name == "ai":
-                mark_ai(ai_field)
+                mark_ai(ai_field, stage=ai_stage)
             if stage_key:
                 stage_timings[stage_key] = stage_timings.get(stage_key, 0) + int(
                     getattr(result, "elapsed_ms", 0) or 0
@@ -1705,6 +1718,7 @@ class DeckBuilder:
             result: object,
             *,
             ai_field: str | None = None,
+            ai_stage: str | None = None,
             stage_key: str | None = None,
         ) -> None:
             provider_name = str(getattr(result, "provider_name", "none") or "none")
@@ -1725,7 +1739,7 @@ class DeckBuilder:
                         for candidate in getattr(result, "candidates", [])
                     )
                 if used_ai:
-                    mark_ai(ai_field)
+                    mark_ai(ai_field, stage=ai_stage)
             if stage_key:
                 stage_timings[stage_key] = stage_timings.get(stage_key, 0) + int(
                     getattr(result, "elapsed_ms", 0) or 0
@@ -2217,8 +2231,8 @@ class DeckBuilder:
             ai_should_allow_web_fallback = False
             max_sentence_ai_attempts = max(0, int(run.sentence_ai_attempts or 0))
             sentence_attempts = 0
-            while sentence_attempts < max_sentence_ai_attempts and allow_ai("sentence"):
-                mark_ai("sentence")
+            while sentence_attempts < max_sentence_ai_attempts and allow_ai("sentence", stage="sentence"):
+                mark_ai("sentence", stage="sentence")
                 count_event("sentence_ai_generate_attempted")
                 ai_result = sentence_service.generate_candidates(
                     focus_word=word,
@@ -2339,7 +2353,7 @@ class DeckBuilder:
                     :MAX_TATOEBA_REWRITE_CANDIDATES
                 ]
                 for rewrite_candidate in rewrite_candidates:
-                    if not allow_ai("sentence"):
+                    if not allow_ai("sentence", stage="sentence_rewrite"):
                         break
                     count_event("sentence_ai_rewrite_attempted")
                     result = sentence_rewrite(
@@ -2354,6 +2368,7 @@ class DeckBuilder:
                         "sentence_rewrite",
                         result,
                         ai_field="sentence",
+                        ai_stage="sentence_rewrite",
                         stage_key="sentence_rewrite_ms",
                     )
                     submit_sentence_candidate(
@@ -2376,7 +2391,7 @@ class DeckBuilder:
                 not strong_tatoeba_available
                 and not has_valid_rewrite_candidate
                 and sentence_attempts < max_sentence_ai_attempts
-                and allow_ai("sentence")
+                and allow_ai("sentence", stage="sentence")
             ):
                 count_event("sentence_ai_generate_attempted")
                 result = providers.sentence_ai(
@@ -2389,6 +2404,7 @@ class DeckBuilder:
                     "sentence",
                     result,
                     ai_field="sentence",
+                    ai_stage="sentence",
                     stage_key="sentence_ai_ms",
                 )
                 generated_candidate = evaluate_sentence_candidate(
@@ -2538,7 +2554,7 @@ class DeckBuilder:
                 result = provider_method(
                     word,
                     run.language,
-                    allow_ai=allow_ai("definition"),
+                    allow_ai=allow_ai("definition", stage="definition"),
                     definition_language=expected_language,
                     sentence=sentence or None,
                 )
@@ -2546,6 +2562,7 @@ class DeckBuilder:
                     field_name,
                     result,
                     ai_field="definition",
+                    ai_stage="definition",
                     stage_key=stage_key,
                 )
                 for raw_candidate in list(getattr(result, "candidates", []) or []):
@@ -2572,13 +2589,14 @@ class DeckBuilder:
             result = providers.definition(
                 word,
                 run.language,
-                allow_ai=allow_ai("definition"),
+                allow_ai=allow_ai("definition", stage="definition"),
                 definition_language=expected_language,
             )
             trace_result(
                 field_name,
                 result,
                 ai_field="definition",
+                ai_stage="definition",
                 stage_key=stage_key,
             )
             candidate = make_definition_candidate(
@@ -2689,12 +2707,13 @@ class DeckBuilder:
                     if translated_candidate is not None:
                         remember_final_definition_candidate(translated_candidate)
                         continue
-                    if allow_ai("definition"):
+                    if allow_ai("definition", stage="definition_translate"):
                         result = providers.translation_ai(source_candidate.text, run.language, "en")
                         trace_result(
                             "definition",
                             result,
                             ai_field="definition",
+                            ai_stage="definition_translate",
                             stage_key="definition_translate_ms",
                         )
                         translated_candidate = make_definition_candidate(
@@ -2715,7 +2734,7 @@ class DeckBuilder:
 
             if (
                 sentence
-                and allow_ai("definition")
+                and allow_ai("definition", stage="definition_context")
                 and run.definition_context_fallback
                 and (not final_definition_candidates or definition_ambiguity_detected)
             ):
@@ -2724,6 +2743,7 @@ class DeckBuilder:
                     "definition",
                     context_ai,
                     ai_field="definition",
+                    ai_stage="definition_context",
                     stage_key="definition_context_ms",
                 )
                 context_candidate = make_definition_candidate(
@@ -2734,12 +2754,13 @@ class DeckBuilder:
                 )
                 if context_candidate is not None:
                     remember_final_definition_candidate(context_candidate)
-            if not final_definition_candidates and allow_ai("definition"):
+            if not final_definition_candidates and allow_ai("definition", stage="definition_context"):
                 direct_ai = request_definition_ai("en")
                 trace_result(
                     "definition",
                     direct_ai,
                     ai_field="definition",
+                    ai_stage="definition_context",
                     stage_key="definition_context_ms",
                 )
                 direct_candidate = make_definition_candidate(
@@ -2751,12 +2772,13 @@ class DeckBuilder:
                 if direct_candidate is not None:
                     remember_final_definition_candidate(direct_candidate)
 
-        if not final_definition_candidates and sentence and run.language == "en" and allow_ai("definition"):
+        if not final_definition_candidates and sentence and run.language == "en" and allow_ai("definition", stage="definition_context"):
             context_ai = request_definition_from_context("en", sentence)
             trace_result(
                 "definition",
                 context_ai,
                 ai_field="definition",
+                ai_stage="definition_context",
                 stage_key="definition_context_ms",
             )
             context_candidate = make_definition_candidate(
@@ -2804,12 +2826,13 @@ class DeckBuilder:
                 result = providers.translation_web(word, run.language, "en")
                 trace_result("word_translation", result, stage_key="word_translation_ms")
                 fallback_translation = (result.value or "").strip()
-                if not fallback_translation and allow_ai("translation"):
+                if not fallback_translation and allow_ai("translation", stage="word_translation"):
                     result = providers.translation_ai(word, run.language, "en")
                     trace_result(
                         "word_translation",
                         result,
                         ai_field="translation",
+                        ai_stage="word_translation",
                         stage_key="word_translation_ms",
                     )
                     fallback_translation = (result.value or "").strip()
@@ -2872,7 +2895,7 @@ class DeckBuilder:
             translation, translation_issue_name = finalize_translation(
                 result.value or "", sentence
             )
-            if not translation and allow_ai("translation"):
+            if not translation and allow_ai("translation", stage="translation"):
                 result = providers.translation_ai(
                     sentence, run.language, run.target_translation
                 )
@@ -2880,6 +2903,7 @@ class DeckBuilder:
                     "translation",
                     result,
                     ai_field="translation",
+                    ai_stage="translation",
                     stage_key="translation_ms",
                 )
                 translation, translation_issue_name = finalize_translation(
@@ -2936,24 +2960,77 @@ class DeckBuilder:
                 *candidate_preview.get("definitions", []),
             ]
         )
-        lexical_review = LexicalReviewService(providers).review(
-            LexicalReviewRequest(
-                focus_word=word,
-                language=run.language,
-                target_translation_language=run.target_translation,
-                accepted_sentence=sentence,
-                current_definition=definition,
-                current_translation=translation,
-                source_definition=source_definition,
-                candidate_senses=candidate_senses,
-                winning_sense=source_definition or None,
-                before={
+        lexical_review_request = LexicalReviewRequest(
+            focus_word=word,
+            language=run.language,
+            target_translation_language=run.target_translation,
+            accepted_sentence=sentence,
+            current_definition=definition,
+            current_translation=translation,
+            source_definition=source_definition,
+            candidate_senses=candidate_senses,
+            winning_sense=source_definition or None,
+            before={
+                "definition": definition,
+                "translation": translation,
+            },
+            selection_reasons=dict(selection_reasons),
+        )
+        if not allow_ai("lexical_review", stage="lexical_review"):
+            review_notes.append("lexical_review_budget_exhausted")
+            return None, LogRecord(
+                focus=word,
+                level=level,
+                lifecycle_state="rejected",
+                providers=providers_used,
+                provider_errors=provider_errors,
+                stage_timings=stage_timings,
+                event_counts=dict(event_counts),
+                validations=[],
+                review_notes=review_notes,
+                reason_codes=["lexical_review_budget_exhausted"],
+                before=dict(lexical_review_request.before),
+                after={
+                    "focus": word,
+                    "sentence": sentence,
                     "definition": definition,
                     "translation": translation,
+                    "source_definition": source_definition,
+                    "ipa": "",
                 },
-                selection_reasons=dict(selection_reasons),
+                provider="ai",
+                candidate_preview=candidate_preview,
+                quality_scores=quality_scores,
+                selection_reasons=selection_reasons,
+                status="discarded",
+                discard_reason="lexical_review_budget_exhausted",
             )
-        )
+
+        lexical_review_transport = getattr(providers, "lexical_review", None)
+        if callable(lexical_review_transport):
+            lexical_review_transport_result = lexical_review_transport(lexical_review_request)
+            trace_candidates_result(
+                "lexical_review",
+                lexical_review_transport_result,
+                ai_field="lexical_review",
+                ai_stage="lexical_review",
+                stage_key="lexical_review_ms",
+            )
+
+            class _StaticLexicalReviewProvider:
+                def __init__(self, result: object) -> None:
+                    self._result = result
+
+                def lexical_review(self, request, **kwargs):
+                    _ = (request, kwargs)
+                    return self._result
+
+            lexical_review = LexicalReviewService(
+                _StaticLexicalReviewProvider(lexical_review_transport_result)
+            ).review(lexical_review_request)
+        else:
+            lexical_review = LexicalReviewService(providers).review(lexical_review_request)
+
         providers_used.setdefault("lexical_review", "ai")
         review_reason_codes = unique_keep_order(list(lexical_review.reason_codes or []))
         selection_reasons.update(dict(lexical_review.selection_reasons or {}))
@@ -3052,18 +3129,19 @@ class DeckBuilder:
 
         ipa = cache.get("ipa", normalized_word)
         if not ipa:
-            result = providers.ipa(word, run.language, allow_ai=allow_ai("ipa"))
-            trace_result("ipa", result, ai_field="ipa", stage_key="ipa_ms")
+            result = providers.ipa(word, run.language, allow_ai=allow_ai("ipa", stage="ipa"))
+            trace_result("ipa", result, ai_field="ipa", ai_stage="ipa", stage_key="ipa_ms")
             ipa = result.value or ""
             if not ipa:
                 ipa = f"/{word}/"
         ipa = _normalize_ipa(ipa)
-        if ipa and not _ipa_has_pronunciation(ipa) and allow_ai("ipa"):
+        if ipa and not _ipa_has_pronunciation(ipa) and allow_ai("ipa", stage="ipa"):
             result = providers.phonetic_spelling(ipa, run.language, allow_ai=True)
             trace_result(
                 "ipa_pronunciation",
                 result,
                 ai_field="ipa",
+                ai_stage="ipa",
                 stage_key="ipa_ms",
             )
             phonetic = _sanitize_phonetic(result.value or "")
@@ -3544,6 +3622,30 @@ class DeckBuilder:
         duplicate_total = exact_rejects + near_rejects
         accepted_card_rate = round(accepted_cards / total_attempted, 4) if total_attempted else 0.0
         duplicate_reject_rate = round(duplicate_total / total_attempted, 4) if total_attempted else 0.0
+        stage_latency_ms = {
+            stage.removesuffix("_ms"): int(total_ms)
+            for stage, total_ms in sorted(stats.stage_counter.items())
+        }
+        total_runtime_ms = sum(stage_latency_ms.values())
+        latency_per_accepted_card_ms = {
+            "accepted_cards": accepted_cards,
+            "total_runtime_ms": total_runtime_ms,
+            "overall": round(total_runtime_ms / accepted_cards, 4) if accepted_cards else 0.0,
+            "by_stage": {
+                stage: round(total_ms / accepted_cards, 4) if accepted_cards else 0.0
+                for stage, total_ms in stage_latency_ms.items()
+            },
+        }
+        ai_budget_usage_by_stage = {
+            event_name.removeprefix("ai_stage_usage."): int(count)
+            for event_name, count in sorted(stats.event_counter.items())
+            if event_name.startswith("ai_stage_usage.")
+        }
+        stage_budget_exhausted = {
+            event_name.removeprefix("ai_stage_budget_exhausted."): int(count)
+            for event_name, count in sorted(stats.event_counter.items())
+            if event_name.startswith("ai_stage_budget_exhausted.")
+        }
         duplicate_levels = {
             str(level): {
                 "exact": duplicate_exact_by_level.get(level, 0),
@@ -3605,6 +3707,16 @@ class DeckBuilder:
             "provider_success_counter": dict(stats.provider_success_counter),
             "provider_error_counter": dict(stats.provider_error_counter),
             "event_counter": dict(stats.event_counter),
+            "stage_latency_ms": stage_latency_ms,
+            "ai_budget_usage": {
+                "total_ai_calls": sum(ai_budget_usage_by_stage.values()),
+                "by_stage": ai_budget_usage_by_stage,
+            },
+            "runtime_guardrails": {
+                "stage_budget_exhausted": stage_budget_exhausted,
+                "preserve_evaluation_logs": bool(run.preserve_evaluation_logs),
+            },
+            "latency_per_accepted_card_ms": latency_per_accepted_card_ms,
             "sentence_source_stats": {
                 "attempted": sentence_attempts,
                 "tatoeba_hits": sentence_tatoeba_hits,
@@ -3710,9 +3822,9 @@ class DeckBuilder:
             self._cleanup_audio_files(media_files, audio_dir)
         self._cleanup_generated_directory(run.cache_path)
         self._cleanup_generated_directory("ankideck_generator/data/progress")
-        if self._last_run_log_path:
+        if self._last_run_log_path and not bool(run.preserve_evaluation_logs):
             self._cleanup_generated_directory(Path(self._last_run_log_path).parent)
-            self._last_run_log_path = None
+        self._last_run_log_path = None
 
     def _cleanup_generated_directory(self, target: str | Path) -> None:
         path = Path(target)
