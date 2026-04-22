@@ -1,8 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+import unicodedata
 
 from ..utils.definition_tools import definition_has_pos
 from ..utils.language_tools import (
@@ -13,7 +14,7 @@ from ..utils.language_tools import (
     valid_focus_characters,
     valid_sentence_characters,
 )
-from .models import CardData
+from .models import CardData, DuplicateDecisionEvidence
 
 IPA_RE = re.compile(r"^/[^/]+/(?:\s*\([^()]+\))?$")
 CLAUSE_PUNCTUATION = {";", ":"}
@@ -28,13 +29,45 @@ ARTIFICIAL_SENTENCE_PATTERNS = [
     re.compile(r"\bэто\s+слово\b", re.IGNORECASE),
     re.compile(r"\bв\s+этом\s+примере\b", re.IGNORECASE),
 ]
-NEAR_DUPLICATE_SENTENCE_THRESHOLD = 0.85
+DUPLICATE_SHORTLIST_LIMIT = 12
+NEAR_DUPLICATE_SENTENCE_THRESHOLD = 0.90
+_DUPLICATE_PUNCTUATION_RE = re.compile(r"[^\w\s]", re.UNICODE)
 
 
 @dataclass
 class ValidationContext:
     seen_focus: set[str] = field(default_factory=set)
     seen_sentence: set[str] = field(default_factory=set)
+    accepted_sentences_by_focus: dict[str, list[str]] = field(default_factory=dict)
+    accepted_sentence_buckets: dict[str, str] = field(default_factory=dict)
+    last_duplicate_evidence: DuplicateDecisionEvidence | None = None
+
+
+def normalize_duplicate_focus(value: str) -> str:
+    return _normalize_duplicate_text(value)
+
+
+def normalize_duplicate_sentence(sentence: str) -> str:
+    return _normalize_duplicate_text(sentence)
+
+
+def remember_accepted_card(ctx: ValidationContext, focus: str, sentence: str) -> None:
+    focus_key = normalize_duplicate_focus(focus)
+    sentence_key = normalize_duplicate_sentence(sentence)
+
+    if focus_key:
+        ctx.seen_focus.add(focus_key)
+    if sentence_key:
+        ctx.seen_sentence.add(sentence_key)
+
+    if not focus_key or not sentence_key:
+        return
+
+    bucket_key = _duplicate_bucket_key(focus_key, sentence_key)
+    ctx.accepted_sentence_buckets.setdefault(bucket_key, sentence)
+    focus_bucket = ctx.accepted_sentences_by_focus.setdefault(focus_key, [])
+    if sentence not in focus_bucket:
+        focus_bucket.append(sentence)
 
 
 def validate_card(
@@ -45,6 +78,7 @@ def validate_card(
     commit: bool = True,
 ) -> list[str]:
     errors: list[str] = []
+    ctx.last_duplicate_evidence = None
 
     if validations.get("spellings_required"):
         if not card.spellings:
@@ -91,25 +125,14 @@ def validate_card(
             errors.append("translation_missing")
 
     if validations.get("no_duplicate_focus"):
-        if card.focus.lower() in ctx.seen_focus:
+        if normalize_duplicate_focus(card.focus) in ctx.seen_focus:
             errors.append("duplicate_focus")
 
     if validations.get("no_duplicate_sentences"):
-        if card.sentence.lower() in ctx.seen_sentence:
-            errors.append("duplicate_sentence")
-        else:
-            candidate_sentence = _normalize_sentence_similarity(card.sentence)
-            for seen_sentence in ctx.seen_sentence:
-                if not seen_sentence:
-                    continue
-                ratio = SequenceMatcher(
-                    None,
-                    candidate_sentence,
-                    _normalize_sentence_similarity(seen_sentence),
-                ).ratio()
-                if ratio >= NEAR_DUPLICATE_SENTENCE_THRESHOLD:
-                    errors.append("duplicate_sentence")
-                    break
+        duplicate_error, duplicate_evidence = _duplicate_sentence_error(card, ctx)
+        if duplicate_error:
+            errors.append(duplicate_error)
+            ctx.last_duplicate_evidence = duplicate_evidence
 
     if validations.get("focus_in_sentence"):
         if not text_contains_focus(card.sentence, card.focus):
@@ -218,8 +241,7 @@ def validate_card(
                 errors.append("sentence_too_easy_for_level3")
 
     if not errors and commit:
-        ctx.seen_focus.add(card.focus.lower())
-        ctx.seen_sentence.add(card.sentence.lower())
+        remember_accepted_card(ctx, card.focus, card.sentence)
 
     return errors
 
@@ -249,5 +271,85 @@ def _sentence_profile_error(
     return None
 
 
-def _normalize_sentence_similarity(sentence: str) -> str:
-    return re.sub(r"\s+", " ", (sentence or "").strip().lower())
+def _duplicate_sentence_error(
+    card: CardData,
+    ctx: ValidationContext,
+) -> tuple[str | None, DuplicateDecisionEvidence | None]:
+    focus_key = normalize_duplicate_focus(card.focus)
+    sentence_key = normalize_duplicate_sentence(card.sentence)
+    if not focus_key or not sentence_key:
+        return None, None
+
+    bucket_key = _duplicate_bucket_key(focus_key, sentence_key)
+    matched_sentence = ctx.accepted_sentence_buckets.get(bucket_key)
+    if matched_sentence is not None:
+        return "duplicate_sentence_exact", DuplicateDecisionEvidence(
+            kind="exact",
+            focus=card.focus,
+            candidate_sentence=card.sentence,
+            matched_sentence=matched_sentence,
+            normalized_sentence=sentence_key,
+            bucket_key=bucket_key,
+            similarity=1.0,
+        )
+
+    for shortlisted_sentence in _shortlist_duplicate_sentences(
+        sentence_key,
+        ctx.accepted_sentences_by_focus.get(focus_key, []),
+    ):
+        normalized_seen = normalize_duplicate_sentence(shortlisted_sentence)
+        ratio = SequenceMatcher(None, sentence_key, normalized_seen).ratio()
+        if ratio >= NEAR_DUPLICATE_SENTENCE_THRESHOLD:
+            return "duplicate_sentence_near", DuplicateDecisionEvidence(
+                kind="near",
+                focus=card.focus,
+                candidate_sentence=card.sentence,
+                matched_sentence=shortlisted_sentence,
+                normalized_sentence=sentence_key,
+                bucket_key=_duplicate_bucket_key(focus_key, normalized_seen),
+                similarity=round(ratio, 4),
+            )
+
+    return None, None
+
+
+def _shortlist_duplicate_sentences(
+    candidate_sentence: str,
+    sentences: list[str],
+    *,
+    limit: int = DUPLICATE_SHORTLIST_LIMIT,
+) -> list[str]:
+    candidate_tokens = _duplicate_tokens(candidate_sentence)
+    ranked: list[tuple[float, str]] = []
+    for sentence in sentences:
+        normalized_sentence = normalize_duplicate_sentence(sentence)
+        if not normalized_sentence or normalized_sentence == candidate_sentence:
+            continue
+        overlap = _token_overlap(candidate_tokens, _duplicate_tokens(normalized_sentence))
+        if overlap <= 0.0:
+            continue
+        ranked.append((overlap, sentence))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [sentence for _score, sentence in ranked[:limit]]
+
+
+def _token_overlap(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(len(left), len(right))
+
+
+def _duplicate_tokens(value: str) -> set[str]:
+    return {token for token in value.split() if token}
+
+
+def _duplicate_bucket_key(focus: str, sentence: str) -> str:
+    return f"{focus}::{sentence}"
+
+
+def _normalize_duplicate_text(value: str) -> str:
+    text = unicodedata.normalize("NFKC", value or "")
+    text = text.lower()
+    text = _DUPLICATE_PUNCTUATION_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()

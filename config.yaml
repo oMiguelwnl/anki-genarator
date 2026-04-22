@@ -212,7 +212,8 @@ runtime:
         - word_audio_missing
         - sentence_audio_missing
         - duplicate_focus
-        - duplicate_sentence
+        - duplicate_sentence_exact
+        - duplicate_sentence_near
         - function_word
         - focus_not_in_lexicon
         - definition_too_similar_translation
@@ -234,7 +235,8 @@ runtime:
         - invalid_focus_characters
         - invalid_sentence_characters
         - duplicate_focus
-        - duplicate_sentence
+        - duplicate_sentence_exact
+        - duplicate_sentence_near
         - ipa_missing
         - invalid_ipa
       soft:

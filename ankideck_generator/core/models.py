@@ -238,6 +238,16 @@ class ProgressState(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
+class DuplicateDecisionEvidence(BaseModel):
+    kind: Literal["exact", "near"]
+    focus: str
+    candidate_sentence: str
+    matched_sentence: str
+    normalized_sentence: str
+    bucket_key: str
+    similarity: float
+
+
 class LogRecord(BaseModel):
     focus: str
     level: int
@@ -256,6 +266,7 @@ class LogRecord(BaseModel):
     candidate_preview: dict[str, list[str]] = Field(default_factory=dict)
     quality_scores: dict[str, float] = Field(default_factory=dict)
     selection_reasons: dict[str, str] = Field(default_factory=dict)
+    duplicate_evidence: DuplicateDecisionEvidence | None = None
     status: str
     discard_reason: str | None = None
     error: str | None = None

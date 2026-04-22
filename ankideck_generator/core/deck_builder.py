@@ -43,6 +43,7 @@ from .models import (
     ANKI_FIELD_ORDER_DEFAULT,
     CardData,
     CompatibilityFingerprint,
+    DuplicateDecisionEvidence,
     LexicalReviewRequest,
     LogRecord,
     ProgressState,
@@ -63,7 +64,13 @@ from .sentence_generation import (
     SENTENCE_GENERATION_POLICY_VERSION,
     SentenceGenerationService,
 )
-from .validators import ValidationContext, validate_card
+from .validators import (
+    ValidationContext,
+    normalize_duplicate_focus,
+    normalize_duplicate_sentence,
+    remember_accepted_card,
+    validate_card,
+)
 
 try:
     from wordfreq import top_n_list, zipf_frequency
@@ -127,7 +134,8 @@ DEFAULT_HARD_VALIDATION_ERRORS = {
     "invalid_focus_characters",
     "invalid_sentence_characters",
     "duplicate_focus",
-    "duplicate_sentence",
+    "duplicate_sentence_exact",
+    "duplicate_sentence_near",
     "ipa_missing",
     "invalid_ipa",
 }
@@ -474,8 +482,10 @@ class DeckBuilder:
             checkpoint_level=state.level if state else 1,
             checkpoint_index=state.index if state else -1,
         )
-        ctx.seen_focus.update(focus.lower() for focus in processed_focus)
-        ctx.seen_sentence.update(sentence.lower() for sentence in processed_sentences)
+        ctx.seen_focus.update(normalize_duplicate_focus(focus) for focus in processed_focus)
+        ctx.seen_sentence.update(
+            normalize_duplicate_sentence(sentence) for sentence in processed_sentences
+        )
 
         parallel_enabled = (
             not run.interactive
@@ -688,7 +698,7 @@ class DeckBuilder:
         text_workers = max(1, int(run.concurrency))
         audio_workers = max(1, int(run.audio_concurrency))
         reserved_focus: set[str] = set()
-        reserved_sentences: set[str] = set()
+        reserved_cards: list[tuple[str, str]] = []
         word_cursor = start_index
         submit_index = start_index
         next_consume = start_index
@@ -810,22 +820,24 @@ class DeckBuilder:
                             )
                             continue
 
-                        text_errors = unique_keep_order(
-                            log_record.validations
-                            + self._validate_text_candidate(
-                                card,
-                                ctx,
-                                run,
-                                reserved_focus,
-                                reserved_sentences,
-                            )
+                        validation_errors, duplicate_evidence = self._validate_text_candidate(
+                            card,
+                            ctx,
+                            run,
+                            reserved_focus,
+                            reserved_cards,
                         )
+                        text_errors = unique_keep_order(
+                            log_record.validations + validation_errors
+                        )
+                        log_record.duplicate_evidence = duplicate_evidence
                         if self._should_reject_errors(text_errors, run):
                             log_record.validations = text_errors
                             log_record.status = "discarded"
                             log_record.discard_reason = _infer_discard_reason(
                                 text_errors, log_record.provider_errors
                             )
+                            self._ensure_snapshot_fields(log_record, card)
                             self._finalize_card_decision(
                                 logger=logger,
                                 stats=stats,
@@ -846,8 +858,8 @@ class DeckBuilder:
 
                         log_record.validations = text_errors
                         log_record.lifecycle_state = "reviewed"
-                        reserved_focus.add(card.focus.lower())
-                        reserved_sentences.add(card.sentence.lower())
+                        reserved_focus.add(normalize_duplicate_focus(card.focus))
+                        reserved_cards.append((card.focus, card.sentence))
                         future = audio_executor.submit(
                             self._attach_audio_task,
                             accepted_index,
@@ -865,8 +877,11 @@ class DeckBuilder:
                         next_audio_commit += 1
                         card = audio_result.card
                         log_record = audio_result.log_record
-                        reserved_focus.discard(card.focus.lower())
-                        reserved_sentences.discard(card.sentence.lower())
+                        reserved_focus.discard(normalize_duplicate_focus(card.focus))
+                        try:
+                            reserved_cards.remove((card.focus, card.sentence))
+                        except ValueError:
+                            pass
 
                         final_errors = unique_keep_order(
                             log_record.validations + self._audio_validation_errors(card, run)
@@ -877,6 +892,7 @@ class DeckBuilder:
                             log_record.discard_reason = _infer_discard_reason(
                                 final_errors, log_record.provider_errors
                             )
+                            self._ensure_snapshot_fields(log_record, card)
                             self._finalize_card_decision(
                                 logger=logger,
                                 stats=stats,
@@ -959,8 +975,7 @@ class DeckBuilder:
             processed_focus.add(card.focus)
             processed_sentences.add(card.sentence)
             if ctx is not None:
-                ctx.seen_focus.add(card.focus.lower())
-                ctx.seen_sentence.add(card.sentence.lower())
+                remember_accepted_card(ctx, card.focus, card.sentence)
             stats.accepted_by_level[level] += 1
             log_record.lifecycle_state = "accepted"
             log_record.after = log_record.after or card.model_dump()
@@ -1027,32 +1042,7 @@ class DeckBuilder:
             stats.corrected_accepted_count += 1
         if log_record.lifecycle_state == "rejected":
             stats.needs_review_items.append(
-                {
-                    "focus": log_record.focus,
-                    "level": level,
-                    "status": log_record.status,
-                    "lifecycle_state": log_record.lifecycle_state,
-                    "discard_reason": log_record.discard_reason,
-                    "reason_codes": list(log_record.reason_codes or []),
-                    "before": dict(log_record.before or {}),
-                    "after": dict(log_record.after or {}),
-                    "provider": log_record.provider,
-                    "model": log_record.model,
-                    "providers": dict(log_record.providers or {}),
-                    "provider_errors": dict(log_record.provider_errors or {}),
-                    "event_counts": dict(log_record.event_counts or {}),
-                    "stage_timings": dict(log_record.stage_timings or {}),
-                    "review_notes": list(log_record.review_notes or []),
-                    "validations": list(log_record.validations or []),
-                    "definition_candidates": list(
-                        (log_record.candidate_preview or {}).get("definitions", [])
-                    ),
-                    "source_definition_candidates": list(
-                        (log_record.candidate_preview or {}).get("source_definitions", [])
-                    ),
-                    "quality_scores": dict(log_record.quality_scores or {}),
-                    "selection_reasons": dict(log_record.selection_reasons or {}),
-                }
+                self._review_queue_item(log_record, level=level)
             )
         for stage_name, elapsed_ms in (log_record.stage_timings or {}).items():
             stats.stage_counter[stage_name] += int(elapsed_ms or 0)
@@ -1431,10 +1421,10 @@ class DeckBuilder:
             log_record.discard_reason = _infer_discard_reason(
                 final_errors, log_record.provider_errors
             )
+            self._ensure_snapshot_fields(log_record, card)
             return None, log_record
 
-        ctx.seen_focus.add(card.focus.lower())
-        ctx.seen_sentence.add(card.sentence.lower())
+        remember_accepted_card(ctx, card.focus, card.sentence)
         card.lifecycle_state = "accepted"
         log_record.status = "accepted"
         log_record.lifecycle_state = "accepted"
@@ -1529,6 +1519,76 @@ class DeckBuilder:
         log_record.before = merged_before
         log_record.after = merged_after
 
+    def _ensure_snapshot_fields(self, log_record: LogRecord, card: CardData) -> None:
+        merged_after = dict(log_record.after or {})
+        for field_name, value in self._review_snapshot(card).items():
+            merged_after.setdefault(field_name, value)
+        log_record.after = merged_after
+
+    def _decision_source(self, log_record: LogRecord) -> dict[str, str | None]:
+        if log_record.duplicate_evidence is not None:
+            return {
+                "stage": "duplicate_guard",
+                "provider": "duplicate_guard",
+                "model": "sequence_matcher@0.90",
+            }
+        stage = "review" if (log_record.provider or log_record.model) else "validation"
+        provider = log_record.provider or ("validation" if stage == "validation" else "review")
+        return {
+            "stage": stage,
+            "provider": provider,
+            "model": log_record.model,
+        }
+
+    def _review_queue_item(self, log_record: LogRecord, *, level: int) -> dict[str, object]:
+        before = dict(log_record.before or {})
+        after = dict(log_record.after or {})
+        card_snapshot = {
+            "focus": after.get("focus") or before.get("focus") or log_record.focus,
+            "sentence": after.get("sentence") or before.get("sentence") or "",
+            "definition": after.get("definition") or before.get("definition") or "",
+            "translation": after.get("translation") or before.get("translation") or "",
+            "source_definition": after.get("source_definition") or before.get("source_definition") or "",
+            "ipa": after.get("ipa") or before.get("ipa") or "",
+        }
+        return {
+            "focus": log_record.focus,
+            "level": level,
+            "status": log_record.status,
+            "lifecycle_state": log_record.lifecycle_state,
+            "discard_reason": log_record.discard_reason,
+            "reason_codes": list(log_record.reason_codes or []),
+            "before": before,
+            "after": after,
+            "provider": log_record.provider,
+            "model": log_record.model,
+            "providers": dict(log_record.providers or {}),
+            "provider_errors": dict(log_record.provider_errors or {}),
+            "event_counts": dict(log_record.event_counts or {}),
+            "stage_timings": dict(log_record.stage_timings or {}),
+            "review_notes": list(log_record.review_notes or []),
+            "validations": list(log_record.validations or []),
+            "definition_candidates": list(
+                (log_record.candidate_preview or {}).get("definitions", [])
+            ),
+            "source_definition_candidates": list(
+                (log_record.candidate_preview or {}).get("source_definitions", [])
+            ),
+            "quality_scores": dict(log_record.quality_scores or {}),
+            "selection_reasons": dict(log_record.selection_reasons or {}),
+            "card_snapshot": card_snapshot,
+            "changed_fields": sorted(after.keys()),
+            "hard_validation_errors": list(log_record.validations or []),
+            "review_flags": list(log_record.review_notes or []),
+            "duplicate_evidence": (
+                log_record.duplicate_evidence.model_dump()
+                if log_record.duplicate_evidence is not None
+                else None
+            ),
+            "field_providers": dict(log_record.providers or {}),
+            "decision_source": self._decision_source(log_record),
+        }
+
     def _revalidate_card_before_acceptance(
         self,
         *,
@@ -1537,18 +1597,17 @@ class DeckBuilder:
         ctx: ValidationContext,
         run: RunConfig,
         reserved_focus: set[str] | None = None,
-        reserved_sentences: set[str] | None = None,
+        reserved_cards: list[tuple[str, str]] | None = None,
     ) -> tuple[CardData | None, LogRecord]:
-        text_errors = unique_keep_order(
-            log_record.validations
-            + self._validate_text_candidate(
-                card,
-                ctx,
-                run,
-                reserved_focus,
-                reserved_sentences,
-            )
+        validation_errors, duplicate_evidence = self._validate_text_candidate(
+            card,
+            ctx,
+            run,
+            reserved_focus,
+            reserved_cards,
         )
+        text_errors = unique_keep_order(log_record.validations + validation_errors)
+        log_record.duplicate_evidence = duplicate_evidence
         log_record.validations = text_errors
         if self._should_reject_errors(text_errors, run):
             log_record.status = "discarded"
@@ -1556,6 +1615,7 @@ class DeckBuilder:
             log_record.discard_reason = _infer_discard_reason(
                 text_errors, log_record.provider_errors
             )
+            self._ensure_snapshot_fields(log_record, card)
             for reason_code in text_errors:
                 if reason_code not in log_record.reason_codes:
                     log_record.reason_codes.append(reason_code)
@@ -2894,6 +2954,7 @@ class DeckBuilder:
                 selection_reasons=dict(selection_reasons),
             )
         )
+        providers_used.setdefault("lexical_review", "ai")
         review_reason_codes = unique_keep_order(list(lexical_review.reason_codes or []))
         selection_reasons.update(dict(lexical_review.selection_reasons or {}))
         if lexical_review.winning_sense and not selection_reasons.get("winning_sense"):
@@ -2936,6 +2997,12 @@ class DeckBuilder:
                     "losing_sense_candidates",
                     list(lexical_review.losing_sense_candidates),
                 )
+            review_after.setdefault("focus", word)
+            review_after.setdefault("sentence", sentence)
+            review_after.setdefault("definition", definition)
+            review_after.setdefault("translation", translation)
+            review_after.setdefault("source_definition", source_definition)
+            review_after.setdefault("ipa", "")
             return None, LogRecord(
                 focus=word,
                 level=level,
@@ -2949,6 +3016,7 @@ class DeckBuilder:
                 reason_codes=review_reason_codes,
                 before=review_before,
                 after=review_after,
+                provider=providers_used.get("lexical_review"),
                 candidate_preview=candidate_preview,
                 quality_scores=quality_scores,
                 selection_reasons=selection_reasons,
@@ -3218,23 +3286,29 @@ class DeckBuilder:
         ctx: ValidationContext,
         run: RunConfig,
         reserved_focus: set[str] | None = None,
-        reserved_sentences: set[str] | None = None,
-    ) -> list[str]:
+        reserved_cards: list[tuple[str, str]] | None = None,
+    ) -> tuple[list[str], DuplicateDecisionEvidence | None]:
         temp_ctx = ValidationContext(
             seen_focus=set(ctx.seen_focus),
             seen_sentence=set(ctx.seen_sentence),
+            accepted_sentences_by_focus={
+                focus: list(sentences)
+                for focus, sentences in ctx.accepted_sentences_by_focus.items()
+            },
+            accepted_sentence_buckets=dict(ctx.accepted_sentence_buckets),
         )
         if reserved_focus:
             temp_ctx.seen_focus.update(reserved_focus)
-        if reserved_sentences:
-            temp_ctx.seen_sentence.update(reserved_sentences)
+        if reserved_cards:
+            for focus, sentence in reserved_cards:
+                remember_accepted_card(temp_ctx, focus, sentence)
         validations = _validations_for_language(
             run.language,
             audio_required=False,
             strict_quality=bool(run.strict_quality),
             level_validation_mode=run.level_validation_mode,
         )
-        return validate_card(card, temp_ctx, validations, commit=False)
+        return validate_card(card, temp_ctx, validations, commit=False), temp_ctx.last_duplicate_evidence
 
     def _audio_validation_errors(self, card: CardData, run: RunConfig) -> list[str]:
         if not run.generate_audio:
@@ -3438,6 +3512,47 @@ class DeckBuilder:
             average_definition_score = (
                 stats.definition_score_total / stats.definition_score_samples
             )
+        total_attempted = sum(stats.attempted_by_level.values())
+        accepted_cards = len(stats.cards)
+        clean_accepts = max(accepted_cards - stats.corrected_accepted_count, 0)
+
+        duplicate_exact_by_level: Counter[int] = Counter()
+        duplicate_near_by_level: Counter[int] = Counter()
+        reason_code_counter: Counter[str] = Counter()
+        hard_validation_counter: Counter[str] = Counter()
+        review_flag_counter: Counter[str] = Counter()
+
+        for item in stats.needs_review_items:
+            level = int(item.get("level") or 0)
+            reason_codes = list(item.get("reason_codes") or [])
+            hard_validation_errors = list(
+                item.get("hard_validation_errors") or item.get("validations") or []
+            )
+            review_flags = list(item.get("review_flags") or item.get("review_notes") or [])
+
+            reason_code_counter.update(reason_codes)
+            hard_validation_counter.update(hard_validation_errors)
+            review_flag_counter.update(review_flags)
+
+            if "duplicate_sentence_exact" in reason_codes or "duplicate_sentence_exact" in hard_validation_errors:
+                duplicate_exact_by_level[level] += 1
+            if "duplicate_sentence_near" in reason_codes or "duplicate_sentence_near" in hard_validation_errors:
+                duplicate_near_by_level[level] += 1
+
+        exact_rejects = sum(duplicate_exact_by_level.values())
+        near_rejects = sum(duplicate_near_by_level.values())
+        duplicate_total = exact_rejects + near_rejects
+        accepted_card_rate = round(accepted_cards / total_attempted, 4) if total_attempted else 0.0
+        duplicate_reject_rate = round(duplicate_total / total_attempted, 4) if total_attempted else 0.0
+        duplicate_levels = {
+            str(level): {
+                "exact": duplicate_exact_by_level.get(level, 0),
+                "near": duplicate_near_by_level.get(level, 0),
+                "total": duplicate_exact_by_level.get(level, 0)
+                + duplicate_near_by_level.get(level, 0),
+            }
+            for level in sorted(set(duplicate_exact_by_level) | set(duplicate_near_by_level))
+        }
         sentence_attempts = stats.event_counter.get("sentence_tatoeba_attempted", 0)
         sentence_tatoeba_hits = stats.event_counter.get("sentence_tatoeba_hit", 0)
         sentence_tatoeba_seeded_hits = stats.event_counter.get("sentence_tatoeba_seeded_hit", 0)
@@ -3456,10 +3571,35 @@ class DeckBuilder:
             "definition_sources": dict(stats.definition_source_counter),
             "ambiguous_focuses": dict(stats.ambiguous_focus_counter.most_common(20)),
             "needs_review": len(stats.needs_review_items),
+            "accepted_card_rate": accepted_card_rate,
+            "duplicate_reject_rate": duplicate_reject_rate,
             "accepted_with_corrections": stats.corrected_accepted_count,
             "definition_score": {
                 "average": round(average_definition_score, 4),
                 "samples": stats.definition_score_samples,
+            },
+            "acceptance_quality": {
+                "accepted_cards": accepted_cards,
+                "accepted_card_rate": accepted_card_rate,
+                "clean_accepts": clean_accepts,
+                "corrected_accepts": stats.corrected_accepted_count,
+            },
+            "duplicate_diagnostics": {
+                "overall": {
+                    "exact": exact_rejects,
+                    "near": near_rejects,
+                    "total": duplicate_total,
+                },
+                "by_level": duplicate_levels,
+                "exact_rejects": exact_rejects,
+                "near_rejects": near_rejects,
+                "duplicate_reject_rate": duplicate_reject_rate,
+            },
+            "review_diagnostics": {
+                "queue_items": len(stats.needs_review_items),
+                "top_reason_codes": dict(reason_code_counter.most_common(10)),
+                "hard_validation_errors": dict(hard_validation_counter.most_common(10)),
+                "review_flags": dict(review_flag_counter.most_common(10)),
             },
             "provider_counter": dict(stats.provider_counter),
             "provider_success_counter": dict(stats.provider_success_counter),
@@ -3747,6 +3887,12 @@ def _infer_discard_reason(
         return "focus_not_in_lexicon"
     if "function_word" in error_set:
         return "function_word"
+    if {
+        "duplicate_focus",
+        "duplicate_sentence_exact",
+        "duplicate_sentence_near",
+    }.intersection(error_set):
+        return "duplicate_rejected"
     if "definition_missing" in error_set:
         return "definition_generation_failed"
     if "definition_missing_pos" in error_set:

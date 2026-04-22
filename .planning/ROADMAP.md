@@ -75,9 +75,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 04-01: Build normalized duplicate signatures and shortlist-based fuzzy comparison.
-- [ ] 04-02: Integrate structured review queue, quality report taxonomy, and provenance fields.
-- [ ] 04-03: Add acceptance-rate and duplicate-rate reporting on accepted-card outputs.
+- [ ] 04-01-PLAN.md — Build normalized duplicate signatures, exact/near reason codes, and accepted-card-only shortlist guards.
+- [ ] 04-02-PLAN.md — Integrate audit-ready review queue artifacts with duplicate evidence and decisive-source provenance.
+- [ ] 04-03-PLAN.md — Publish acceptance/duplicate diagnostics in quality_report.json while preserving export compatibility.
 
 ### Phase 5: Evaluation and Runtime Controls
 **Goal**: Add reproducible evaluation, acceptance thresholds, and operational guardrails so the milestone can prove quality gains above the current baseline without runaway cost or latency.

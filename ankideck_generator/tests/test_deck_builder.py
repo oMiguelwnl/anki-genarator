@@ -15,6 +15,7 @@ from ankideck_generator.core.deck_builder import (
 )
 from ankideck_generator.core.models import (
     CardData,
+    DuplicateDecisionEvidence,
     LexicalReviewResult,
     LogRecord,
     ProgressState,
@@ -784,6 +785,125 @@ def test_interactive_edit_valid_correction_generates_audio_after_acceptance(
     assert log.lifecycle_state == "accepted"
     assert card.word_audio == "[sound:banco.mp3]"
     assert call_order == ["interactive", "audio"]
+
+
+def test_process_word_rejects_duplicate_candidate_against_accepted_cards_only(
+    monkeypatch, tmp_path: Path
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path, language="en")
+    run.mode = "full"
+    ctx = ValidationContext()
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    candidate_cards = iter(
+        [
+            CardData(
+                focus="house",
+                index=1,
+                ipa="/haʊs/",
+                definition="",
+                sentence="I see the bright old house today.",
+                translation="I see the bright old house today.",
+                translation_language="en",
+                level=1,
+                language="en",
+                lifecycle_state="generated",
+            ),
+            CardData(
+                focus="house",
+                index=1,
+                ipa="/haʊs/",
+                definition="noun: a building for people to live in.",
+                sentence="I see the bright old house today.",
+                translation="I see the bright old house today.",
+                translation_language="en",
+                level=1,
+                language="en",
+                lifecycle_state="generated",
+            ),
+            CardData(
+                focus="house",
+                index=1,
+                ipa="/haʊs/",
+                definition="noun: a building for people to live in.",
+                sentence="I see the bright old house today!",
+                translation="I see the bright old house today.",
+                translation_language="en",
+                level=1,
+                language="en",
+                lifecycle_state="generated",
+            ),
+        ]
+    )
+
+    def fake_process_word_textual(**_kwargs):
+        card = next(candidate_cards)
+        return card, LogRecord(
+            focus=card.focus,
+            level=card.level,
+            lifecycle_state="generated",
+            status="candidate",
+        )
+
+    monkeypatch.setattr(builder, "_process_word_textual", fake_process_word_textual)
+    monkeypatch.setattr(
+        builder,
+        "_attach_audio_to_card",
+        lambda **kwargs: (kwargs["card"], kwargs["log_record"], []),
+    )
+
+    first_card, first_log = builder._process_word(
+        word="house",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=object(),
+        ctx=ctx,
+        media_files=[],
+    )
+    second_card, second_log = builder._process_word(
+        word="house",
+        level=1,
+        index=2,
+        run=run,
+        cache=FakeCache(),
+        providers=object(),
+        ctx=ctx,
+        media_files=[],
+    )
+    third_card, third_log = builder._process_word(
+        word="house",
+        level=1,
+        index=3,
+        run=run,
+        cache=FakeCache(),
+        providers=object(),
+        ctx=ctx,
+        media_files=[],
+    )
+
+    assert first_card is None
+    assert first_log.lifecycle_state == "rejected"
+    assert "definition_missing" in first_log.validations
+
+    assert second_card is not None
+    assert second_log.lifecycle_state == "accepted"
+
+    assert third_card is None
+    assert third_log.lifecycle_state == "rejected"
+    assert "duplicate_sentence_exact" in third_log.validations
+    assert "duplicate_sentence_exact" in third_log.reason_codes
+    assert third_log.duplicate_evidence is not None
+    assert third_log.duplicate_evidence.kind == "exact"
 
 
 def test_build_assigns_sequential_sortindex(monkeypatch, tmp_path: Path) -> None:
@@ -3253,3 +3373,264 @@ def test_write_quality_outputs_only_rejected_cards_enter_review_queue(tmp_path: 
     assert "provider_error_counter" in report
     assert [item["focus"] for item in review_queue] == ["mal"]
     assert review_queue[0]["reason_codes"] == ["definition_missing"]
+
+
+def test_write_quality_outputs_duplicate_review_queue_artifact_shape(
+    tmp_path: Path,
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.review_queue_path = str(tmp_path / "output" / "review_queue.json")
+    run.quality_report_path = str(tmp_path / "output" / "quality_report.json")
+
+    stats = BuildStats()
+    logger = deck_builder_module.JsonLogger(tmp_path / "run.jsonl")
+
+    builder._record_log(
+        logger,
+        stats,
+        LogRecord(
+            focus="house",
+            level=1,
+            status="discarded",
+            lifecycle_state="rejected",
+            discard_reason="duplicate_rejected",
+            reason_codes=["duplicate_sentence_near"],
+            validations=["duplicate_sentence_near"],
+            review_notes=["definition_low_translation_alignment"],
+            providers={"definition": "googletrans", "translation": "googletrans"},
+            after={
+                "focus": "house",
+                "sentence": "I see the bright old house today again.",
+                "definition": "noun: a building for people to live in.",
+                "translation": "I see the bright old house today again.",
+                "source_definition": "noun: house.",
+                "ipa": "/haʊs/",
+            },
+            duplicate_evidence=DuplicateDecisionEvidence(
+                kind="near",
+                focus="house",
+                candidate_sentence="I see the bright old house today again.",
+                matched_sentence="I see the bright old house today.",
+                normalized_sentence="i see the bright old house today again",
+                bucket_key="house::i see the bright old house today",
+                similarity=0.95,
+            ),
+        ),
+    )
+
+    builder._write_quality_outputs(run, stats)
+
+    review_queue = json.loads(Path(run.review_queue_path).read_text(encoding="utf-8"))
+    item = review_queue[0]
+
+    assert item["card_snapshot"] == {
+        "focus": "house",
+        "sentence": "I see the bright old house today again.",
+        "definition": "noun: a building for people to live in.",
+        "translation": "I see the bright old house today again.",
+        "source_definition": "noun: house.",
+        "ipa": "/haʊs/",
+    }
+    assert item["changed_fields"] == [
+        "definition",
+        "focus",
+        "ipa",
+        "sentence",
+        "source_definition",
+        "translation",
+    ]
+    assert item["hard_validation_errors"] == ["duplicate_sentence_near"]
+    assert item["review_flags"] == ["definition_low_translation_alignment"]
+    assert item["duplicate_evidence"]["kind"] == "near"
+    assert item["duplicate_evidence"]["matched_sentence"] == "I see the bright old house today."
+    assert item["field_providers"] == {
+        "definition": "googletrans",
+        "translation": "googletrans",
+    }
+    assert item["decision_source"] == {
+        "stage": "duplicate_guard",
+        "provider": "duplicate_guard",
+        "model": "sequence_matcher@0.90",
+    }
+
+
+def test_review_queue_preserves_decision_source_and_field_providers(
+    tmp_path: Path,
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    stats = BuildStats()
+    logger = deck_builder_module.JsonLogger(tmp_path / "run.jsonl")
+
+    builder._record_log(
+        logger,
+        stats,
+        LogRecord(
+            focus="banco",
+            level=1,
+            status="discarded",
+            lifecycle_state="rejected",
+            discard_reason="lexical_review_rejected",
+            reason_codes=["lexical_review_unresolved_ambiguity"],
+            validations=[],
+            review_notes=["lexical_review_rejected"],
+            providers={
+                "definition": "wiktionary",
+                "translation": "googletrans",
+                "lexical_review": "ai",
+            },
+            provider="ai",
+            model="llama-3.1-8b-instant",
+            after={
+                "focus": "banco",
+                "sentence": "Vi el banco cerca del rio.",
+                "definition": "noun: bank",
+                "translation": "I saw the bank near the river.",
+                "source_definition": "noun: banco.",
+                "ipa": "",
+            },
+        ),
+    )
+
+    item = stats.needs_review_items[0]
+
+    assert item["field_providers"] == {
+        "definition": "wiktionary",
+        "translation": "googletrans",
+        "lexical_review": "ai",
+    }
+    assert item["decision_source"] == {
+        "stage": "review",
+        "provider": "ai",
+        "model": "llama-3.1-8b-instant",
+    }
+    assert item["hard_validation_errors"] == []
+    assert item["review_flags"] == ["lexical_review_rejected"]
+
+
+def test_write_quality_outputs_reports_duplicate_diagnostics_sections(
+    tmp_path: Path,
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.review_queue_path = str(tmp_path / "output" / "review_queue.json")
+    run.quality_report_path = str(tmp_path / "output" / "quality_report.json")
+
+    stats = BuildStats()
+    logger = deck_builder_module.JsonLogger(tmp_path / "run.jsonl")
+    stats.cards.extend(
+        [
+            CardData(
+                focus="home",
+                definition="noun: a place where someone lives.",
+                sentence="Home feels calm tonight.",
+                translation="Home feels calm tonight.",
+                level=1,
+                language="en",
+            ),
+            CardData(
+                focus="house",
+                definition="noun: a building for people to live in.",
+                sentence="The house is bright today.",
+                translation="The house is bright today.",
+                level=1,
+                language="en",
+            ),
+        ]
+    )
+    stats.attempted_by_level[1] = 4
+    stats.accepted_by_level[1] = 2
+
+    builder._record_log(
+        logger,
+        stats,
+        LogRecord(
+            focus="house",
+            level=1,
+            status="accepted",
+            lifecycle_state="accepted",
+            review_notes=["definition_corrected"],
+            before={"definition": "old gloss"},
+            after={"definition": "noun: a building for people to live in."},
+        ),
+    )
+    builder._record_log(
+        logger,
+        stats,
+        LogRecord(
+            focus="house",
+            level=1,
+            status="discarded",
+            lifecycle_state="rejected",
+            discard_reason="duplicate_rejected",
+            reason_codes=["duplicate_sentence_exact"],
+            validations=["duplicate_sentence_exact"],
+            after={"focus": "house", "sentence": "The house is bright today."},
+            duplicate_evidence=DuplicateDecisionEvidence(
+                kind="exact",
+                focus="house",
+                candidate_sentence="The house is bright today.",
+                matched_sentence="The house is bright today.",
+                normalized_sentence="the house is bright today",
+                bucket_key="house::the house is bright today",
+                similarity=1.0,
+            ),
+        ),
+    )
+    builder._record_log(
+        logger,
+        stats,
+        LogRecord(
+            focus="house",
+            level=1,
+            status="discarded",
+            lifecycle_state="rejected",
+            discard_reason="duplicate_rejected",
+            reason_codes=["duplicate_sentence_near"],
+            validations=["duplicate_sentence_near"],
+            review_notes=["definition_low_translation_alignment"],
+            after={"focus": "house", "sentence": "The bright house feels sunny today."},
+            duplicate_evidence=DuplicateDecisionEvidence(
+                kind="near",
+                focus="house",
+                candidate_sentence="The bright house feels sunny today.",
+                matched_sentence="The house is bright today.",
+                normalized_sentence="the bright house feels sunny today",
+                bucket_key="house::the house is bright today",
+                similarity=0.92,
+            ),
+        ),
+    )
+
+    builder._write_quality_outputs(run, stats)
+
+    report = json.loads(Path(run.quality_report_path).read_text(encoding="utf-8"))
+
+    assert report["accepted_card_rate"] == 0.5
+    assert report["duplicate_reject_rate"] == 0.5
+    assert report["accepted_with_corrections"] == 1
+    assert report["acceptance_quality"] == {
+        "accepted_cards": 2,
+        "accepted_card_rate": 0.5,
+        "clean_accepts": 1,
+        "corrected_accepts": 1,
+    }
+    assert report["duplicate_diagnostics"] == {
+        "overall": {"exact": 1, "near": 1, "total": 2},
+        "by_level": {"1": {"exact": 1, "near": 1, "total": 2}},
+        "exact_rejects": 1,
+        "near_rejects": 1,
+        "duplicate_reject_rate": 0.5,
+    }
+    assert report["review_diagnostics"] == {
+        "queue_items": 2,
+        "top_reason_codes": {
+            "duplicate_sentence_exact": 1,
+            "duplicate_sentence_near": 1,
+        },
+        "hard_validation_errors": {
+            "duplicate_sentence_exact": 1,
+            "duplicate_sentence_near": 1,
+        },
+        "review_flags": {"definition_low_translation_alignment": 1},
+    }

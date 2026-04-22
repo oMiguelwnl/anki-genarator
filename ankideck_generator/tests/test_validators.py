@@ -1,5 +1,9 @@
-﻿from ankideck_generator.core.models import CardData
-from ankideck_generator.core.validators import ValidationContext, validate_card
+from ankideck_generator.core.models import CardData
+from ankideck_generator.core.validators import (
+    ValidationContext,
+    remember_accepted_card,
+    validate_card,
+)
 import ankideck_generator.core.validators as validators_module
 
 
@@ -361,14 +365,15 @@ def test_validate_card_rejects_artificial_meta_sentence() -> None:
     assert "sentence_profile_invalid" in errors
 
 
-def test_validate_card_rejects_near_duplicate_sentence() -> None:
+def test_validate_card_rejects_exact_duplicate_sentence() -> None:
     card = CardData(
         focus="house",
         sentence="I see the bright old house today!",
         level=1,
         language="en",
     )
-    ctx = ValidationContext(seen_sentence={"i see the bright old house today."})
+    ctx = ValidationContext()
+    remember_accepted_card(ctx, "house", "I see the bright old house today.")
     errors = validate_card(card, ctx, {
         "definition_required": False,
         "ipa_required": False,
@@ -385,6 +390,90 @@ def test_validate_card_rejects_near_duplicate_sentence() -> None:
         "sentence_profile": {1: {"max_commas": 0, "forbid_clause_punctuation": True}},
         "sentence_difficulty_matches_level": False,
     })
-    assert "duplicate_sentence" in errors
+    assert "duplicate_sentence_exact" in errors
+    assert ctx.last_duplicate_evidence is not None
+    assert ctx.last_duplicate_evidence.kind == "exact"
+
+
+def test_validate_card_rejects_near_duplicate_sentence() -> None:
+    card = CardData(
+        focus="house",
+        sentence="I see the bright old house today again.",
+        level=1,
+        language="en",
+    )
+    ctx = ValidationContext()
+    remember_accepted_card(ctx, "house", "I see the bright old house today.")
+    errors = validate_card(card, ctx, {
+        "definition_required": False,
+        "ipa_required": False,
+        "translation_required": False,
+        "focus_in_sentence": True,
+        "sentence_matches_language": False,
+        "no_duplicate_focus": False,
+        "no_duplicate_sentences": True,
+        "valid_characters": True,
+        "ipa_format": False,
+        "audio_generated": False,
+        "definition_not_literal_translation": False,
+        "sentence_length": {1: (5, 12)},
+        "sentence_profile": {1: {"max_commas": 0, "forbid_clause_punctuation": True}},
+        "sentence_difficulty_matches_level": False,
+    })
+    assert "duplicate_sentence_near" in errors
+    assert ctx.last_duplicate_evidence is not None
+    assert ctx.last_duplicate_evidence.kind == "near"
+
+
+def test_validate_card_limits_near_duplicate_shortlist_to_twelve_candidates(
+    monkeypatch,
+) -> None:
+    comparisons: list[tuple[str, str]] = []
+
+    class FakeSequenceMatcher:
+        def __init__(self, _junk, left: str, right: str):
+            comparisons.append((left, right))
+
+        def ratio(self) -> float:
+            return 0.0
+
+    monkeypatch.setattr(validators_module, "SequenceMatcher", FakeSequenceMatcher)
+
+    ctx = ValidationContext()
+    for index in range(20):
+        remember_accepted_card(
+            ctx,
+            "house",
+            f"I see the bright old house today with garden number {index}.",
+        )
+
+    errors = validate_card(
+        CardData(
+            focus="house",
+            sentence="I see the bright old house today with garden target.",
+            level=1,
+            language="en",
+        ),
+        ctx,
+        {
+            "definition_required": False,
+            "ipa_required": False,
+            "translation_required": False,
+            "focus_in_sentence": True,
+            "sentence_matches_language": False,
+            "no_duplicate_focus": False,
+            "no_duplicate_sentences": True,
+            "valid_characters": True,
+            "ipa_format": False,
+            "audio_generated": False,
+            "definition_not_literal_translation": False,
+            "sentence_length": {1: (5, 20)},
+            "sentence_profile": {1: {"max_commas": 0, "forbid_clause_punctuation": True}},
+            "sentence_difficulty_matches_level": False,
+        },
+    )
+
+    assert errors == []
+    assert len(comparisons) == 12
 
 
