@@ -90,9 +90,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 05-01: Define the benchmark dataset and evaluation harness for sentence, lexical, duplicate, and acceptance quality.
-- [ ] 05-02: Add cost or latency instrumentation plus per-stage AI budget controls.
-- [ ] 05-03: Define release-readiness thresholds and reporting for the milestone target above 60% accepted-card rate.
+- [ ] 05-01-PLAN.md — Define repo-stored benchmark fixtures and typed evaluation aggregation for sentence, lexical, duplicate, and acceptance quality.
+- [ ] 05-02-PLAN.md — Extend runtime metrics and per-stage AI guardrails, including lexical-review budget coverage.
+- [ ] 05-03-PLAN.md — Enforce the release gate and readiness reporting for the milestone target above 60% accepted-card rate.
 
 ## Progress
 
