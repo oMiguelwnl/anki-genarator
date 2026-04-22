@@ -12,7 +12,7 @@ This roadmap converts the current brownfield CLI from a provider-first text pipe
 
 - [ ] **Phase 1: Run State Foundation** - Establish explicit card states, safe export gating, and versioned runtime artifacts.
 - [ ] **Phase 2: AI Sentence Generation** - Make structured AI sentence generation the primary path while preserving bounded fallback behavior.
-- [ ] **Phase 3: Contextual Lexical Review** - Resolve and review translation plus definition in sentence context before acceptance.
+- [x] **Phase 3: Contextual Lexical Review** - Resolve and review translation plus definition in sentence context before acceptance.
 - [ ] **Phase 4: Duplicate Guard and Review Workflow** - Add scalable duplicate prevention, audit-ready review artifacts, and accepted-card reporting.
 - [ ] **Phase 5: Evaluation and Runtime Controls** - Add benchmark-driven release checks and cost or latency guardrails.
 
@@ -103,6 +103,6 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 |-------|----------------|--------|-----------|
 | 1. Run State Foundation | 0/3 | Not started | - |
 | 2. AI Sentence Generation | 0/4 | Not started | - |
-| 3. Contextual Lexical Review | 3/3 | Complete | 2026-04-20 |
+| 3. Contextual Lexical Review | 3/3 | Complete | 2026-04-22 |
 | 4. Duplicate Guard and Review Workflow | 0/3 | Not started | - |
 | 5. Evaluation and Runtime Controls | 0/3 | Not started | - |
