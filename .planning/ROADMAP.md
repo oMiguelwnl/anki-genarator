@@ -10,10 +10,10 @@ This roadmap converts the current brownfield CLI from a provider-first text pipe
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions if needed later
 
-- [ ] **Phase 1: Run State Foundation** - Establish explicit card states, safe export gating, and versioned runtime artifacts.
-- [ ] **Phase 2: AI Sentence Generation** - Make structured AI sentence generation the primary path while preserving bounded fallback behavior.
+- [x] **Phase 1: Run State Foundation** - Establish explicit card states, safe export gating, and versioned runtime artifacts.
+- [x] **Phase 2: AI Sentence Generation** - Make structured AI sentence generation the primary path while preserving bounded fallback behavior.
 - [x] **Phase 3: Contextual Lexical Review** - Resolve and review translation plus definition in sentence context before acceptance.
-- [ ] **Phase 4: Duplicate Guard and Review Workflow** - Add scalable duplicate prevention, audit-ready review artifacts, and accepted-card reporting.
+- [x] **Phase 4: Duplicate Guard and Review Workflow** - Add scalable duplicate prevention, audit-ready review artifacts, and accepted-card reporting.
 - [ ] **Phase 5: Evaluation and Runtime Controls** - Add benchmark-driven release checks and cost or latency guardrails.
 
 ## Phase Details
@@ -29,9 +29,9 @@ This roadmap converts the current brownfield CLI from a provider-first text pipe
 **Plans**: 3 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Define compact lifecycle, audit, and compatibility-fingerprint contracts.
-- [ ] 01-02-PLAN.md — Wire deterministic resume and final-decision checkpoint seams into `DeckBuilder`.
-- [ ] 01-03-PLAN.md — Enforce accepted-only export and rejected-only review artifacts.
+- [x] 01-01-PLAN.md — Define compact lifecycle, audit, and compatibility-fingerprint contracts.
+- [x] 01-02-PLAN.md — Wire deterministic resume and final-decision checkpoint seams into `DeckBuilder`.
+- [x] 01-03-PLAN.md — Enforce accepted-only export and rejected-only review artifacts.
 
 ### Phase 2: AI Sentence Generation
 **Goal**: Move sentence generation to a structured AI-first flow that produces constrained candidate sets, rejects malformed outputs early, and keeps web sources as bounded fallback rather than the default path.
@@ -44,10 +44,10 @@ Plans:
 **Plans**: 4 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Add typed candidate schemas, prompt versioning, and AI sentence-generation transport.
-- [ ] 02-02-PLAN.md — Extract a sentence-generation service and early-rejection seam from `DeckBuilder`.
-- [ ] 02-03-PLAN.md — Re-route sentence selection to AI-first with bounded fallback and contract fingerprinting.
-- [ ] 02-04-PLAN.md — Add fixture-based regressions for structured AI batches and salvage-only fallback.
+- [x] 02-01-PLAN.md — Add typed candidate schemas, prompt versioning, and AI sentence-generation transport.
+- [x] 02-02-PLAN.md — Extract a sentence-generation service and early-rejection seam from `DeckBuilder`.
+- [x] 02-03-PLAN.md — Re-route sentence selection to AI-first with bounded fallback and contract fingerprinting.
+- [x] 02-04-PLAN.md — Add fixture-based regressions for structured AI batches and salvage-only fallback.
 
 ### Phase 3: Contextual Lexical Review
 **Goal**: Build translation and definition around the accepted sentence context, add a review or correction stage, and force deterministic revalidation after any automated or human edit.
@@ -75,9 +75,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 04-01-PLAN.md — Build normalized duplicate signatures, exact/near reason codes, and accepted-card-only shortlist guards.
-- [ ] 04-02-PLAN.md — Integrate audit-ready review queue artifacts with duplicate evidence and decisive-source provenance.
-- [ ] 04-03-PLAN.md — Publish acceptance/duplicate diagnostics in quality_report.json while preserving export compatibility.
+- [x] 04-01-PLAN.md — Build normalized duplicate signatures, exact/near reason codes, and accepted-card-only shortlist guards.
+- [x] 04-02-PLAN.md — Integrate audit-ready review queue artifacts with duplicate evidence and decisive-source provenance.
+- [x] 04-03-PLAN.md — Publish acceptance/duplicate diagnostics in quality_report.json while preserving export compatibility.
 
 ### Phase 5: Evaluation and Runtime Controls
 **Goal**: Add reproducible evaluation, acceptance thresholds, and operational guardrails so the milestone can prove quality gains above the current baseline without runaway cost or latency.
@@ -101,8 +101,8 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Run State Foundation | 0/3 | Not started | - |
-| 2. AI Sentence Generation | 0/4 | Not started | - |
+| 1. Run State Foundation | 3/3 | Complete | - |
+| 2. AI Sentence Generation | 4/4 | Complete | - |
 | 3. Contextual Lexical Review | 3/3 | Complete | 2026-04-22 |
-| 4. Duplicate Guard and Review Workflow | 0/3 | Not started | - |
+| 4. Duplicate Guard and Review Workflow | 3/3 | Complete | 2026-04-22 |
 | 5. Evaluation and Runtime Controls | 0/3 | Not started | - |

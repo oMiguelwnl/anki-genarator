@@ -30,16 +30,16 @@ Requirements for the current milestone. Each requirement maps to a roadmap phase
 
 ### Quality, Duplicates, and Reporting
 
-- [ ] **QUAL-01**: The system blocks exact duplicates and near-duplicates across accepted cards using normalized signatures plus bounded fuzzy comparison.
-- [ ] **QUAL-02**: Hard validation failures and soft review flags are tracked separately and surfaced in structured outputs.
-- [ ] **QUAL-03**: Review artifacts preserve before and after context, rejection reasons, and provider or model provenance sufficient for audit.
+- [x] **QUAL-01**: The system blocks exact duplicates and near-duplicates across accepted cards using normalized signatures plus bounded fuzzy comparison.
+- [x] **QUAL-02**: Hard validation failures and soft review flags are tracked separately and surfaced in structured outputs.
+- [x] **QUAL-03**: Review artifacts preserve before and after context, rejection reasons, and provider or model provenance sufficient for audit.
 - [ ] **QUAL-04**: The accepted-card rate improves above 60% on the defined benchmark or release dataset before the milestone is considered complete.
 
 ### Compatibility and Runtime
 
 - [ ] **COMP-01**: The existing CLI entrypoint remains usable from the repo root for configured languages.
 - [ ] **COMP-02**: `wordfreq` and frequency-level selection remain the front door for vocabulary intake.
-- [ ] **COMP-03**: `.apkg` export plus `output/metadata.json`, `output/quality_report.json`, and `output/review_queue.json` continue to be produced.
+- [x] **COMP-03**: `.apkg` export plus `output/metadata.json`, `output/quality_report.json`, and `output/review_queue.json` continue to be produced.
 - [x] **COMP-04**: Audio or TTS generation remains post-acceptance and continues to integrate with deck export.
 - [ ] **COMP-05**: Existing provider fallback behavior for non-AI fields remains compatible unless a later phase explicitly replaces it.
 
@@ -47,7 +47,7 @@ Requirements for the current milestone. Each requirement maps to a roadmap phase
 
 - [ ] **EVAL-01**: The project includes a representative benchmark or gold set segmented by language, ambiguity, and frequency or difficulty slice.
 - [ ] **EVAL-02**: Prompt, model, or validator changes can be evaluated against reproducible metrics for sentence quality, lexical accuracy, duplicate rate, acceptance rate, and cost or latency per accepted card.
-- [ ] **EVAL-03**: Runtime logs and reports capture stage, model or provider, confidence or reason codes, and rejection paths needed to tune the pipeline.
+- [x] **EVAL-03**: Runtime logs and reports capture stage, model or provider, confidence or reason codes, and rejection paths needed to tune the pipeline.
 - [ ] **EVAL-04**: Runtime enforces configurable AI call budgets or guardrails so deck builds remain operationally viable.
 
 ## v2 Requirements
@@ -98,11 +98,11 @@ Which phases cover which requirements.
 | LEX-03 | Phase 3 | Complete |
 | LEX-04 | Phase 3 | Complete |
 | COMP-04 | Phase 3 | Complete |
-| QUAL-01 | Phase 4 | Pending |
-| QUAL-02 | Phase 4 | Pending |
-| QUAL-03 | Phase 4 | Pending |
-| COMP-03 | Phase 4 | Pending |
-| EVAL-03 | Phase 4 | Pending |
+| QUAL-01 | Phase 4 | Complete |
+| QUAL-02 | Phase 4 | Complete |
+| QUAL-03 | Phase 4 | Complete |
+| COMP-03 | Phase 4 | Complete |
+| EVAL-03 | Phase 4 | Complete |
 | QUAL-04 | Phase 5 | Pending |
 | EVAL-01 | Phase 5 | Pending |
 | EVAL-02 | Phase 5 | Pending |

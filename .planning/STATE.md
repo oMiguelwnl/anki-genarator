@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 04
-current_phase_name: duplicate guard and review workflow
+current_phase: 05
+current_phase_name: evaluation and runtime controls
 current_plan: Not started
-status: executing
-stopped_at: Phase 04 context gathered
-last_updated: "2026-04-22T17:19:12.041Z"
+status: ready
+stopped_at: Completed 04-03-PLAN.md
+last_updated: "2026-04-22T17:52:35.552Z"
 last_activity: 2026-04-22
 progress:
   total_phases: 5
-  completed_phases: 3
-  total_plans: 13
-  completed_plans: 10
-  percent: 77
+  completed_phases: 4
+  total_plans: 16
+  completed_plans: 13
+  percent: 81
 ---
 
 # Project State
@@ -24,31 +24,31 @@ progress:
 See: `.planning/PROJECT.md` (updated 2026-04-15)
 
 **Core value:** Gerar cards de vocabulario uteis e semanticamente corretos a partir de palavras frequentes, com qualidade suficiente para exportar o deck final sem grande retrabalho manual.
-**Current focus:** Phase 03 — contextual-lexical-review
+**Current focus:** Phase 05 — evaluation and runtime controls
 
 ## Current Position
 
-**Current Phase:** 04
-**Current Phase Name:** duplicate guard and review workflow
+**Current Phase:** 05
+**Current Phase Name:** evaluation and runtime controls
 **Total Phases:** 5
 **Current Plan:** Not started
 **Total Plans in Phase:** 3
 **Status:** Ready to execute
-**Progress:** [██████████] 100%
+**Progress:** [░░░░░░░░░░] 0%
 **Last Activity:** 2026-04-22
-**Last Activity Description:** Phase 04 planning complete — 3 plans ready
+**Last Activity Description:** Phase 04 execution complete — 3 plan summaries recorded
 
-Phase: 03 (contextual-lexical-review) — EXECUTING
-Plan: 3 of 3
+Phase: 05 (evaluation-and-runtime-controls) — READY
+Plan: 0 of 3
 Status: Ready to execute
-Last activity: 2026-04-22 -- Phase 04 planning complete
+Last activity: 2026-04-22 -- Phase 04 execution complete
 Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 3
+- Total plans completed: 13
 - Average duration: -
 - Total execution time: 0.0 hours
 
@@ -77,6 +77,14 @@ Progress: [░░░░░░░░░░] 0%
 - [Phase 03]: Interactive edit changes now merge into the existing before/after audit trail before post-correction validation runs.
 - [Phase 03]: Audio attachment now occurs only after the final corrected text state passes acceptance, so failed manual corrections never generate media.
 
+| Phase 04 P01 | 300 | 2 tasks | 3 files |
+| Phase 04 P02 | 300 | 2 tasks | 3 files |
+| Phase 04 P03 | 300 | 2 tasks | 3 files |
+
+- [Phase 04]: Duplicate rejection now distinguishes exact and near matches with structured evidence and accepted-card-only bounded matching.
+- [Phase 04]: Rejected artifacts now preserve card snapshots, duplicate evidence, field providers, and decisive decision_source provenance.
+- [Phase 04]: quality_report.json now exposes acceptance, duplicate, and review diagnostics while preserving legacy counters and export compatibility.
+
 ## Pending Todos
 
 None yet.
@@ -93,6 +101,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-22T17:11:26.316Z
-Stopped at: Phase 04 context gathered
-Resume file: .planning/phases/04-duplicate-guard-and-review-workflow/04-CONTEXT.md
+Last session: 2026-04-22T17:52:35.545Z
+Stopped at: Completed 04-03-PLAN.md
+Resume file: None
