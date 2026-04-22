@@ -3634,3 +3634,194 @@ def test_write_quality_outputs_reports_duplicate_diagnostics_sections(
         },
         "review_flags": {"definition_low_translation_alignment": 1},
     }
+
+
+def test_process_word_records_lexical_review_stage_timing(tmp_path: Path) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config["audio"]["enabled"] = False
+    run = _run_config(tmp_path)
+
+    class FakeCache:
+        def get(self, *_args, **_kwargs):
+            return None
+
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class Result:
+        def __init__(self, value: str, provider_name: str = "ai", elapsed_ms: int = 1):
+            self.value = value
+            self.provider_name = provider_name
+            self.elapsed_ms = elapsed_ms
+            self.error = None
+
+    class ReviewTransport:
+        def __init__(self, review: LexicalReviewResult):
+            self.review = review
+            self.provider_name = "ai"
+            self.elapsed_ms = 17
+            self.error = None
+
+    class FakeProviders:
+        def definition(self, word, language, allow_ai=True, definition_language=None):
+            _ = (word, language, allow_ai, definition_language)
+            return Result("noun: bench in a park or public place")
+
+        def ipa(self, word, language, allow_ai=True):
+            _ = (word, language, allow_ai)
+            return Result("/ˈbaŋ.ko/")
+
+        def phonetic_spelling(self, ipa, language, allow_ai=True):
+            _ = (ipa, language, allow_ai)
+            return Result("BAN-ko")
+
+        def sentence_web(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result("Me sente en el banco del parque.", provider_name="tatoeba")
+
+        def sentence_ai(self, word, language, level=None, **kwargs):
+            _ = (word, language, level, kwargs)
+            return Result("Me sente en el banco del parque.")
+
+        def translation_web(self, text, src, dest):
+            _ = (src, dest)
+            if text.startswith("noun:"):
+                return Result("noun: bench in a park or public place", provider_name="googletrans")
+            return Result("I sat on the bench in the park.", provider_name="googletrans")
+
+        def translation_ai(self, text, src, dest):
+            _ = (text, src, dest)
+            return Result("I sat on the bench in the park.")
+
+        def lexical_review(self, request, **kwargs):
+            _ = kwargs
+            return ReviewTransport(
+                LexicalReviewResult.model_validate(
+                    {
+                        "verdict": "accept",
+                        "focus_word": request.focus_word,
+                        "language": request.language,
+                        "target_translation_language": request.target_translation_language,
+                        "accepted_sentence": request.accepted_sentence,
+                        "current_definition": request.current_definition,
+                        "current_translation": request.current_translation,
+                        "source_definition": request.source_definition,
+                        "candidate_senses": list(request.candidate_senses),
+                        "winning_sense": request.current_definition,
+                        "reason_codes": [],
+                        "selection_reasons": {"winning_sense": "already_aligned"},
+                    }
+                )
+            )
+
+    card, log = builder._process_word_textual(
+        word="banco",
+        level=1,
+        index=1,
+        run=run,
+        cache=FakeCache(),
+        providers=FakeProviders(),
+    )
+
+    assert card is not None
+    assert log.providers["lexical_review"] == "ai"
+    assert log.stage_timings["lexical_review_ms"] == 17
+
+
+def test_write_quality_outputs_reports_runtime_guardrails_and_latency_per_accepted_card(
+    tmp_path: Path,
+) -> None:
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    run = _run_config(tmp_path)
+    run.review_queue_path = str(tmp_path / "output" / "review_queue.json")
+    run.quality_report_path = str(tmp_path / "output" / "quality_report.json")
+
+    stats = BuildStats()
+    logger = deck_builder_module.JsonLogger(tmp_path / "run.jsonl")
+    stats.cards.append(
+        CardData(
+            focus="banco",
+            definition="noun: bench in a park or public place.",
+            sentence="Me sente en el banco del parque.",
+            translation="I sat on the bench in the park.",
+            level=1,
+            language="es",
+        )
+    )
+    stats.attempted_by_level[1] = 2
+    stats.accepted_by_level[1] = 1
+
+    builder._record_log(
+        logger,
+        stats,
+        LogRecord(
+            focus="banco",
+            level=1,
+            status="accepted",
+            lifecycle_state="accepted",
+            providers={"lexical_review": "ai", "translation": "googletrans"},
+            stage_timings={"lexical_review_ms": 17, "translation_ms": 5},
+            event_counts={
+                "ai_stage_usage.lexical_review": 1,
+                "ai_stage_budget_exhausted.lexical_review": 1,
+            },
+        ),
+    )
+
+    builder._write_quality_outputs(run, stats)
+
+    report = json.loads(Path(run.quality_report_path).read_text(encoding="utf-8"))
+
+    assert report["stage_latency_ms"] == {
+        "lexical_review": 17,
+        "translation": 5,
+    }
+    assert report["ai_budget_usage"] == {
+        "total_ai_calls": 1,
+        "by_stage": {"lexical_review": 1},
+    }
+    assert report["runtime_guardrails"] == {
+        "stage_budget_exhausted": {"lexical_review": 1},
+    }
+    assert report["latency_per_accepted_card_ms"] == {
+        "accepted_cards": 1,
+        "total_runtime_ms": 22,
+        "overall": 22.0,
+        "by_stage": {
+            "lexical_review": 17.0,
+            "translation": 5.0,
+        },
+    }
+
+
+def test_cleanup_run_artifacts_preserves_logs_when_enabled_for_evaluation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    builder = DeckBuilder(str(Path(__file__).resolve().parents[2] / "config.yaml"))
+    builder.config.setdefault("runtime", {})["cleanup_generated_artifacts"] = True
+    run = _run_config(tmp_path)
+    object.__setattr__(run, "preserve_evaluation_logs", True)
+
+    cache_dir = Path(run.cache_path)
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "cache.json").write_text("{}", encoding="utf-8")
+    progress_dir = Path("ankideck_generator/data/progress")
+    progress_dir.mkdir(parents=True)
+    (progress_dir / "es_test.json").write_text("{}", encoding="utf-8")
+    log_dir = Path("ankideck_generator/data/logs")
+    log_dir.mkdir(parents=True)
+    log_path = log_dir / "run-test.jsonl"
+    log_path.write_text('{"focus":"banco"}\n', encoding="utf-8")
+    builder._last_run_log_path = str(log_path)
+
+    builder._cleanup_run_artifacts(
+        run,
+        cleanup_audio=False,
+        audio_dir=tmp_path / "audio",
+        media_files=[],
+    )
+
+    assert not cache_dir.exists()
+    assert not progress_dir.exists()
+    assert log_path.exists()
