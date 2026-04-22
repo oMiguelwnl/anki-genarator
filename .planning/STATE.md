@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 current_phase: 05
-current_phase_name: evaluation and runtime controls
-current_plan: 2
+current_phase_name: evaluation-and-runtime-controls
+current_plan: 3
 status: executing
-stopped_at: Completed 05-01-PLAN.md
-last_updated: "2026-04-22T19:04:21.950Z"
+stopped_at: Completed 05-02-PLAN.md
+last_updated: "2026-04-22T19:26:15.136Z"
 last_activity: 2026-04-22
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 16
-  completed_plans: 14
-  percent: 88
+  completed_plans: 15
+  percent: 94
 ---
 
 # Project State
@@ -24,25 +24,25 @@ progress:
 See: `.planning/PROJECT.md` (updated 2026-04-15)
 
 **Core value:** Gerar cards de vocabulario uteis e semanticamente corretos a partir de palavras frequentes, com qualidade suficiente para exportar o deck final sem grande retrabalho manual.
-**Current focus:** Phase 05 — evaluation and runtime controls
+**Current focus:** Phase 05 — evaluation-and-runtime-controls
 
 ## Current Position
 
 **Current Phase:** 05
-**Current Phase Name:** evaluation and runtime controls
+**Current Phase Name:** evaluation-and-runtime-controls
 **Total Phases:** 5
-**Current Plan:** 2
+**Current Plan:** 3
 **Total Plans in Phase:** 3
-**Status:** Executing Phase 05
-**Progress:** [█████████░] 88%
+**Status:** Ready to execute
+**Progress:** [█████████░] 94%
 **Last Activity:** 2026-04-22
-**Last Activity Description:** Completed 05-01-PLAN.md
+**Last Activity Description:** Phase 05 execution started
 
 Phase: 05 (evaluation-and-runtime-controls) — EXECUTING
-Plan: 2 of 3
-Status: Executing Phase 05
-Last activity: 2026-04-22 -- Completed 05-01-PLAN.md
-Progress: [█████████░] 88%
+Plan: 3 of 3
+Status: Ready to execute
+Last activity: 2026-04-22
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
@@ -91,6 +91,12 @@ Progress: [█████████░] 88%
 - [Phase 05]: Experiment identity is derived from canonical JSON over experiment metadata and benchmark cases — Order-insensitive hashing makes repeated evaluation runs reproducible and auditable.
 - [Phase 05]: Slice summaries count language, ambiguity, difficulty, and quality-dimension coverage from one bundle contract — Downstream runtime and release-gate plans can reuse the same deterministic aggregation surface.
 
+| Phase 05 P02 | 14 min | 2 tasks | 5 files |
+
+- [Phase 05]: Per-stage AI limits merge runtime defaults with mode overrides into one RunConfig map. — One validated budget surface keeps runtime controls observable without introducing a second guardrail system.
+- [Phase 05]: Lexical review budget exhaustion rejects the card with explicit machine-readable evidence. — Acceptance without lexical review would bypass the Phase 03 correctness gate, so exhaustion must stay visible and blocking.
+- [Phase 05]: Latency per accepted card is derived from aggregated stage timings and accepted-card count inside quality_report.json. — A single accepted-only runtime metric makes prompt or model comparisons reproducible for downstream evaluation tooling.
+
 ## Pending Todos
 
 None yet.
@@ -107,6 +113,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-04-22T19:04:13.267Z
-Stopped at: Completed 05-01-PLAN.md
+Last session: 2026-04-22T19:25:33.845Z
+Stopped at: Completed 05-02-PLAN.md
 Resume file: None

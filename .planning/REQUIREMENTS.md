@@ -48,7 +48,7 @@ Requirements for the current milestone. Each requirement maps to a roadmap phase
 - [x] **EVAL-01**: The project includes a representative benchmark or gold set segmented by language, ambiguity, and frequency or difficulty slice.
 - [x] **EVAL-02**: Prompt, model, or validator changes can be evaluated against reproducible metrics for sentence quality, lexical accuracy, duplicate rate, acceptance rate, and cost or latency per accepted card.
 - [x] **EVAL-03**: Runtime logs and reports capture stage, model or provider, confidence or reason codes, and rejection paths needed to tune the pipeline.
-- [ ] **EVAL-04**: Runtime enforces configurable AI call budgets or guardrails so deck builds remain operationally viable.
+- [x] **EVAL-04**: Runtime enforces configurable AI call budgets or guardrails so deck builds remain operationally viable.
 
 ## v2 Requirements
 
@@ -106,7 +106,7 @@ Which phases cover which requirements.
 | QUAL-04 | Phase 5 | Pending |
 | EVAL-01 | Phase 5 | Complete |
 | EVAL-02 | Phase 5 | Complete |
-| EVAL-04 | Phase 5 | Pending |
+| EVAL-04 | Phase 5 | Complete |
 
 **Coverage:**
 - v1 requirements: 25 total
