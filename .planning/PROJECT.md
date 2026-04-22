@@ -16,11 +16,11 @@ Gerar cards de vocabulario uteis e semanticamente corretos a partir de palavras 
 - ✓ Usuario pode obter definicao, traducao, frase de exemplo e audio por meio de provedores configuraveis com fallback — existing
 - ✓ Usuario pode reutilizar cache, resume/progresso e logs estruturados durante a geracao — existing
 - ✓ Usuario pode exportar metadados, fila de revisao e relatorio de qualidade junto do deck final — existing
+- ✓ O motor usa IA para revisar ou corrigir traducao e definicao antes de aceitar um card — Validated in Phase 03: contextual-lexical-review
 
 ### Active
 
 - [ ] O motor deve gerar frases principalmente com IA, usando `vocabGenarator.py` como referencia para prompt e logica de chamada
-- [ ] O motor deve usar IA para revisar ou corrigir traducao e definicao antes de aceitar um card
 - [ ] O pipeline deve eliminar cards duplicados e elevar a taxa final de aprovacao para acima de 60%
 - [ ] O fluxo novo deve continuar baseado em `wordfreq` e niveis de frequencia, mas funcionar como motor generico para os idiomas configurados
 - [ ] O fluxo novo deve preservar export `.apkg`, audio/TTS, cache/resume e integracoes necessarias do deck atual
@@ -75,4 +75,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-15 after initialization*
+*Last updated: 2026-04-22 after Phase 03 completion*
