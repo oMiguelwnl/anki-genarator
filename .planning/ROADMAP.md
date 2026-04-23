@@ -14,7 +14,7 @@ This roadmap converts the current brownfield CLI from a provider-first text pipe
 - [x] **Phase 2: AI Sentence Generation** - Make structured AI sentence generation the primary path while preserving bounded fallback behavior.
 - [x] **Phase 3: Contextual Lexical Review** - Resolve and review translation plus definition in sentence context before acceptance.
 - [x] **Phase 4: Duplicate Guard and Review Workflow** - Add scalable duplicate prevention, audit-ready review artifacts, and accepted-card reporting.
-- [ ] **Phase 5: Evaluation and Runtime Controls** - Add benchmark-driven release checks and cost or latency guardrails.
+- [x] **Phase 5: Evaluation and Runtime Controls** - Add benchmark-driven release checks and cost or latency guardrails. (completed 2026-04-23)
 
 ## Phase Details
 
@@ -92,7 +92,7 @@ Plans:
 Plans:
 - [x] 05-01-PLAN.md — Define repo-stored benchmark fixtures and typed evaluation aggregation for sentence, lexical, duplicate, and acceptance quality.
 - [x] 05-02-PLAN.md — Extend runtime metrics and per-stage AI guardrails, including lexical-review budget coverage.
-- [ ] 05-03-PLAN.md — Enforce the release gate and readiness reporting for the milestone target above 60% accepted-card rate.
+- [x] 05-03-PLAN.md — Enforce the release gate and readiness reporting for the milestone target above 60% accepted-card rate.
 
 ## Progress
 
@@ -105,4 +105,4 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 | 2. AI Sentence Generation | 4/4 | Complete | - |
 | 3. Contextual Lexical Review | 3/3 | Complete | 2026-04-22 |
 | 4. Duplicate Guard and Review Workflow | 3/3 | Complete | 2026-04-22 |
-| 5. Evaluation and Runtime Controls | 0/3 | Not started | - |
+| 5. Evaluation and Runtime Controls | 3/3 | Complete   | 2026-04-23 |
