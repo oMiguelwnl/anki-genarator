@@ -1,0 +1,29 @@
+{
+  "schema_version": "evaluation-release-thresholds-v1",
+  "milestone": "v1.0",
+  "checks": [
+    {
+      "metric": "accepted_card_rate",
+      "comparator": ">",
+      "value": 0.6,
+      "description": "Accepted-card rate must be strictly above 60% for release readiness."
+    },
+    {
+      "metric": "latency_per_accepted_card_ms.overall",
+      "comparator": "<=",
+      "value": 250.0,
+      "description": "Runtime latency per accepted card must stay bounded for reproducible comparisons."
+    }
+  ],
+  "required_report_fields": [
+    "accepted_card_rate",
+    "acceptance_quality.accepted_cards",
+    "acceptance_quality.accepted_card_rate",
+    "duplicate_reject_rate",
+    "runtime_guardrails",
+    "runtime_guardrails.stage_budget_exhausted",
+    "ai_budget_usage",
+    "latency_per_accepted_card_ms",
+    "latency_per_accepted_card_ms.overall"
+  ]
+}
