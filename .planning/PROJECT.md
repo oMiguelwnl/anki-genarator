@@ -56,6 +56,12 @@ Gerar cards de vocabulario uteis e semanticamente corretos a partir de palavras 
 | IA tambem revisara traducao e definicao | Trocar apenas a frase nao resolve os erros semanticos que hoje derrubam a aprovacao final | — Pending |
 | `wordfreq`, niveis, audio/TTS, cache/resume e export `.apkg` permanecem como base | O produto ja possui uma pipeline operacional util e a melhoria precisa aumentar qualidade sem quebrar o fluxo existente | — Pending |
 | A evolucao deve ser pensada como motor generico para idiomas configurados | O objetivo nao e otimizar so um caminho local, mas melhorar a logica central da geracao | — Pending |
+| Avaliacao de milestone fica baseada em fixtures versionados no repo e artefatos aceitos da pipeline | A meta de qualidade precisa ser reproduzivel, comparavel e auditavel sem depender de inspecao manual ad hoc | Implemented in Phase 05 |
+| Guardrails de custo/latencia permanecem no mesmo sistema de budget da runtime atual | Evita um segundo subsistema de quotas e mantem a observabilidade em `quality_report.json` e nos logs existentes | Implemented in Phase 05 |
+
+## Current State
+
+Phase 05 complete - the project now has repo-backed benchmark fixtures, reproducible evaluation bundles, runtime AI budget guardrails including lexical review, and a machine-readable release-readiness verdict for the `accepted_card_rate > 0.60` gate. Live provider benchmarking still depends on running the flow in a credentialed environment.
 
 ## Evolution
 
@@ -75,4 +81,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-22 after Phase 03 completion*
+*Last updated: 2026-04-27 after Phase 05 completion*
